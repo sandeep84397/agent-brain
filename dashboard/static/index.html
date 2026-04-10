@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Brain Office</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <div id="office-container">
+            <canvas id="office"></canvas>
+        </div>
+        <div id="sidebar">
+            <div id="sidebar-header">
+                <h2>&#x1f4ac; Activity</h2>
+                <div id="connection-dot" class="disconnected"></div>
+            </div>
+            <div id="chat-log">
+                <div class="empty-chat">No messages yet</div>
+            </div>
+            <div id="agent-list">
+                <h3>&#x1f465; Team</h3>
+                <div id="agent-entries">
+                    <div class="empty-team">Waiting for agents...</div>
+                </div>
+            </div>
+            <div id="status-bar">
+                <span id="agent-count">Connecting...</span>
+                <span id="last-update"></span>
+            </div>
+        </div>
+    </div>
+    <script src="office.js"></script>
+</body>
+</html>

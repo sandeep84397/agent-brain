@@ -35,6 +35,8 @@ BRAIN_DIR = Path(os.environ.get("AGENT_BRAIN_DIR", str(Path.home() / ".agent-bra
 GRAPH_FILE = BRAIN_DIR / "decisions.json"
 CONFIG_FILE = BRAIN_DIR / "config.json"
 LOCK = threading.Lock()
+OFFICE_LOCK = threading.Lock()
+OFFICE_STATE_FILE = BRAIN_DIR / "office-state.json"
 
 
 def _load_config() -> dict:
@@ -51,6 +53,52 @@ def _get_repo_paths() -> dict[str, Path]:
     """Get configured repo name → path mapping."""
     config = _load_config()
     return {name: Path(p) for name, p in config.get("repos", {}).items()}
+
+
+# ---------------------------------------------------------------------------
+# Office State (for live dashboard)
+# ---------------------------------------------------------------------------
+
+
+def _load_office_state() -> dict:
+    """Load office state for dashboard. Returns empty if none exists."""
+    if OFFICE_STATE_FILE.exists():
+        try:
+            return json.loads(OFFICE_STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {"agents": {}, "messages": []}
+    return {"agents": {}, "messages": []}
+
+
+def _save_office_state(state: dict) -> None:
+    """Persist office state atomically."""
+    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = OFFICE_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.rename(OFFICE_STATE_FILE)
+
+
+def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "") -> None:
+    """Silently update office state from brain tool calls. Never raises."""
+    try:
+        with OFFICE_LOCK:
+            state = _load_office_state()
+            config = _load_config()
+            role = "unknown"
+            for t in config.get("team", []):
+                if t.get("name", "").lower() == agent.lower():
+                    role = t.get("role", "unknown")
+                    break
+            state.setdefault("agents", {})[agent] = {
+                "role": role, "status": status,
+                "task": (task or "")[:100],
+                "talking_to": talking_to or None,
+                "message": None,
+                "last_seen": datetime.now().isoformat(),
+            }
+            _save_office_state(state)
+    except Exception:
+        pass  # Office state must never break brain functionality
 
 
 mcp = FastMCP(
@@ -396,6 +444,7 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
         area: Domain area (e.g. "auth", "feed", "schema", "ui")
         action_description: Brief description of what you plan to do
     """
+    _auto_heartbeat(agent, "planning", action_description)
     with LOCK:
         G = _load_graph()
     sections = []
@@ -490,6 +539,7 @@ def log_decision(
                 G.add_node(sym_node, type="code_ref", qualified_name=sym, repo=repo)
             G.add_edge(node_id, sym_node, relation="touches")
         _save_graph(G)
+    _auto_heartbeat(agent, "working", action)
     result = f"Decision logged: {node_id}"
     if resolved_symbols:
         result += f"\nLinked to {len(resolved_symbols)} code symbol(s)"
@@ -515,7 +565,9 @@ def log_outcome(decision_id: str, outcome: str, outcome_by: str, reason: str) ->
         G.nodes[decision_id]["outcome_by"] = outcome_by
         G.nodes[decision_id]["outcome_reason"] = reason
         G.nodes[decision_id]["outcome_timestamp"] = datetime.now().isoformat()
+        dec_agent = G.nodes[decision_id].get("agent", "")
         _save_graph(G)
+    _auto_heartbeat(outcome_by, "reviewing", f"outcome: {outcome}", talking_to=dec_agent)
     return f"Outcome recorded: {decision_id} -> {outcome} by {outcome_by}"
 
 
@@ -538,7 +590,9 @@ def log_feedback(agent: str, decision_id: str, feedback: str, severity: str = "i
         G.add_node(fb_id, type="feedback", agent=agent, feedback=feedback,
                     severity=severity, timestamp=datetime.now().isoformat())
         G.add_edge(fb_id, decision_id, relation="feedback_on")
+        dec_agent = G.nodes.get(decision_id, {}).get("agent", "")
         _save_graph(G)
+    _auto_heartbeat(agent, "reviewing", feedback[:80], talking_to=dec_agent)
     return f"Feedback logged: {fb_id} -> {decision_id}"
 
 
@@ -953,6 +1007,73 @@ def get_decision(decision_id: str) -> str:
         lines.append("\nCode symbols:")
         for sym in code_syms:
             lines.append(f"  - {sym}")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# MCP Tools — Office Dashboard
+# ===========================================================================
+
+
+@mcp.tool()
+def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", message: str = "") -> str:
+    """
+    Report agent status for the live office dashboard.
+    Call this to update your visible state in the pixel art office.
+
+    Args:
+        agent: Your name (e.g. "arjun")
+        status: One of: working, idle, planning, discussing, reviewing, blocked, waiting
+        task: What you're working on (shown as label, max 100 chars)
+        talking_to: Name of agent you're interacting with (shows discussion animation)
+        message: Chat message content (appears as speech bubble + in chat log)
+    """
+    with OFFICE_LOCK:
+        state = _load_office_state()
+        config = _load_config()
+        role = "unknown"
+        for t in config.get("team", []):
+            if t.get("name", "").lower() == agent.lower():
+                role = t.get("role", "unknown")
+                break
+        state.setdefault("agents", {})[agent] = {
+            "role": role, "status": status,
+            "task": (task or "")[:100],
+            "talking_to": talking_to or None,
+            "message": (message or None)[:200] if message else None,
+            "last_seen": datetime.now().isoformat(),
+        }
+        if message and talking_to:
+            state.setdefault("messages", []).append({
+                "from": agent, "to": talking_to,
+                "text": (message or "")[:200],
+                "ts": datetime.now().isoformat(),
+            })
+            state["messages"] = state["messages"][-50:]
+        _save_office_state(state)
+    return "ok"
+
+
+@mcp.tool()
+def office_state() -> str:
+    """Get current office state (for debugging the dashboard)."""
+    state = _load_office_state()
+    if not state.get("agents"):
+        return "Office is empty. No agents have checked in."
+    lines = ["=== OFFICE STATE ===\n"]
+    for name, info in sorted(state["agents"].items()):
+        status = info.get("status", "unknown")
+        task = info.get("task", "")
+        talking = info.get("talking_to")
+        last = info.get("last_seen", "?")[:19]
+        lines.append(f"  {name} [{info.get('role','')}]: {status} (seen: {last})")
+        if task:
+            lines.append(f"    task: {task}")
+        if talking:
+            lines.append(f"    talking to: {talking}")
+    msg_count = len(state.get("messages", []))
+    if msg_count:
+        lines.append(f"\n  {msg_count} message(s) in log")
     return "\n".join(lines)
 
 

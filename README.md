@@ -58,7 +58,7 @@ The setup wizard will:
 │  Your Machine (global)                          │
 │                                                 │
 │  ~/.agent-brain/                                │
-│  ├── server.py        ← MCP server (19 tools)  │
+│  ├── server.py        ← MCP server (21 tools)  │
 │  ├── config.json      ← your repos + team      │
 │  └── decisions.json   ← persistent memory       │
 │                                                 │
@@ -73,10 +73,14 @@ The setup wizard will:
 │  project-repo/.san/   ← SAN-compressed code     │
 │  ├── _index.json                                │
 │  └── src/**/*.san                               │
+│                                                 │
+│  dashboard/           ← pixel art office UI     │
+│  ├── server.py        (python, zero deps)       │
+│  └── static/          (HTML5 Canvas + SSE)      │
 └─────────────────────────────────────────────────┘
 ```
 
-## MCP Tools (19)
+## MCP Tools (21)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -112,6 +116,12 @@ The setup wizard will:
 | `get_agent_stats` | Quick stats for one or all agents |
 | `agent_scorecard` | Detailed breakdown with trends and advice |
 | `team_dashboard` | All agents at a glance |
+
+### Office Dashboard
+| Tool | Purpose |
+|------|---------|
+| `heartbeat` | Report agent status (working/idle/discussing/blocked) for live dashboard |
+| `office_state` | Get current office state (debugging) |
 
 ### SAN (Structured Associative Notation)
 | Tool | Purpose |
@@ -223,6 +233,45 @@ Agents with high rejection rates get progressively stricter warnings:
 | < 30% | NORMAL | Standard pre_check |
 | 30-50% | ELEVATED | "Pay close attention to past failures" |
 | > 50% | STRICT | Shows top rejection patterns, demands extra scrutiny |
+
+## Office Dashboard (Live Visualization)
+
+A pixel art virtual office that shows your agents working in real-time. Agents move between desks and the meeting table, show speech bubbles during discussions, and display status indicators.
+
+```bash
+python dashboard/server.py
+# Opens http://localhost:3333 in your browser
+```
+
+**Features:**
+- Pixel art office with desks, meeting table, whiteboard, coffee machine
+- Agents animate: idle bob, working (typing), walking, discussing (gestures)
+- Status dots: 🟢 working, 🟡 planning, 🟠 reviewing, 🔵 discussing, 🔴 blocked, ⚫ offline
+- Speech bubbles with actual message content
+- Chat log sidebar with all agent interactions
+- Team status panel with live agent list
+
+**How it works:**
+1. Brain tools (`pre_check`, `log_decision`, etc.) auto-update agent status — **zero changes to your agents needed**
+2. For richer state (idle, messages, discussing), agents can call `heartbeat()` explicitly
+3. Dashboard reads `~/.agent-brain/office-state.json` via SSE (polls every 500ms)
+4. Canvas renders pixel art at 60fps with smooth agent movement
+
+**Auto-heartbeat** (free, no agent changes):
+| Brain Tool | Dashboard Status |
+|-----------|-----------------|
+| `pre_check` | Agent shows as "planning" |
+| `log_decision` | Agent shows as "working" |
+| `log_outcome` | Reviewer shows as "reviewing" |
+| `log_feedback` | Reviewer shows as "reviewing", linked to target agent |
+
+**Explicit heartbeat** (richer state):
+```
+heartbeat(agent="arjun", status="discussing", talking_to="marcus", message="DIP violation in AuthService?")
+```
+→ Both agents walk to meeting table, speech bubbles appear, message shows in chat log.
+
+> **Tip**: Add `heartbeat(agent="<name>", status="idle")` to agent templates for when they finish a task. Otherwise agents stay at their last status until the 2-minute timeout.
 
 ## Verification
 

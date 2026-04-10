@@ -1,0 +1,189 @@
+/* Agent Brain Office Dashboard — Dark pixel art theme */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: #0a0a1a;
+    color: #c0c0c0;
+    font-family: 'Press Start 2P', 'Courier New', monospace;
+    overflow: hidden;
+    height: 100vh;
+}
+
+/* --- Layout --- */
+
+#app {
+    display: flex;
+    height: 100vh;
+}
+
+#office-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0e0e20;
+    position: relative;
+    overflow: hidden;
+}
+
+canvas#office {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    -ms-interpolation-mode: nearest-neighbor;
+    max-width: 100%;
+    max-height: 100%;
+}
+
+/* --- Sidebar --- */
+
+#sidebar {
+    width: 300px;
+    min-width: 300px;
+    background: #12122a;
+    border-left: 2px solid #1a1a3e;
+    display: flex;
+    flex-direction: column;
+}
+
+#sidebar-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid #1a1a3e;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+#sidebar-header h2 {
+    font-size: 8px;
+    color: #e94560;
+}
+
+#connection-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    transition: background 0.3s;
+}
+#connection-dot.connected { background: #00E436; }
+#connection-dot.disconnected { background: #FF004D; animation: pulse 1.5s infinite; }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* --- Chat Log --- */
+
+#chat-log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+    font-size: 6px;
+    line-height: 1.8;
+}
+
+.msg {
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    background: #0a0a1a;
+    border-radius: 3px;
+    border-left: 2px solid #1a1a3e;
+    animation: slideIn 0.2s ease-out;
+}
+
+@keyframes slideIn {
+    from { opacity: 0; transform: translateX(-8px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.msg .from { color: #e94560; }
+.msg .arrow { color: #444; }
+.msg .to { color: #29ADFF; }
+.msg .time { color: #444; float: right; font-size: 5px; }
+.msg .text { color: #999; display: block; margin-top: 3px; word-break: break-word; }
+
+.empty-chat, .empty-team {
+    color: #333;
+    font-size: 6px;
+    text-align: center;
+    padding: 20px 0;
+}
+
+/* --- Agent List --- */
+
+#agent-list {
+    border-top: 1px solid #1a1a3e;
+    padding: 8px 12px;
+    font-size: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+#agent-list h3 {
+    font-size: 7px;
+    color: #666;
+    margin-bottom: 8px;
+}
+
+.agent-entry {
+    display: flex;
+    align-items: center;
+    padding: 4px 0;
+    gap: 6px;
+}
+
+.agent-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.dot-working { background: #00E436; }
+.dot-planning { background: #FFEC27; }
+.dot-reviewing { background: #FFA300; }
+.dot-discussing { background: #29ADFF; }
+.dot-blocked { background: #FF004D; }
+.dot-waiting { background: #FFEC27; }
+.dot-idle { background: #555; }
+.dot-offline { background: #333; }
+
+.agent-name { color: #c0c0c0; flex: 1; }
+.agent-role { color: #444; font-size: 5px; }
+.agent-task { color: #666; font-size: 5px; display: block; padding-left: 12px; margin-top: 1px; }
+
+/* --- Status Bar --- */
+
+#status-bar {
+    padding: 8px 12px;
+    border-top: 1px solid #1a1a3e;
+    font-size: 6px;
+    display: flex;
+    justify-content: space-between;
+    color: #444;
+}
+
+/* --- Scrollbar --- */
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #0a0a1a; }
+::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a5a; }
+
+/* --- Responsive --- */
+
+@media (max-width: 900px) {
+    #sidebar { width: 240px; min-width: 240px; }
+}
+
+@media (max-width: 700px) {
+    #app { flex-direction: column; }
+    #sidebar {
+        width: 100%; min-width: 100%;
+        max-height: 200px;
+        border-left: none;
+        border-top: 2px solid #1a1a3e;
+    }
+    #agent-list { display: none; }
+}
