@@ -1,0 +1,13 @@
+{
+  "repos": {
+    "my-backend": "/path/to/your/backend-repo",
+    "my-frontend": "/path/to/your/frontend-repo"
+  },
+  "team": [
+    {"name": "marcus", "role": "principal-engineer"},
+    {"name": "maya", "role": "product-owner"},
+    {"name": "arjun", "role": "backend-engineer"},
+    {"name": "priya", "role": "frontend-engineer"},
+    {"name": "rahul", "role": "qa-engineer"}
+  ]
+}

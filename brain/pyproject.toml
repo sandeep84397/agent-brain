@@ -1,0 +1,16 @@
+[project]
+name = "agent-brain"
+version = "1.0.0"
+description = "Persistent decision memory MCP server for Claude Code agent teams"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mcp>=1.0.0",
+    "networkx>=3.0",
+]
+readme = "README.md"
+keywords = ["claude", "mcp", "agents", "memory", "decision-tracking"]
+
+[project.urls]
+Homepage = "https://github.com/anthropics/agent-brain"
+Issues = "https://github.com/anthropics/agent-brain/issues"
