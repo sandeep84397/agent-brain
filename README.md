@@ -38,11 +38,18 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-Then:
-1. Edit `~/.agent-brain/config.json` with your repo paths
-2. Customize agents in `~/.claude/agents/`
-3. Restart Claude Code
-4. Test: ask any agent to call `brain_stats()`
+The setup wizard will:
+- Create a Python venv and install dependencies
+- Prompt for your repo paths (or use the template config)
+- Register the MCP server globally with Claude Code
+- Offer to customize agent names interactively
+- Run verification checks
+
+> **No `setup.sh`?** The server works standalone. Just `pip install mcp networkx` and register manually:
+> ```bash
+> claude mcp add --transport stdio --scope user agent-brain -- python3 /path/to/server.py
+> ```
+> The server gracefully handles a missing `config.json` — it starts with an empty brain.
 
 ## Architecture
 
@@ -129,6 +136,46 @@ The repo includes 6 agent templates. Each has the Brain Protocol baked in:
 
 Scale by duplicating templates (e.g., `backend-engineer-2.md`).
 
+### Placeholders
+
+Each template has `{{ROLE_NAME}}` / `{{ROLE_NAME_LOWER}}` placeholders:
+
+| File | Placeholders |
+|------|-------------|
+| `project-manager.md` | `{{PM_NAME}}`, `{{PM_NAME_LOWER}}` |
+| `product-owner.md` | `{{PO_NAME}}`, `{{PO_NAME_LOWER}}` |
+| `principal-engineer.md` | `{{PE_NAME}}`, `{{PE_NAME_LOWER}}` |
+| `backend-engineer.md` | `{{BE_NAME}}`, `{{BE_NAME_LOWER}}` |
+| `frontend-engineer.md` | `{{FE_NAME}}`, `{{FE_NAME_LOWER}}` |
+| `qa-engineer.md` | `{{QA_NAME}}`, `{{QA_NAME_LOWER}}` |
+
+`setup.sh` offers to replace these interactively. Or do it manually:
+```bash
+sed -i 's/{{BE_NAME}}/Arjun/g; s/{{BE_NAME_LOWER}}/arjun/g' ~/.claude/agents/backend-engineer.md
+```
+
+### Already have custom agents?
+
+If you already have agent `.md` files, **don't overwrite them**. Instead, add the Brain Protocol block to each:
+
+```markdown
+# Brain Protocol
+Before starting any task:
+1. Call `pre_check(agent="<name>", area="<area>", action_description="<plan>")`
+2. If warnings exist, adjust approach
+3. Call `log_decision(agent="<name>", repo="<repo>", area="<area>", action="<plan>", reasoning="<why>", files_touched=["<paths>"])`
+After feedback:
+4. Call `log_outcome(decision_id="<id>", outcome="<result>", outcome_by="<who>", reason="<why>")`
+NON-NEGOTIABLE.
+```
+
+For reviewers (PE, QA), also add:
+```markdown
+5. Call `log_feedback(agent="<name>", decision_id="<their-id>", feedback="<detail>", severity="blocker|warning|info")`
+```
+
+`setup.sh` shows this snippet if it detects existing agents (choose `[m]` for manual).
+
 ## Brain Protocol
 
 Every agent must follow this before starting work:
@@ -177,10 +224,64 @@ Agents with high rejection rates get progressively stricter warnings:
 | 30-50% | ELEVATED | "Pay close attention to past failures" |
 | > 50% | STRICT | Shows top rejection patterns, demands extra scrutiny |
 
+## Verification
+
+After setup, restart Claude Code and ask any agent to call `brain_stats()`. Expected output:
+
+```
+Brain Stats:
+  Nodes: 0 | Edges: 0
+  Decisions: 0 | Feedback: 0 | Code refs: 0
+  Areas: none
+  Repos: none
+  Agents: none
+```
+
+**Troubleshooting:**
+
+| Problem | Fix |
+|---------|-----|
+| `brain_stats` not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
+| MCP connection error | Check venv: `~/.agent-brain/.venv/bin/python -c "import mcp, networkx"` |
+| No tools registered | Verify: `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py` shouldn't error |
+| `config.json` not found | Server works without it (empty brain). Create one if you want repo integration. |
+| `AGENT_BRAIN_DIR` not set | Defaults to `~/.agent-brain/`. Set the env var only if you want a custom location. |
+
+## SAN Setup
+
+SAN (Structured Associative Notation) compresses source code by ~85% for LLM context. This is **optional** — the decision memory works without it.
+
+1. **Create `.san/` in your repo:**
+   ```bash
+   mkdir -p your-repo/.san
+   ```
+
+2. **Generate SAN files** using the brain-compiler agent (see `san/brain-compiler.md`):
+   ```
+   # In Claude Code, spawn the brain-compiler agent:
+   # "Convert src/services/AuthService.kt to SAN"
+   ```
+   The compiler writes `your-repo/.san/src/services/AuthService.san`.
+
+3. **Build the index:**
+   ```
+   # Call update_san_index("my-backend") via any agent
+   ```
+
+4. **Query SAN:**
+   ```
+   query_san("my-backend", "Auth")      # search by keyword
+   get_san("my-backend", "src/services/AuthService.kt")  # get specific file
+   check_san_freshness("my-backend")    # find stale files
+   ```
+
+> **Commit `.san/` to git.** SAN files are prebuilt knowledge — they help any developer (or agent) working on the project. Don't `.gitignore` them.
+
 ## Requirements
 
-- Claude Code (with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`)
+- Any MCP-compatible AI code agent (Claude Code, Cursor, Windsurf, Cline, etc.)
 - Python 3.10+
+- Optional: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` for multi-agent orchestration
 - Optional: [code-review-graph](https://github.com/nicobailey/code-review-graph) for code bridge features
 
 ## Configuration

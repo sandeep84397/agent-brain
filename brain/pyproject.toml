@@ -12,5 +12,5 @@ readme = "README.md"
 keywords = ["claude", "mcp", "agents", "memory", "decision-tracking"]
 
 [project.urls]
-Homepage = "https://github.com/anthropics/agent-brain"
-Issues = "https://github.com/anthropics/agent-brain/issues"
+Homepage = "https://github.com/sandeep84397/agent-brain"
+Issues = "https://github.com/sandeep84397/agent-brain/issues"
