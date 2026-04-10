@@ -170,6 +170,12 @@ If you already have agent `.md` files, **don't overwrite them**. Instead, add th
 
 ```markdown
 # Brain Protocol
+STEP 0 — Load MCP tools (do this FIRST, before anything else):
+    ToolSearch(query="agent-brain", max_results=25)
+    ToolSearch(query="code-review-graph", max_results=25)
+Both calls in parallel. This loads deferred MCP tools into your session.
+Without this, brain + graph tools don't exist in subagent contexts.
+
 Before starting any task:
 1. Call `pre_check(agent="<name>", area="<area>", action_description="<plan>")`
 2. If warnings exist, adjust approach
@@ -178,6 +184,16 @@ After feedback:
 4. Call `log_outcome(decision_id="<id>", outcome="<result>", outcome_by="<who>", reason="<why>")`
 NON-NEGOTIABLE.
 ```
+
+**Also add `ToolSearch` to the frontmatter tools list** — without it, subagents can't load deferred MCP tools:
+```yaml
+tools: [Read, Write, Edit, Glob, Grep, Bash, ToolSearch]
+```
+
+> **Why?** MCP tools like `pre_check`, `log_decision`, and `heartbeat` are deferred —
+> they must be loaded via `ToolSearch` before use. The main Claude Code session loads
+> them automatically, but subagents spawned via the `Agent` tool start fresh and need
+> to load them explicitly. Without Step 0, the entire brain loop is silently bypassed.
 
 For reviewers (PE, QA), also add:
 ```markdown
