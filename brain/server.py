@@ -1274,6 +1274,7 @@ def _parse_kotlin_to_san(source_text: str, file_rel: str) -> str:
 
     # Build SAN output
     san_parts = []
+    san_parts.append("# origin: parser")  # marks this as auto-generated (not LLM)
     if package:
         san_parts.append(f"# package: {package}")
         san_parts.append(f"# file: {file_rel}")
@@ -1349,6 +1350,8 @@ def _auto_recompile_san(repo_path: Path, san_dir: Path, stale_files: list[str],
             stats["errors"] += 1
 
     # Recompile stale + missing
+    # IMPORTANT: never overwrite LLM-generated SAN files with parser output.
+    # Only recompile if: (a) no .san exists, or (b) existing .san was parser-generated.
     for source_rel in stale_files + missing_files:
         source_path = repo_path / source_rel
         if not source_path.exists():
@@ -1356,10 +1359,21 @@ def _auto_recompile_san(repo_path: Path, san_dir: Path, stale_files: list[str],
         # Only parse Kotlin and Java files
         if source_path.suffix not in (".kt", ".java"):
             continue
+        san_path = _source_to_san_path(san_dir, source_rel)
+        # Skip if existing SAN was LLM-generated (preserve rich content)
+        if san_path.exists():
+            try:
+                first_line = san_path.read_text().split("\n", 1)[0]
+                if "# origin: parser" not in first_line:
+                    # LLM-generated — mark stale but don't overwrite
+                    stats.setdefault("skipped_llm", 0)
+                    stats["skipped_llm"] += 1
+                    continue
+            except OSError:
+                pass
         try:
             source_text = source_path.read_text(errors="replace")
             san_content = _parse_kotlin_to_san(source_text, source_rel)
-            san_path = _source_to_san_path(san_dir, source_rel)
             san_path.parent.mkdir(parents=True, exist_ok=True)
             san_path.write_text(san_content)
             stats["recompiled"] += 1
@@ -1456,6 +1470,8 @@ def _ensure_san_fresh(repo: str) -> Optional[str]:
         msg.append(f"auto-recompiled {stats['recompiled']} SAN file(s)")
     if stats["deleted"]:
         msg.append(f"deleted {stats['deleted']} orphan(s)")
+    if stats.get("skipped_llm"):
+        msg.append(f"skipped {stats['skipped_llm']} LLM-generated (stale but preserved)")
     if stats["errors"]:
         msg.append(f"{stats['errors']} error(s)")
     return ", ".join(msg) if msg else None
