@@ -1604,6 +1604,93 @@ def check_san_freshness(repo: str) -> str:
 
 
 @mcp.tool()
+def recompile_san(repo: str, file_path: str = "") -> str:
+    """
+    Force-recompile SAN files using the free Python parser.
+    Only overwrites parser-generated SAN (origin: parser), never LLM-generated.
+    Call with file_path="" to recompile ALL parser-generated .san files in the repo.
+
+    Args:
+        repo: Repository name from config.json
+        file_path: Source file path to recompile (e.g. "src/main/kotlin/.../Auth.kt"). Empty = all.
+    """
+    repo_path = _resolve_repo_path(repo)
+    if not repo_path:
+        return f"ERROR: repo '{repo}' not found in config"
+
+    san_dir = repo_path / ".san"
+    if not san_dir.exists():
+        san_dir.mkdir(parents=True, exist_ok=True)
+
+    recompiled = 0
+    skipped_llm = 0
+    errors = 0
+
+    if file_path:
+        # Single file
+        source_path = repo_path / file_path
+        if not source_path.exists():
+            return f"ERROR: source file not found: {file_path}"
+        if source_path.suffix not in (".kt", ".java"):
+            return f"ERROR: only .kt and .java files supported, got {source_path.suffix}"
+        san_path = _source_to_san_path(san_dir, file_path)
+        # Check if LLM-generated
+        if san_path.exists():
+            try:
+                first_line = san_path.read_text().split("\n", 1)[0]
+                if "# origin: parser" not in first_line:
+                    return (f"SKIPPED: {file_path} has LLM-generated SAN. "
+                            f"Run brain-compiler to upgrade it, or delete the .san file first to force parser.")
+            except OSError:
+                pass
+        try:
+            source_text = source_path.read_text(errors="replace")
+            san_content = _parse_kotlin_to_san(source_text, file_path)
+            san_path.parent.mkdir(parents=True, exist_ok=True)
+            san_path.write_text(san_content)
+            _rebuild_san_index(san_dir)
+            return f"Recompiled: {file_path} -> {san_path.relative_to(san_dir)}"
+        except Exception as e:
+            return f"ERROR recompiling {file_path}: {e}"
+    else:
+        # All files — find every .kt/.java in repo
+        for ext in ("**/*.kt", "**/*.java"):
+            for source_path in repo_path.glob(ext):
+                rel = str(source_path.relative_to(repo_path))
+                if rel.startswith("build/") or "/.gradle/" in rel or "/build/" in rel:
+                    continue
+                san_path = _source_to_san_path(san_dir, rel)
+                # Skip LLM-generated
+                if san_path.exists():
+                    try:
+                        first_line = san_path.read_text().split("\n", 1)[0]
+                        if "# origin: parser" not in first_line:
+                            skipped_llm += 1
+                            continue
+                    except OSError:
+                        pass
+                try:
+                    source_text = source_path.read_text(errors="replace")
+                    san_content = _parse_kotlin_to_san(source_text, rel)
+                    san_path.parent.mkdir(parents=True, exist_ok=True)
+                    san_path.write_text(san_content)
+                    recompiled += 1
+                except Exception:
+                    errors += 1
+
+        if recompiled > 0:
+            _rebuild_san_index(san_dir)
+
+        lines = [f"Recompile SAN for '{repo}':"]
+        lines.append(f"  Recompiled: {recompiled}")
+        if skipped_llm:
+            lines.append(f"  Skipped (LLM-generated, preserved): {skipped_llm}")
+        if errors:
+            lines.append(f"  Errors: {errors}")
+        return "\n".join(lines)
+
+
+@mcp.tool()
 def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
     """
     Search SAN files by keyword. Searches both the index and .san file contents.
