@@ -1082,6 +1082,427 @@ def office_state() -> str:
 # ===========================================================================
 
 
+# ---------------------------------------------------------------------------
+# Pure Python Kotlin/Java parser → SAN (zero LLM tokens)
+# ---------------------------------------------------------------------------
+
+_KIND_MAP = {
+    "class": "svc", "abstract class": "svc", "data class": "model",
+    "sealed class": "model", "sealed interface": "iface", "enum class": "model",
+    "object": "util", "interface": "iface", "annotation class": "model",
+}
+
+
+def _parse_kotlin_to_san(source_text: str, file_rel: str) -> str:
+    """Parse Kotlin/Java source into SAN notation. Pure regex, no LLM."""
+    raw_lines = source_text.split("\n")
+    package = ""
+    imports = []
+    declarations = []  # list of {kind, name, parent, params, functions, annotations}
+
+    # Pre-process: join multiline declarations (class Foo(\n  val x: X,\n) : Bar {)
+    lines = []
+    buf = ""
+    paren_depth = 0
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if buf:
+            buf += " " + stripped
+            paren_depth += stripped.count("(") - stripped.count(")")
+            if paren_depth <= 0:
+                lines.append(buf)
+                buf = ""
+                paren_depth = 0
+        elif re.match(r'(?:.*\s+)?(class|interface|object)\s+\w+', stripped) and "(" in stripped and ")" not in stripped:
+            # Start of multiline declaration
+            buf = stripped
+            paren_depth = stripped.count("(") - stripped.count(")")
+        elif re.match(r'(?:.*\s+)?(?:override\s+)?(?:suspend\s+)?fun\s+', stripped) and "(" in stripped and ")" not in stripped:
+            # Multiline function signature
+            buf = stripped
+            paren_depth = stripped.count("(") - stripped.count(")")
+        else:
+            lines.append(stripped)
+
+    if buf:
+        lines.append(buf)
+
+    current_decl = None
+    brace_depth = 0
+    in_decl = False
+
+    for stripped in lines:
+        # Package
+        if stripped.startswith("package "):
+            package = stripped.replace("package ", "").rstrip(";")
+            continue
+
+        # Imports
+        if stripped.startswith("import "):
+            imp = stripped.replace("import ", "").rstrip(";")
+            imports.append(imp)
+            continue
+
+        # Skip comments
+        if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+            continue
+
+        # Class/interface/object declaration
+        decl_match = re.match(
+            r'(?:(?:public|private|protected|internal|abstract|open|sealed|data|enum|annotation)\s+)*'
+            r'(class|interface|object|abstract\s+class|data\s+class|sealed\s+class|sealed\s+interface|enum\s+class|annotation\s+class)'
+            r'\s+(\w+)'
+            r'(?:\s*<[^>]+>)?'           # generics
+            r'(?:\s*\(([^)]*)\))?'       # constructor params (now on single joined line)
+            r'(?:\s*:\s*(.+?))?'         # inheritance
+            r'\s*\{?\s*$',
+            stripped
+        )
+        if decl_match:
+            kind_raw = decl_match.group(1).strip()
+            name = decl_match.group(2)
+            params_raw = decl_match.group(3) or ""
+            parent_raw = decl_match.group(4) or ""
+
+            # Parse constructor deps
+            deps = []
+            if params_raw:
+                for p in params_raw.split(","):
+                    p = p.strip()
+                    # "private val firestore: Firestore" → Firestore
+                    type_match = re.search(r':\s*(\w+)', p)
+                    if type_match:
+                        deps.append(type_match.group(1))
+
+            # Parse parent classes/interfaces
+            parents = []
+            if parent_raw:
+                for seg in parent_raw.split(","):
+                    seg = seg.strip().rstrip("{").strip()
+                    pname = re.match(r'(\w+)', seg)
+                    if pname:
+                        parents.append(pname.group(1))
+
+            kind = _KIND_MAP.get(kind_raw, "util")
+            # Heuristic: if name ends with Impl, it's a repo/svc impl
+            if name.endswith("Impl"):
+                kind = "repo" if "repository" in file_rel.lower() else "svc"
+            elif name.endswith("Repository"):
+                kind = "iface" if kind_raw == "interface" else "repo"
+            elif name.endswith("Service"):
+                kind = "svc"
+            elif name.endswith("Routes") or name.endswith("Routing"):
+                kind = "route"
+            elif name.endswith("Module"):
+                kind = "module"
+            elif name.endswith("ViewModel"):
+                kind = "vm"
+            elif name.endswith("UseCase"):
+                kind = "usecase"
+            elif name.endswith("Test"):
+                kind = "test"
+
+            current_decl = {
+                "kind_raw": kind_raw, "kind": kind, "name": name,
+                "parents": parents, "deps": deps, "functions": [],
+                "annotations": [],
+            }
+            declarations.append(current_decl)
+            in_decl = True
+            brace_depth = stripped.count("{") - stripped.count("}")
+            continue
+
+        # Track brace depth inside a declaration
+        if in_decl and current_decl:
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth <= 0:
+                in_decl = False
+                current_decl = None
+                brace_depth = 0
+                continue
+
+            # Function signatures inside the class
+            fn_match = re.match(
+                r'(?:(?:override|public|private|protected|internal|suspend|open|abstract|inline)\s+)*'
+                r'fun\s+(?:<[^>]+>\s*)?(?:\w+\.)?(\w+)\s*\(([^)]*)\)'
+                r'(?:\s*:\s*(\S+))?',
+                stripped
+            )
+            if fn_match:
+                fn_name = fn_match.group(1)
+                fn_params = fn_match.group(2).strip()
+                fn_ret = fn_match.group(3) or "Unit"
+                # Compress params: "userId: String, type: AlertType" → "userId: String, type: AlertType"
+                param_short = fn_params if len(fn_params) < 80 else _compress_params(fn_params)
+                is_suspend = "suspend " in stripped
+                prefix = "suspend " if is_suspend else ""
+                current_decl["functions"].append(f"{prefix}fn:{fn_name}({param_short}) → {fn_ret}")
+                continue
+
+            # Annotations on functions/properties
+            if stripped.startswith("@"):
+                ann = re.match(r'@(\w+)', stripped)
+                if ann and current_decl:
+                    current_decl["annotations"].append(ann.group(1))
+                continue
+
+    # Top-level functions (outside classes) — use raw_lines for brace counting
+    top_fns = []
+    in_any_class = False
+    class_brace = 0
+    for line in raw_lines:
+        stripped = line.strip()
+        if re.match(r'(?:.*\s+)?(class|interface|object)\s+', stripped):
+            in_any_class = True
+            class_brace = 0
+        if in_any_class:
+            class_brace += stripped.count("{") - stripped.count("}")
+            if class_brace <= 0:
+                in_any_class = False
+            continue
+        fn_match = re.match(
+            r'(?:(?:public|private|internal|suspend|inline)\s+)*fun\s+(?:<[^>]+>\s*)?(?:\w+\.)?(\w+)\s*\(([^)]*)\)(?:\s*:\s*(\S+))?',
+            stripped
+        )
+        if fn_match:
+            fn_name = fn_match.group(1)
+            fn_params = fn_match.group(2).strip()
+            fn_ret = fn_match.group(3) or "Unit"
+            is_suspend = "suspend " in stripped
+            prefix = "suspend " if is_suspend else ""
+            top_fns.append(f"{prefix}fn:{fn_name}({_compress_params(fn_params)}) → {fn_ret}")
+
+    # Build SAN output
+    san_parts = []
+    if package:
+        san_parts.append(f"# package: {package}")
+        san_parts.append(f"# file: {file_rel}")
+        san_parts.append("")
+
+    for decl in declarations:
+        qualified = f"{package}.{decl['name']}" if package else decl["name"]
+        san_parts.append(f"{qualified} @{decl['kind']} {{")
+        if decl["parents"]:
+            san_parts.append(f"  impl: {' + '.join(decl['parents'])}")
+        if decl["deps"]:
+            san_parts.append(f"  deps: {' + '.join(decl['deps'])}")
+        if decl["annotations"]:
+            unique_ann = list(dict.fromkeys(decl["annotations"]))
+            san_parts.append(f"  annotations: {', '.join(unique_ann)}")
+        for fn in decl["functions"]:
+            san_parts.append(f"  {fn}")
+        san_parts.append("}")
+        san_parts.append("")
+
+    if top_fns:
+        module_name = Path(file_rel).stem
+        qualified = f"{package}.{module_name}" if package else module_name
+        san_parts.append(f"{qualified} @util {{")
+        for fn in top_fns:
+            san_parts.append(f"  {fn}")
+        san_parts.append("}")
+        san_parts.append("")
+
+    return "\n".join(san_parts) if san_parts else f"# {file_rel}: no declarations found\n"
+
+
+def _compress_params(params: str) -> str:
+    """Shorten parameter lists: keep names + types, drop defaults."""
+    parts = []
+    for p in params.split(","):
+        p = p.strip()
+        # Remove default values
+        p = re.sub(r'\s*=\s*.+', '', p)
+        # Remove val/var keywords
+        p = re.sub(r'^(val|var)\s+', '', p)
+        parts.append(p.strip())
+    return ", ".join(parts)
+
+
+def _resolve_repo_path(repo: str) -> Optional[Path]:
+    """Resolve repo name to path from config."""
+    repo_paths = _get_repo_paths()
+    repo_path = repo_paths.get(repo)
+    if not repo_path:
+        for name, path in repo_paths.items():
+            if repo.lower() in name.lower():
+                repo_path = path
+                break
+    return repo_path
+
+
+def _auto_recompile_san(repo_path: Path, san_dir: Path, stale_files: list[str],
+                         missing_files: list[str], orphan_sans: list[Path]) -> dict:
+    """
+    Auto-recompile stale/missing SAN files using pure Python parser.
+    Delete orphan .san files whose source no longer exists.
+    Returns stats dict.
+    """
+    stats = {"recompiled": 0, "deleted": 0, "errors": 0}
+
+    # Delete orphans
+    for orphan in orphan_sans:
+        try:
+            orphan.unlink()
+            stats["deleted"] += 1
+        except OSError:
+            stats["errors"] += 1
+
+    # Recompile stale + missing
+    for source_rel in stale_files + missing_files:
+        source_path = repo_path / source_rel
+        if not source_path.exists():
+            continue
+        # Only parse Kotlin and Java files
+        if source_path.suffix not in (".kt", ".java"):
+            continue
+        try:
+            source_text = source_path.read_text(errors="replace")
+            san_content = _parse_kotlin_to_san(source_text, source_rel)
+            san_path = _source_to_san_path(san_dir, source_rel)
+            san_path.parent.mkdir(parents=True, exist_ok=True)
+            san_path.write_text(san_content)
+            stats["recompiled"] += 1
+        except Exception:
+            stats["errors"] += 1
+
+    return stats
+
+
+def _ensure_san_fresh(repo: str) -> Optional[str]:
+    """
+    Check SAN freshness and auto-recompile if stale. Returns status message or None.
+    Called internally by query_san and get_san before serving results.
+    """
+    repo_path = _resolve_repo_path(repo)
+    if not repo_path:
+        return None
+
+    san_dir = repo_path / ".san"
+    if not san_dir.exists():
+        # Auto-create .san dir and do initial scan
+        san_dir.mkdir(parents=True, exist_ok=True)
+
+    index = _load_san_index(san_dir)
+
+    stale = []
+    missing_san = []
+    orphans = []
+
+    if index:
+        # Check indexed files
+        seen_source_rels = set()
+        for qualified_name, meta in index.items():
+            source_rel = meta.get("file", "")
+            if not source_rel:
+                continue
+            seen_source_rels.add(source_rel)
+            source_path = repo_path / source_rel
+            san_path = _source_to_san_path(san_dir, source_rel)
+
+            if not source_path.exists():
+                if san_path.exists():
+                    orphans.append(san_path)
+            elif not san_path.exists():
+                missing_san.append(source_rel)
+            else:
+                if source_path.stat().st_mtime > san_path.stat().st_mtime:
+                    stale.append(source_rel)
+
+        # Find .san files with no index entry and no source
+        try:
+            for san_file in san_dir.rglob("*.san"):
+                rel = str(san_file.relative_to(san_dir))
+                source_rel = str(Path(rel).with_suffix(""))
+                # Check if there's a matching source extension
+                for ext in (".kt", ".java"):
+                    candidate = repo_path / (source_rel + ext) if not source_rel.endswith(ext) else repo_path / source_rel
+                    if candidate.exists():
+                        break
+                else:
+                    # No source found for this .san file
+                    if san_file not in orphans:
+                        # Check with original extension
+                        source_with_ext = repo_path / source_rel
+                        if not source_with_ext.exists():
+                            orphans.append(san_file)
+        except Exception:
+            pass
+    else:
+        # No index — scan source tree for Kotlin/Java files and create SAN for all
+        for ext in ("**/*.kt", "**/*.java"):
+            for source_path in repo_path.glob(ext):
+                # Skip build dirs
+                rel = str(source_path.relative_to(repo_path))
+                if rel.startswith("build/") or "/.gradle/" in rel:
+                    continue
+                san_path = _source_to_san_path(san_dir, rel)
+                if not san_path.exists():
+                    missing_san.append(rel)
+                elif source_path.stat().st_mtime > san_path.stat().st_mtime:
+                    stale.append(rel)
+
+    if not stale and not missing_san and not orphans:
+        return None
+
+    stats = _auto_recompile_san(repo_path, san_dir, stale, missing_san, orphans)
+
+    # Rebuild index after recompile
+    if stats["recompiled"] > 0 or stats["deleted"] > 0:
+        _rebuild_san_index(san_dir)
+
+    msg = []
+    if stats["recompiled"]:
+        msg.append(f"auto-recompiled {stats['recompiled']} SAN file(s)")
+    if stats["deleted"]:
+        msg.append(f"deleted {stats['deleted']} orphan(s)")
+    if stats["errors"]:
+        msg.append(f"{stats['errors']} error(s)")
+    return ", ".join(msg) if msg else None
+
+
+def _rebuild_san_index(san_dir: Path):
+    """Rebuild _index.json from .san files. Pure Python, no MCP tool call."""
+    index = {}
+    try:
+        for san_file in san_dir.rglob("*.san"):
+            rel = str(san_file.relative_to(san_dir))
+            try:
+                content = san_file.read_text()
+            except OSError:
+                continue
+
+            source_rel = str(Path(rel).with_suffix(""))
+            # Determine source extension
+            for ext in (".kt", ".java"):
+                if source_rel.endswith(ext):
+                    break
+            else:
+                # Try .kt first
+                source_rel_kt = source_rel + ".kt" if not source_rel.endswith(".kt") else source_rel
+                source_rel = source_rel_kt
+
+            # Extract qualified names from SAN content
+            for match in re.finditer(r'^([\w.]+)\s+@(\w+)\s*\{', content, re.MULTILINE):
+                qname = match.group(1)
+                kind = match.group(2)
+                index[qname] = {
+                    "kind": kind,
+                    "file": source_rel,
+                    "tokens_san": len(content.split()),
+                }
+    except Exception:
+        pass
+
+    idx_file = san_dir / "_index.json"
+    try:
+        tmp = idx_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(index, indent=2))
+        tmp.rename(idx_file)
+    except OSError:
+        pass
+
+
 def _get_san_dir(repo: str) -> Optional[Path]:
     """Get the .san/ directory for a repo."""
     repo_paths = _get_repo_paths()
@@ -1118,32 +1539,28 @@ def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
 @mcp.tool()
 def check_san_freshness(repo: str) -> str:
     """
-    Check which SAN files are stale (source newer than SAN) or missing.
+    Check SAN freshness and auto-recompile stale/missing files.
+    Deletes orphan .san files whose source no longer exists.
+    Uses pure Python parser (zero LLM tokens).
 
     Args:
         repo: Repository name from config.json
     """
-    repo_paths = _get_repo_paths()
-    repo_path = repo_paths.get(repo)
-    if not repo_path:
-        for name, path in repo_paths.items():
-            if repo.lower() in name.lower():
-                repo_path = path
-                break
+    repo_path = _resolve_repo_path(repo)
     if not repo_path:
         return f"ERROR: repo '{repo}' not found in config"
 
+    # Auto-recompile handles everything
+    result = _ensure_san_fresh(repo)
+
+    # Now report current state
     san_dir = repo_path / ".san"
     if not san_dir.exists():
-        return f"No .san/ directory in '{repo}'. Run brain-compiler to generate SAN files."
+        return f"No .san/ directory in '{repo}'."
 
     index = _load_san_index(san_dir)
-    if not index:
-        return f".san/ exists but _index.json is empty or missing. Run update_san_index first."
-
-    stale = []
-    missing = []
     fresh = 0
+    remaining_stale = []
 
     for qualified_name, meta in index.items():
         source_rel = meta.get("file", "")
@@ -1151,34 +1568,22 @@ def check_san_freshness(repo: str) -> str:
             continue
         source_path = repo_path / source_rel
         san_path = _source_to_san_path(san_dir, source_rel)
-
-        if not san_path.exists():
-            missing.append(source_rel)
-        elif not source_path.exists():
-            # Source deleted but SAN remains — stale
-            stale.append(f"{source_rel} (source deleted)")
-        else:
-            src_mtime = source_path.stat().st_mtime
-            san_mtime = san_path.stat().st_mtime
-            if src_mtime > san_mtime:
-                stale.append(source_rel)
+        if san_path.exists() and source_path.exists():
+            if source_path.stat().st_mtime > san_path.stat().st_mtime:
+                remaining_stale.append(source_rel)
             else:
                 fresh += 1
 
-    lines = [f"SAN freshness for '{repo}':", f"  Fresh: {fresh}", f"  Stale: {len(stale)}",
-             f"  Missing: {len(missing)}"]
-    if stale:
-        lines.append("\nStale (need re-compilation):")
-        for s in stale[:20]:
+    lines = [f"SAN freshness for '{repo}':",
+             f"  Entries: {len(index)}",
+             f"  Fresh: {fresh}",
+             f"  Remaining stale: {len(remaining_stale)}"]
+    if result:
+        lines.insert(1, f"  Auto-fix: {result}")
+    if remaining_stale:
+        lines.append("\nStill stale (non-Kotlin/Java, need manual recompile):")
+        for s in remaining_stale[:10]:
             lines.append(f"  - {s}")
-        if len(stale) > 20:
-            lines.append(f"  ... and {len(stale) - 20} more")
-    if missing:
-        lines.append("\nMissing SAN files:")
-        for m in missing[:20]:
-            lines.append(f"  - {m}")
-        if len(missing) > 20:
-            lines.append(f"  ... and {len(missing) - 20} more")
     return "\n".join(lines)
 
 
@@ -1192,9 +1597,19 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
         keyword: Search term (function name, class name, pattern, etc.)
         max_results: Maximum results to return (default 10)
     """
+    # Auto-recompile stale SAN before searching
+    _ensure_san_fresh(repo)
+
     san_dir = _get_san_dir(repo)
     if not san_dir:
-        return f"No .san/ directory for '{repo}'."
+        # _ensure_san_fresh should have created it, but try resolving manually
+        repo_path = _resolve_repo_path(repo)
+        if repo_path:
+            san_dir = repo_path / ".san"
+            if not san_dir.exists():
+                return f"No .san/ directory for '{repo}'."
+        else:
+            return f"No .san/ directory for '{repo}'."
 
     index = _load_san_index(san_dir)
     keyword_lower = keyword.lower()
@@ -1272,9 +1687,16 @@ def get_san(repo: str, file_path: str) -> str:
         repo: Repository name from config.json
         file_path: Source file path (relative to repo root, e.g. "src/main/kotlin/com/example/Auth.kt")
     """
+    # Auto-recompile stale SAN before reading
+    _ensure_san_fresh(repo)
+
     san_dir = _get_san_dir(repo)
     if not san_dir:
-        return f"No .san/ directory for '{repo}'."
+        repo_path = _resolve_repo_path(repo)
+        if repo_path:
+            san_dir = repo_path / ".san"
+        if not san_dir or not san_dir.exists():
+            return f"No .san/ directory for '{repo}'."
 
     san_path = _source_to_san_path(san_dir, file_path)
     if not san_path.exists():
