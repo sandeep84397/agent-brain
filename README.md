@@ -58,7 +58,7 @@ The setup wizard will:
 │  Your Machine (global)                          │
 │                                                 │
 │  ~/.agent-brain/                                │
-│  ├── server.py        ← MCP server (21 tools)  │
+│  ├── server.py        ← MCP server (24 tools)  │
 │  ├── config.json      ← your repos + team      │
 │  └── decisions.json   ← persistent memory       │
 │                                                 │
@@ -80,7 +80,7 @@ The setup wizard will:
 └─────────────────────────────────────────────────┘
 ```
 
-## MCP Tools (21)
+## MCP Tools (24)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
