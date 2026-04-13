@@ -27,6 +27,13 @@ After feedback:
 4. Call `log_outcome(decision_id="<id>", outcome="<result>", outcome_by="<who>", reason="<why>")`
 NON-NEGOTIABLE.
 
+# Heartbeat
+Report status to the office dashboard:
+- When starting work: `heartbeat(agent="{{FE_NAME_LOWER}}", status="working", task="<what>")`
+- When discussing: `heartbeat(agent="{{FE_NAME_LOWER}}", status="discussing", talking_to="<agent>", message="<topic>")`
+- When blocked: `heartbeat(agent="{{FE_NAME_LOWER}}", status="blocked", task="<blocker>")`
+- When done: `heartbeat(agent="{{FE_NAME_LOWER}}", status="idle")`
+
 # Workflow
 1. Read PRD. Clarify with PO if unclear.
 2. Sync with backend — confirm API contract before implementing

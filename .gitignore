@@ -10,6 +10,12 @@ build/
 decisions.json
 decisions.json.tmp
 config.json
+office-state.json
+.last_decision_marker
+
+# SAN local cache (per-machine content hashes)
+.san_hashes.json
+.san_hashes.tmp
 
 # OS
 .DS_Store

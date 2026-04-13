@@ -56,7 +56,10 @@ def _load_config() -> dict:
 def _get_repo_paths() -> dict[str, Path]:
     """Get configured repo name → path mapping."""
     config = _load_config()
-    return {name: Path(p) for name, p in config.get("repos", {}).items()}
+    repos = config.get("repos", {})
+    if not isinstance(repos, dict):
+        return {}
+    return {name: Path(p) for name, p in repos.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -188,23 +191,22 @@ def _resolve_files_to_code_nodes(repo: str, files: list[str]) -> list[dict]:
 
     results = []
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        repo_paths = _get_repo_paths()
-        for f in files:
-            rel = f
-            for prefix in [str(p) + "/" for p in repo_paths.values()]:
-                if f.startswith(prefix):
-                    rel = f[len(prefix):]
-                    break
-            rows = conn.execute(
-                "SELECT kind, name, qualified_name, file_path, line_start, line_end "
-                "FROM nodes WHERE file_path LIKE ? ORDER BY kind, name",
-                (f"%{rel}%",),
-            ).fetchall()
-            for r in rows:
-                results.append(dict(r))
-        conn.close()
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            repo_paths = _get_repo_paths()
+            for f in files:
+                rel = f
+                for prefix in [str(p) + "/" for p in repo_paths.values()]:
+                    if f.startswith(prefix):
+                        rel = f[len(prefix):]
+                        break
+                rows = conn.execute(
+                    "SELECT kind, name, qualified_name, file_path, line_start, line_end "
+                    "FROM nodes WHERE file_path LIKE ? ORDER BY kind, name",
+                    (f"%{rel}%",),
+                ).fetchall()
+                for r in rows:
+                    results.append(dict(r))
     except Exception:
         pass
     return results
@@ -216,16 +218,15 @@ def _get_code_node_details(repo: str, qualified_name: str) -> Optional[dict]:
     if not db_path:
         return None
     try:
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT kind, name, qualified_name, file_path, line_start, line_end, "
-            "parent_name, params, return_type "
-            "FROM nodes WHERE qualified_name = ?",
-            (qualified_name,),
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT kind, name, qualified_name, file_path, line_start, line_end, "
+                "parent_name, params, return_type "
+                "FROM nodes WHERE qualified_name = ?",
+                (qualified_name,),
+            ).fetchone()
+            return dict(row) if row else None
     except Exception:
         return None
 
@@ -236,14 +237,13 @@ def _get_callers_of(repo: str, qualified_name: str) -> list[str]:
     if not db_path:
         return []
     try:
-        conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT DISTINCT source_qualified FROM edges "
-            "WHERE target_qualified = ? AND kind = 'CALLS'",
-            (qualified_name,),
-        ).fetchall()
-        conn.close()
-        return [r[0] for r in rows]
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT source_qualified FROM edges "
+                "WHERE target_qualified = ? AND kind = 'CALLS'",
+                (qualified_name,),
+            ).fetchall()
+            return [r[0] for r in rows]
     except Exception:
         return []
 
@@ -1079,7 +1079,8 @@ def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", mes
 @mcp.tool()
 def office_state() -> str:
     """Get current office state (for debugging the dashboard)."""
-    state = _load_office_state()
+    with OFFICE_LOCK:
+        state = _load_office_state()
     if not state.get("agents"):
         return "Office is empty. No agents have checked in."
     lines = ["=== OFFICE STATE ===\n"]
@@ -1109,7 +1110,8 @@ def detect_stalls(stall_minutes: int = 5) -> str:
     Args:
         stall_minutes: Minutes of inactivity before an agent is considered stalled (default 5)
     """
-    state = _load_office_state()
+    with OFFICE_LOCK:
+        state = _load_office_state()
     agents_info = state.get("agents", {})
     now = datetime.now()
 
@@ -1689,7 +1691,7 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
         keyword: Search term (function name, class name, pattern, etc.)
         max_results: Maximum results to return (default 10)
     """
-    # Auto-recompile stale SAN before searching
+    # Check SAN freshness before searching
     _ensure_san_fresh(repo)
 
     san_dir = _get_san_dir(repo)
@@ -1779,7 +1781,7 @@ def get_san(repo: str, file_path: str) -> str:
         repo: Repository name from config.json
         file_path: Source file path (relative to repo root, e.g. "src/main/kotlin/com/example/Auth.kt")
     """
-    # Auto-recompile stale SAN before reading
+    # Check SAN freshness before reading
     _ensure_san_fresh(repo)
 
     san_dir = _get_san_dir(repo)
@@ -2169,6 +2171,7 @@ def validate_brain() -> str:
     real_graph_file = GRAPH_FILE
     real_config_file = CONFIG_FILE
     real_office_file = OFFICE_STATE_FILE
+    real_marker_file = DECISION_MARKER_FILE
 
     def _test(name: str, condition: bool, detail: str = ""):
         nonlocal passed, failed
@@ -2179,13 +2182,16 @@ def validate_brain() -> str:
             failed += 1
             results.append(f"  FAIL: {name}" + (f" — {detail}" if detail else ""))
 
-    try:
+    # Acquire both locks to prevent concurrent access during global swap
+    with LOCK, OFFICE_LOCK:
+     try:
         tmp_root = Path(tempfile.mkdtemp(prefix="brain_validate_"))
-        # Redirect globals to temp
+        # Redirect globals to temp (including marker to avoid polluting real state)
         globals()["BRAIN_DIR"] = tmp_root
         globals()["GRAPH_FILE"] = tmp_root / "decisions.json"
         globals()["CONFIG_FILE"] = tmp_root / "config.json"
         globals()["OFFICE_STATE_FILE"] = tmp_root / "office-state.json"
+        globals()["DECISION_MARKER_FILE"] = tmp_root / ".last_decision_marker"
 
         # ===================================================================
         # SECTION 1: Graph Persistence
@@ -2593,17 +2599,18 @@ def validate_brain() -> str:
               "similar past failure" in r.lower() or "payment" in r.lower(),
               f"got: {r[:200]}")
 
-    except Exception as e:
+     except Exception as e:
         import traceback
         failed += 1
         results.append(f"  FAIL: unexpected exception — {type(e).__name__}: {e}")
         results.append(f"  {traceback.format_exc()[-500:]}")
-    finally:
+     finally:
         # Restore real globals
         globals()["BRAIN_DIR"] = real_brain_dir
         globals()["GRAPH_FILE"] = real_graph_file
         globals()["CONFIG_FILE"] = real_config_file
         globals()["OFFICE_STATE_FILE"] = real_office_file
+        globals()["DECISION_MARKER_FILE"] = real_marker_file
         # Clean up
         if tmp_root and tmp_root.exists():
             try:

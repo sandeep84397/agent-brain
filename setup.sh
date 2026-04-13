@@ -103,6 +103,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 4b: Install enforcement hook
+# ---------------------------------------------------------------------------
+echo ""
+echo "[4b] Installing brain protocol enforcement hook..."
+
+SETTINGS_FILE="$HOME/.claude/settings.json"
+HOOK_SCRIPT="$SCRIPT_DIR/brain/hooks/enforce_brain_protocol.py"
+
+if [ -f "$HOOK_SCRIPT" ]; then
+    if [ -f "$SETTINGS_FILE" ]; then
+        # Check if hook already installed
+        if grep -q "enforce_brain_protocol" "$SETTINGS_FILE" 2>/dev/null; then
+            echo "  Enforcement hook already installed. Skipping."
+        else
+            echo "  NOTE: Add this PreToolUse hook to $SETTINGS_FILE to enforce brain protocol:"
+            echo "  {\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Edit|Write\", \"hooks\": [{\"type\": \"command\", \"command\": \"python3 $HOOK_SCRIPT\", \"timeout\": 5000}]}]}}"
+            echo "  This blocks code edits unless log_decision was called first."
+            echo "  Set BRAIN_SKIP_ENFORCE=1 in env to bypass for your own direct edits."
+        fi
+    else
+        echo "  WARNING: $SETTINGS_FILE not found. Create it and add the hook manually."
+    fi
+else
+    echo "  WARNING: Hook script not found at $HOOK_SCRIPT"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 5: Install agent templates
 # ---------------------------------------------------------------------------
 echo ""

@@ -28,6 +28,14 @@ After reviewing another agent's work:
 5. Call `log_feedback(agent="{{PE_NAME_LOWER}}", decision_id="<their-id>", feedback="<detail>", severity="blocker|warning|info")`
 NON-NEGOTIABLE.
 
+# Heartbeat
+Report status to the office dashboard:
+- When starting work: `heartbeat(agent="{{PE_NAME_LOWER}}", status="working", task="<what>")`
+- When reviewing: `heartbeat(agent="{{PE_NAME_LOWER}}", status="reviewing", task="<what>")`
+- When discussing: `heartbeat(agent="{{PE_NAME_LOWER}}", status="discussing", talking_to="<agent>", message="<topic>")`
+- When blocked: `heartbeat(agent="{{PE_NAME_LOWER}}", status="blocked", task="<blocker>")`
+- When done: `heartbeat(agent="{{PE_NAME_LOWER}}", status="idle")`
+
 # Role
 Architecture guardian. Cross-cutting. Reviews all repos.
 

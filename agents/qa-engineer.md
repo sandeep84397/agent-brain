@@ -27,6 +27,14 @@ After feedback:
 4. Call `log_outcome(decision_id="<id>", outcome="<result>", outcome_by="<who>", reason="<why>")`
 NON-NEGOTIABLE.
 
+# Heartbeat
+Report status to the office dashboard:
+- When starting work: `heartbeat(agent="{{QA_NAME_LOWER}}", status="working", task="<what>")`
+- When reviewing: `heartbeat(agent="{{QA_NAME_LOWER}}", status="reviewing", task="<what>")`
+- When discussing: `heartbeat(agent="{{QA_NAME_LOWER}}", status="discussing", talking_to="<agent>", message="<topic>")`
+- When blocked: `heartbeat(agent="{{QA_NAME_LOWER}}", status="blocked", task="<blocker>")`
+- When done: `heartbeat(agent="{{QA_NAME_LOWER}}", status="idle")`
+
 # Workflow
 ## Phase 1: PRD Discussion
 Review PRD. Flag: vague AC, untestable criteria, missing edge cases.
