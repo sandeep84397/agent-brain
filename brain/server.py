@@ -82,6 +82,22 @@ def _save_office_state(state: dict) -> None:
     tmp.rename(OFFICE_STATE_FILE)
 
 
+DECISION_MARKER_FILE = BRAIN_DIR / ".last_decision_marker"
+
+
+def _write_decision_marker(agent: str, decision_id: str) -> None:
+    """Write a lightweight marker so the enforcement hook knows a decision was logged."""
+    try:
+        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        DECISION_MARKER_FILE.write_text(json.dumps({
+            "agent": agent,
+            "decision_id": decision_id,
+            "timestamp": datetime.now().isoformat(),
+        }))
+    except OSError:
+        pass
+
+
 def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "") -> None:
     """Silently update office state from brain tool calls. Never raises."""
     try:
@@ -544,6 +560,8 @@ def log_decision(
             G.add_edge(node_id, sym_node, relation="touches")
         _save_graph(G)
     _auto_heartbeat(agent, "working", action)
+    # Write marker for brain-protocol enforcement hook
+    _write_decision_marker(agent, node_id)
     result = f"Decision logged: {node_id}"
     if resolved_symbols:
         result += f"\nLinked to {len(resolved_symbols)} code symbol(s)"

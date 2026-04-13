@@ -225,6 +225,41 @@ Every agent must follow this before starting work:
 
 This is enforced in every agent's `.md` file as NON-NEGOTIABLE.
 
+### Enforcement Hook
+
+Text in `.md` files is advisory — agents can skip it. The enforcement hook makes it **mandatory**: any Edit/Write to code files is blocked if no `log_decision` was called in the last 30 minutes.
+
+**How it works:**
+1. `log_decision()` writes a marker file (`~/.agent-brain/.last_decision_marker`)
+2. A PreToolUse hook fires before every Edit/Write
+3. If marker is missing or stale (>30min), the hook blocks with exit code 2
+4. Claude sees the block reason and calls `log_decision` before retrying
+
+**Skips** (no block): `.md`, `.json`, `.yaml`, `.toml`, config files, `.claude/`, `.git/`, `.san/`, `node_modules/`, `build/`
+
+**Install** (setup.sh does this automatically):
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/agent-brain/brain/hooks/enforce_brain_protocol.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> **Fail-open**: If the marker file is corrupt or the hook script errors, it allows the edit (exit 0). The hook never crashes your workflow — it only blocks when it's confident no decision was logged.
+
 ## SAN Protocol
 
 Structured Associative Notation compresses code by ~85% while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.
