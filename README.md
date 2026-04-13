@@ -260,6 +260,12 @@ Text in `.md` files is advisory — agents can skip it. The enforcement hook mak
 
 > **Fail-open**: If the marker file is corrupt or the hook script errors, it allows the edit (exit 0). The hook never crashes your workflow — it only blocks when it's confident no decision was logged.
 
+> **Bypass for direct edits**: The hook fires on all Edit/Write — agents and user alike. To skip enforcement when you're editing directly, set `BRAIN_SKIP_ENFORCE=1` in your shell before launching Claude Code, or add it to your settings.json env block:
+> ```json
+> { "env": { "BRAIN_SKIP_ENFORCE": "1" } }
+> ```
+> Agents spawned via the team system won't inherit this, so enforcement stays active for them.
+
 ## SAN Protocol
 
 Structured Associative Notation compresses code by ~85% while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.

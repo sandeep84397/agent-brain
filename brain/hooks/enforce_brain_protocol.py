@@ -32,6 +32,10 @@ def main():
         # Can't parse input — don't block, fail open
         sys.exit(0)
 
+    # Bypass: set BRAIN_SKIP_ENFORCE=1 for direct user sessions
+    if os.environ.get("BRAIN_SKIP_ENFORCE") == "1":
+        sys.exit(0)
+
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
 
