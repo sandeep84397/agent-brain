@@ -58,7 +58,7 @@ The setup wizard will:
 │  Your Machine (global)                          │
 │                                                 │
 │  ~/.agent-brain/                                │
-│  ├── server.py        ← MCP server (24 tools)  │
+│  ├── server.py        ← MCP server (25 tools)  │
 │  ├── config.json      ← your repos + team      │
 │  └── decisions.json   ← persistent memory       │
 │                                                 │
@@ -80,7 +80,7 @@ The setup wizard will:
 └─────────────────────────────────────────────────┘
 ```
 
-## MCP Tools (24)
+## MCP Tools (25)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -122,6 +122,7 @@ The setup wizard will:
 |------|---------|
 | `heartbeat` | Report agent status (working/idle/discussing/blocked) for live dashboard |
 | `office_state` | Get current office state (debugging) |
+| `detect_stalls` | Find agents with open decisions but no activity for N minutes (default 5) |
 
 ### SAN (Structured Associative Notation)
 | Tool | Purpose |

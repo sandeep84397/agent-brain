@@ -1081,6 +1081,100 @@ def office_state() -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def detect_stalls(stall_minutes: int = 5) -> str:
+    """
+    Detect agents that appear stalled: have open decisions (outcome=pending)
+    but no heartbeat activity within stall_minutes. Returns a report for the
+    Project Manager to act on.
+
+    Args:
+        stall_minutes: Minutes of inactivity before an agent is considered stalled (default 5)
+    """
+    state = _load_office_state()
+    agents_info = state.get("agents", {})
+    now = datetime.now()
+
+    # Find all open (pending) decisions grouped by agent
+    with LOCK:
+        G = _load_graph()
+    open_by_agent: dict[str, list] = defaultdict(list)
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") == "decision" and data.get("outcome") == "pending":
+            open_by_agent[data.get("agent", "unknown")].append({
+                "id": node_id,
+                "area": data.get("area", ""),
+                "action": data.get("action", "")[:80],
+                "timestamp": data.get("timestamp", ""),
+            })
+
+    if not open_by_agent:
+        return "No open decisions. Nothing to check."
+
+    stalled = []
+    active = []
+    no_heartbeat = []
+
+    for agent, decisions in open_by_agent.items():
+        agent_state = agents_info.get(agent)
+        if not agent_state:
+            # Agent has open decisions but never sent a heartbeat
+            no_heartbeat.append((agent, decisions))
+            continue
+
+        last_seen_str = agent_state.get("last_seen", "")
+        status = agent_state.get("status", "unknown")
+
+        # If agent reported blocked, that's not a stall — it's a known blocker
+        if status == "blocked":
+            active.append((agent, status, "blocked — not a stall"))
+            continue
+
+        try:
+            last_seen = datetime.fromisoformat(last_seen_str)
+            idle_minutes = (now - last_seen).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            no_heartbeat.append((agent, decisions))
+            continue
+
+        if idle_minutes >= stall_minutes:
+            stalled.append({
+                "agent": agent,
+                "idle_minutes": round(idle_minutes, 1),
+                "last_status": status,
+                "open_decisions": decisions,
+            })
+        else:
+            active.append((agent, status, f"seen {round(idle_minutes, 1)}m ago"))
+
+    # Build report
+    lines = [f"=== STALL DETECTION (threshold: {stall_minutes}m) ===\n"]
+
+    if stalled:
+        lines.append(f"STALLED ({len(stalled)} agent(s)):\n")
+        for s in stalled:
+            lines.append(f"  {s['agent']} — idle {s['idle_minutes']}m, last status: {s['last_status']}")
+            for d in s["open_decisions"]:
+                lines.append(f"    [{d['id']}] {d['area']}: {d['action']}")
+            lines.append("")
+        lines.append("ACTION: Nudge these agents to continue or log_outcome if done.\n")
+    else:
+        lines.append("No stalled agents.\n")
+
+    if no_heartbeat:
+        lines.append(f"NO HEARTBEAT ({len(no_heartbeat)} agent(s) with open decisions but no activity):\n")
+        for agent, decisions in no_heartbeat:
+            lines.append(f"  {agent} — never checked in, {len(decisions)} open decision(s)")
+        lines.append("")
+
+    if active:
+        lines.append(f"ACTIVE ({len(active)}):")
+        for agent, status, detail in active:
+            lines.append(f"  {agent}: {status} ({detail})")
+
+    return "\n".join(lines)
+
+
 # ===========================================================================
 # MCP Tools — SAN (Structured Associative Notation)
 # ===========================================================================
