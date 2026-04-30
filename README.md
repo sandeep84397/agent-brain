@@ -51,6 +51,41 @@ The setup wizard will:
 > ```
 > The server gracefully handles a missing `config.json` — it starts with an empty brain.
 
+### Linking a project (so subagents can use brain)
+
+`./setup.sh` registers brain at the user level. That's enough for the **main Claude Code session**, but **subagents spawned inside a project** read MCP config from project-scoped files. Run:
+
+```bash
+./setup.sh --link-project=/absolute/path/to/your/project
+```
+
+This is **idempotent** and writes/merges:
+
+- `<project>/.mcp.json` — adds the `agent-brain` server entry alongside any existing entries
+- `<project>/.claude/settings.local.json` — sets `enableAllProjectMcpServers: true` and adds `agent-brain` to `enabledMcpjsonServers`
+- `<project>/.gitignore` — appends `.mcp.json`, `.san/.san_hashes.json`, `.san/_cache/`
+
+After running it, restart Claude Code in the project (`/exit` then `claude`), then verify:
+
+```bash
+~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose --project=/absolute/path/to/your/project
+```
+
+### How brain MCP reaches Claude Code subagents (4-layer model)
+
+Brain tools work in BOTH the main Claude Code session AND spawned subagents only when all four layers are correctly configured:
+
+| Layer | File | What it does | Set by |
+|---|---|---|---|
+| 1 | `~/.claude.json` *or* `~/.claude/settings.json` `mcpServers` | Registers `agent-brain` server for the main session | `setup.sh` (initial install) |
+| 2 | `~/.claude/settings.local.json` `enabledMcpjsonServers` | User-level allowlist (only relevant if you use allowlist mode) | `setup.sh` (auto-detects allowlist; appends `agent-brain` if needed) |
+| 3 | `<project>/.mcp.json` | Project-scoped server registration — **subagents read this** | `setup.sh --link-project=<path>` |
+| 4 | `<project>/.claude/settings.local.json` `enableAllProjectMcpServers: true` + `enabledMcpjsonServers: ["agent-brain"]` | Project-level activation | `setup.sh --link-project=<path>` |
+
+**Plus** the agent frontmatter rule (see [Already have custom agents?](#already-have-custom-agents) below): **omit the `tools:` field** so MCP tools are inherited. Setting `tools: [Read, Write, ...]` makes it an allowlist that silently strips every `mcp__*` tool, and `mcp__agent-brain__*` is not a valid wildcard.
+
+After any config change, restart Claude Code (`/exit` then `claude`) — MCP and agent definitions are loaded at session start. Then run `server.py diagnose --project=<path>` to confirm all four layers are wired up.
+
 ## Architecture
 
 ```
@@ -174,12 +209,6 @@ If you already have agent `.md` files, **don't overwrite them**. Instead, add th
 
 ```markdown
 # Brain Protocol
-STEP 0 — Load MCP tools (do this FIRST, before anything else):
-    ToolSearch(query="agent-brain", max_results=25)
-    ToolSearch(query="code-review-graph", max_results=25)
-Both calls in parallel. This loads deferred MCP tools into your session.
-Without this, brain + graph tools don't exist in subagent contexts.
-
 Before starting any task:
 1. Call `pre_check(agent="<name>", area="<area>", action_description="<plan>")`
 2. If warnings exist, adjust approach
@@ -189,15 +218,22 @@ After feedback:
 NON-NEGOTIABLE.
 ```
 
-**Also add `ToolSearch` to the frontmatter tools list** — without it, subagents can't load deferred MCP tools:
+**Critical: do NOT set the frontmatter `tools:` field.** Claude Code subagents inherit ALL tools from the parent session — including every `mcp__agent-brain__*` tool — *only when `tools:` is omitted*. Setting it (even with `ToolSearch` included) turns it into a literal allowlist that silently strips MCP tools, because `mcp__*` is not a valid wildcard. Reference: [Claude Code subagents — Available tools](https://code.claude.com/docs/en/sub-agents#available-tools).
+
 ```yaml
-tools: [Read, Write, Edit, Glob, Grep, Bash, ToolSearch]
+---
+name: my-agent
+description: ...
+model: claude-sonnet-4-6
+# No `tools:` — inherits everything from the parent session, including MCP.
+# To restrict tools, use `disallowedTools:` instead.
+---
 ```
 
-> **Why?** MCP tools like `pre_check`, `log_decision`, and `heartbeat` are deferred —
-> they must be loaded via `ToolSearch` before use. The main Claude Code session loads
-> them automatically, but subagents spawned via the `Agent` tool start fresh and need
-> to load them explicitly. Without Step 0, the entire brain loop is silently bypassed.
+> **What if I really must restrict tools?** Add `ToolSearch` to your `tools:` allowlist
+> and bootstrap brain tools at the top of every task with
+> `ToolSearch(query="agent-brain", max_results=25)`. This is a fallback for the rare
+> case where you genuinely need a tool denylist; for normal use, omit `tools:` entirely.
 
 For reviewers (PE, QA), also add:
 ```markdown
@@ -236,6 +272,21 @@ Text in `.md` files is advisory — agents can skip it. The enforcement hook mak
 4. Claude sees the block reason and calls `log_decision` before retrying
 
 **Skips** (no block): `.md`, `.json`, `.yaml`, `.toml`, config files, `.claude/`, `.git/`, `.san/`, `node_modules/`, `build/`
+
+**Custom skip patterns** — extend the built-in skip list with fnmatch globs in `~/.agent-brain/config.json`:
+
+```json
+{
+  "hook_skip_paths": [
+    "**/docs/**",
+    "**/.github/**",
+    "**/CHANGELOG*",
+    "**/migrations/**"
+  ]
+}
+```
+
+Patterns are matched against the absolute file path. The hook fails open: an invalid `hook_skip_paths` value is ignored silently rather than blocking your session.
 
 **Install** (setup.sh does this automatically):
 ```json
@@ -382,6 +433,33 @@ Brain Stats:
 | No tools registered | Verify: `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py` shouldn't error |
 | `config.json` not found | Server works without it (empty brain). Create one if you want repo integration. |
 | `AGENT_BRAIN_DIR` not set | Defaults to `~/.agent-brain/`. Set the env var only if you want a custom location. |
+| Anything looks off | Run `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose` for a full health report (no Claude session needed). |
+
+### Diagnose CLI
+
+```bash
+~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose [--project=/path/to/project]
+```
+
+Runs a standalone health check from the shell — no Claude session required.
+
+**Always verifies:**
+
+1. MCP tools are registered in the server
+2. `config.json` is valid JSON (or absent — empty brain is OK)
+3. `~/.agent-brain/` is writable (decision marker round-trip)
+4. `decisions.json` is readable if present
+5. `agent-brain` is registered as an MCP server in `~/.claude.json` and/or `~/.claude/settings.json` (layer 1)
+6. Every `~/.claude/agents/*.md` is **subagent-MCP-safe**: omits the `tools:` frontmatter field (preferred — inherits MCP) **or** lists `ToolSearch` in `tools:` (fallback bootstrap)
+7. Per-repo team resolution: which agents the brain considers in-team for each configured repo
+
+**With `--project=<path>`, also verifies:**
+
+8. `<project>/.mcp.json` exists and registers `agent-brain` (layer 3)
+9. `<project>/.claude/settings.local.json` enables project MCP and allowlists `agent-brain` (layer 4)
+10. `<project>/.gitignore` covers brain artifacts (informational)
+
+Exit code is `0` when all checks pass, `1` otherwise — safe to call from a CI pre-flight or a dotfiles bootstrap.
 
 ## SAN Setup
 
@@ -477,6 +555,44 @@ Edit `~/.agent-brain/config.json`:
   ]
 }
 ```
+
+### Per-repo team scoping
+
+A flat `team` list applies to every repo — fine when one team owns everything. When you run multiple repos with different staffing, scope members per repo so heartbeats from `arjun` on `my-backend` don't pollute the `my-frontend` office state.
+
+**Two ways to scope:**
+
+1. **Per-entry `repos` filter** (simplest — extends the flat list):
+   ```json
+   {
+     "team": [
+       {"name": "marcus", "role": "principal-engineer"},
+       {"name": "arjun",  "role": "backend-engineer",  "repos": ["my-backend"]},
+       {"name": "priya",  "role": "frontend-engineer", "repos": ["my-frontend"]}
+     ]
+   }
+   ```
+   - `marcus` has no `repos` → global, applies to every repo.
+   - `arjun` only resolves on `my-backend`.
+   - `priya` only resolves on `my-frontend`.
+
+2. **`teams_per_repo` override** (full replacement for one repo):
+   ```json
+   {
+     "team": [ /* default global team */ ],
+     "teams_per_repo": {
+       "experimental-repo": [
+         {"name": "marcus", "role": "principal-engineer"},
+         {"name": "neha",   "role": "product-owner"}
+       ]
+     }
+   }
+   ```
+   When `teams_per_repo[repo]` is present, the flat `team` list is ignored for that repo.
+
+**Backwards compatible**: configs without `teams_per_repo` and no `repos` field on entries behave exactly like before.
+
+**How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, `office_state`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. `office_state(repo="my-backend")` shows only that repo's agents.
 
 ## Customization
 

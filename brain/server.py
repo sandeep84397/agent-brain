@@ -62,6 +62,56 @@ def _get_repo_paths() -> dict[str, Path]:
     return {name: Path(p) for name, p in repos.items()}
 
 
+def _get_team_for_repo(repo: str = "") -> list[dict]:
+    """
+    Resolve the team list for a given repo.
+
+    Resolution order:
+      1. config['teams_per_repo'][repo]  — explicit per-repo team override (full list)
+      2. Filter config['team']:
+         - Entries with no 'repos' key → global, included for every repo
+         - Entries with 'repos': [...] → included only when repo matches
+      3. If no repo passed → return the full flat global team (legacy behavior)
+
+    Backwards compatible: configs without teams_per_repo or 'repos' field on
+    team entries behave exactly like before.
+    """
+    config = _load_config()
+    if not repo:
+        return list(config.get("team", []) or [])
+
+    per_repo = config.get("teams_per_repo")
+    if isinstance(per_repo, dict) and repo in per_repo:
+        explicit = per_repo.get(repo)
+        if isinstance(explicit, list):
+            return list(explicit)
+
+    result: list[dict] = []
+    for t in config.get("team", []) or []:
+        if not isinstance(t, dict):
+            continue
+        scope = t.get("repos")
+        if scope is None:
+            result.append(t)  # global member, applies to every repo
+        elif isinstance(scope, list) and repo in scope:
+            result.append(t)
+    return result
+
+
+def _resolve_role(agent: str, repo: str = "") -> str:
+    """Look up an agent's role, scoped to repo when provided."""
+    team = _get_team_for_repo(repo) if repo else _get_team_for_repo()
+    for t in team:
+        if isinstance(t, dict) and t.get("name", "").lower() == agent.lower():
+            return t.get("role", "unknown")
+    # Fallback: any team entry across all scopes (legacy behavior)
+    if repo:
+        for t in _get_team_for_repo():
+            if isinstance(t, dict) and t.get("name", "").lower() == agent.lower():
+                return t.get("role", "unknown")
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Office State (for live dashboard)
 # ---------------------------------------------------------------------------
@@ -101,24 +151,22 @@ def _write_decision_marker(agent: str, decision_id: str) -> None:
         pass
 
 
-def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "") -> None:
+def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", repo: str = "") -> None:
     """Silently update office state from brain tool calls. Never raises."""
     try:
         with OFFICE_LOCK:
             state = _load_office_state()
-            config = _load_config()
-            role = "unknown"
-            for t in config.get("team", []):
-                if t.get("name", "").lower() == agent.lower():
-                    role = t.get("role", "unknown")
-                    break
-            state.setdefault("agents", {})[agent] = {
+            role = _resolve_role(agent, repo)
+            entry = {
                 "role": role, "status": status,
                 "task": (task or "")[:100],
                 "talking_to": talking_to or None,
                 "message": None,
                 "last_seen": datetime.now().isoformat(),
             }
+            if repo:
+                entry["repo"] = repo
+            state.setdefault("agents", {})[agent] = entry
             _save_office_state(state)
     except Exception:
         pass  # Office state must never break brain functionality
@@ -559,7 +607,7 @@ def log_decision(
                 G.add_node(sym_node, type="code_ref", qualified_name=sym, repo=repo)
             G.add_edge(node_id, sym_node, relation="touches")
         _save_graph(G)
-    _auto_heartbeat(agent, "working", action)
+    _auto_heartbeat(agent, "working", action, repo=repo)
     # Write marker for brain-protocol enforcement hook
     _write_decision_marker(agent, node_id)
     result = f"Decision logged: {node_id}"
@@ -588,8 +636,9 @@ def log_outcome(decision_id: str, outcome: str, outcome_by: str, reason: str) ->
         G.nodes[decision_id]["outcome_reason"] = reason
         G.nodes[decision_id]["outcome_timestamp"] = datetime.now().isoformat()
         dec_agent = G.nodes[decision_id].get("agent", "")
+        dec_repo = G.nodes[decision_id].get("repo", "")
         _save_graph(G)
-    _auto_heartbeat(outcome_by, "reviewing", f"outcome: {outcome}", talking_to=dec_agent)
+    _auto_heartbeat(outcome_by, "reviewing", f"outcome: {outcome}", talking_to=dec_agent, repo=dec_repo)
     return f"Outcome recorded: {decision_id} -> {outcome} by {outcome_by}"
 
 
@@ -613,8 +662,9 @@ def log_feedback(agent: str, decision_id: str, feedback: str, severity: str = "i
                     severity=severity, timestamp=datetime.now().isoformat())
         G.add_edge(fb_id, decision_id, relation="feedback_on")
         dec_agent = G.nodes.get(decision_id, {}).get("agent", "")
+        dec_repo = G.nodes.get(decision_id, {}).get("repo", "")
         _save_graph(G)
-    _auto_heartbeat(agent, "reviewing", feedback[:80], talking_to=dec_agent)
+    _auto_heartbeat(agent, "reviewing", feedback[:80], talking_to=dec_agent, repo=dec_repo)
     return f"Feedback logged: {fb_id} -> {decision_id}"
 
 
@@ -1038,7 +1088,7 @@ def get_decision(decision_id: str) -> str:
 
 
 @mcp.tool()
-def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", message: str = "") -> str:
+def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", message: str = "", repo: str = "") -> str:
     """
     Report agent status for the live office dashboard.
     Call this to update your visible state in the pixel art office.
@@ -1049,54 +1099,89 @@ def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", mes
         task: What you're working on (shown as label, max 100 chars)
         talking_to: Name of agent you're interacting with (shows discussion animation)
         message: Chat message content (appears as speech bubble + in chat log)
+        repo: Optional repo this heartbeat is scoped to. When set, role
+              resolution honours teams_per_repo / per-entry 'repos' filters,
+              and the office state entry includes the repo so dashboards can
+              segment views per repo.
     """
     with OFFICE_LOCK:
         state = _load_office_state()
-        config = _load_config()
-        role = "unknown"
-        for t in config.get("team", []):
-            if t.get("name", "").lower() == agent.lower():
-                role = t.get("role", "unknown")
-                break
-        state.setdefault("agents", {})[agent] = {
+        role = _resolve_role(agent, repo)
+        entry = {
             "role": role, "status": status,
             "task": (task or "")[:100],
             "talking_to": talking_to or None,
             "message": (message or None)[:200] if message else None,
             "last_seen": datetime.now().isoformat(),
         }
+        if repo:
+            entry["repo"] = repo
+        state.setdefault("agents", {})[agent] = entry
         if message and talking_to:
-            state.setdefault("messages", []).append({
+            msg_entry = {
                 "from": agent, "to": talking_to,
                 "text": (message or "")[:200],
                 "ts": datetime.now().isoformat(),
-            })
+            }
+            if repo:
+                msg_entry["repo"] = repo
+            state.setdefault("messages", []).append(msg_entry)
             state["messages"] = state["messages"][-50:]
         _save_office_state(state)
     return "ok"
 
 
 @mcp.tool()
-def office_state() -> str:
-    """Get current office state (for debugging the dashboard)."""
+def office_state(repo: str = "") -> str:
+    """
+    Get current office state (for debugging the dashboard).
+
+    Args:
+        repo: Optional repo filter. Shows only agents scoped to this repo.
+              Agents are included if their last heartbeat carried this repo,
+              or if they belong to the resolved team for this repo
+              (configured via teams_per_repo / per-entry 'repos').
+              Omit to see the full unfiltered office.
+    """
     with OFFICE_LOCK:
         state = _load_office_state()
-    if not state.get("agents"):
+    agents_dict = state.get("agents", {}) or {}
+    if not agents_dict:
         return "Office is empty. No agents have checked in."
-    lines = ["=== OFFICE STATE ===\n"]
-    for name, info in sorted(state["agents"].items()):
+
+    if repo:
+        scoped_names = {
+            t.get("name", "").lower()
+            for t in _get_team_for_repo(repo)
+            if isinstance(t, dict) and t.get("name")
+        }
+        filtered = {
+            name: info for name, info in agents_dict.items()
+            if info.get("repo") == repo or name.lower() in scoped_names
+        }
+        if not filtered:
+            return f"No agents currently scoped to repo '{repo}'."
+        agents_dict = filtered
+
+    header = f"=== OFFICE STATE [{repo}] ===\n" if repo else "=== OFFICE STATE ===\n"
+    lines = [header]
+    for name, info in sorted(agents_dict.items()):
         status = info.get("status", "unknown")
         task = info.get("task", "")
         talking = info.get("talking_to")
         last = info.get("last_seen", "?")[:19]
-        lines.append(f"  {name} [{info.get('role','')}]: {status} (seen: {last})")
+        repo_tag = f" @ {info['repo']}" if info.get("repo") and not repo else ""
+        lines.append(f"  {name} [{info.get('role','')}]{repo_tag}: {status} (seen: {last})")
         if task:
             lines.append(f"    task: {task}")
         if talking:
             lines.append(f"    talking to: {talking}")
-    msg_count = len(state.get("messages", []))
-    if msg_count:
-        lines.append(f"\n  {msg_count} message(s) in log")
+
+    messages = state.get("messages", []) or []
+    if repo:
+        messages = [m for m in messages if m.get("repo") == repo]
+    if messages:
+        lines.append(f"\n  {len(messages)} message(s) in log")
     return "\n".join(lines)
 
 
@@ -2624,5 +2709,256 @@ def validate_brain() -> str:
     return header + "\n" + "\n".join(results)
 
 
+def _diagnose(project: str = "") -> int:
+    """
+    Self-check from the shell. Prints PASS/FAIL per check.
+
+    Verifies (always):
+      1. server.py importable + MCP tools registered
+      2. config.json valid JSON (or absent — that's OK, server allows empty)
+      3. ~/.agent-brain/ writable (decision marker round-trip)
+      4. decisions.json readable if present (atomic-write safety)
+      5. MCP registration: claude.json + ~/.claude/settings.json mention agent-brain
+      6. Agent .md frontmatter is subagent-MCP-safe (omits `tools:` OR includes
+         ToolSearch as fallback)
+      7. Per-repo team scoping: report resolved team for each configured repo
+
+    Verifies (when project=<path> is set):
+      8. <project>/.mcp.json exists with agent-brain entry
+      9. <project>/.claude/settings.local.json activates project MCP
+     10. <project>/.gitignore covers brain artifacts (warning, not fail)
+
+    Exit code 0 if all checks pass, 1 otherwise.
+    """
+    import sys as _sys
+
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. tools registered
+    try:
+        tool_count = len(mcp._tool_manager._tools)
+        checks.append(("MCP tools registered", tool_count > 0,
+                       f"{tool_count} tools"))
+    except Exception as e:
+        checks.append(("MCP tools registered", False, str(e)))
+
+    # 2. config.json
+    cfg_ok = True
+    cfg_msg = "no config.json (empty brain — OK)"
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            cfg_msg = (f"{len(cfg.get('repos', {}))} repo(s), "
+                       f"{len(cfg.get('team', []))} team member(s)")
+        except Exception as e:
+            cfg_ok = False
+            cfg_msg = f"INVALID JSON: {e}"
+    checks.append(("config.json valid", cfg_ok, cfg_msg))
+
+    # 3. brain dir writable
+    try:
+        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        probe = BRAIN_DIR / ".diagnose_probe"
+        probe.write_text("ok")
+        probe.unlink()
+        checks.append(("BRAIN_DIR writable", True, str(BRAIN_DIR)))
+    except Exception as e:
+        checks.append(("BRAIN_DIR writable", False, f"{BRAIN_DIR}: {e}"))
+
+    # 4. decisions.json readable
+    if GRAPH_FILE.exists():
+        try:
+            data = json.loads(GRAPH_FILE.read_text())
+            n = len(data.get("nodes", []))
+            checks.append(("decisions.json readable", True, f"{n} node(s)"))
+        except Exception as e:
+            checks.append(("decisions.json readable", False, str(e)))
+    else:
+        checks.append(("decisions.json readable", True,
+                       "absent (fresh install — OK)"))
+
+    # 5. MCP registration in either config file
+    home = Path.home()
+    locations = [
+        ("~/.claude.json", home / ".claude.json"),
+        ("~/.claude/settings.json", home / ".claude" / "settings.json"),
+    ]
+    found_anywhere = False
+    location_report = []
+    for label, path in locations:
+        if not path.exists():
+            location_report.append(f"{label}: missing")
+            continue
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data.get("mcpServers"), dict) and "agent-brain" in data["mcpServers"]:
+                location_report.append(f"{label}: ✓")
+                found_anywhere = True
+            else:
+                location_report.append(f"{label}: not registered")
+        except Exception as e:
+            location_report.append(f"{label}: parse error ({e})")
+    checks.append(("MCP registered (main session)", found_anywhere,
+                   " | ".join(location_report)))
+
+    # 6. agent .md frontmatter is subagent-MCP-safe.
+    #    Two valid configurations:
+    #      (a) NO `tools:` field → subagent inherits everything including MCP (preferred)
+    #      (b) `tools:` includes ToolSearch → fallback bootstrap path
+    #    Anything else silently filters out mcp__* tools.
+    agents_dir = home / ".claude" / "agents"
+    if agents_dir.is_dir():
+        broken: list[str] = []
+        scanned = 0
+        for md in sorted(agents_dir.glob("*.md")):
+            scanned += 1
+            try:
+                head = md.read_text(errors="replace")[:2000]
+            except OSError:
+                continue
+            # Find a yaml line starting with `tools:` (ignoring comments)
+            tools_line = None
+            for line in head.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if stripped.startswith("tools:"):
+                    tools_line = stripped
+                    break
+            if tools_line is None:
+                continue  # case (a): no tools field, MCP inherits — OK
+            # case (b): tools field present — must include ToolSearch
+            if "ToolSearch" not in tools_line:
+                broken.append(md.name)
+        if scanned == 0:
+            checks.append(("Subagent frontmatter MCP-safe", True,
+                           "no agent .md files (skip)"))
+        elif broken:
+            checks.append(("Subagent frontmatter MCP-safe", False,
+                           f"sets `tools:` without ToolSearch (strips MCP) in: "
+                           f"{', '.join(broken)}. Either remove the tools field "
+                           f"or add ToolSearch."))
+        else:
+            checks.append(("Subagent frontmatter MCP-safe", True,
+                           f"{scanned} file(s) OK"))
+    else:
+        checks.append(("Subagent frontmatter MCP-safe", True,
+                       f"no {agents_dir} (skip)"))
+
+    # 7. per-repo team scoping report (informational; never fails)
+    try:
+        config = _load_config()
+        repos = list((config.get("repos") or {}).keys())
+        if repos:
+            details = []
+            for r in repos:
+                team = _get_team_for_repo(r)
+                names = [t.get("name", "?") for t in team if isinstance(t, dict)]
+                details.append(f"{r}: {len(names)} ({', '.join(names) or 'empty'})")
+            checks.append(("Per-repo team resolution", True, "; ".join(details)))
+        else:
+            checks.append(("Per-repo team resolution", True,
+                           "no repos configured"))
+    except Exception as e:
+        checks.append(("Per-repo team resolution", False, str(e)))
+
+    # 8-10. Project-layer checks (only when --project specified)
+    if project:
+        proj = Path(project).expanduser()
+        if not proj.is_dir():
+            checks.append((f"Project '{project}'", False,
+                           "path is not a directory"))
+        else:
+            # 8. .mcp.json
+            mcp_path = proj / ".mcp.json"
+            if not mcp_path.exists():
+                checks.append((f"{mcp_path.name} (project MCP)", False,
+                               f"missing — run `setup.sh --link-project={proj}`"))
+            else:
+                try:
+                    pdata = json.loads(mcp_path.read_text())
+                    if "agent-brain" in (pdata.get("mcpServers") or {}):
+                        checks.append((f"{mcp_path.name} (project MCP)", True,
+                                       "agent-brain registered"))
+                    else:
+                        checks.append((f"{mcp_path.name} (project MCP)", False,
+                                       "exists but no agent-brain entry"))
+                except Exception as e:
+                    checks.append((f"{mcp_path.name} (project MCP)", False,
+                                   f"parse error: {e}"))
+
+            # 9. .claude/settings.local.json
+            slp = proj / ".claude" / "settings.local.json"
+            if not slp.exists():
+                checks.append(("Project settings.local.json", False,
+                               f"missing — run `setup.sh --link-project={proj}`"))
+            else:
+                try:
+                    sdata = json.loads(slp.read_text())
+                    enable_all = sdata.get("enableAllProjectMcpServers")
+                    allowlist = sdata.get("enabledMcpjsonServers") or []
+                    in_allow = isinstance(allowlist, list) and "agent-brain" in allowlist
+                    if enable_all and in_allow:
+                        checks.append(("Project settings.local.json", True,
+                                       "MCP enabled + agent-brain allowed"))
+                    else:
+                        problems = []
+                        if not enable_all:
+                            problems.append("enableAllProjectMcpServers != true")
+                        if not in_allow:
+                            problems.append("agent-brain not in enabledMcpjsonServers")
+                        checks.append(("Project settings.local.json", False,
+                                       "; ".join(problems)))
+                except Exception as e:
+                    checks.append(("Project settings.local.json", False,
+                                   f"parse error: {e}"))
+
+            # 10. .gitignore (informational)
+            gi = proj / ".gitignore"
+            wanted = {".mcp.json", ".san/.san_hashes.json", ".san/_cache/"}
+            if not gi.exists():
+                checks.append(("Project .gitignore", True,
+                               "no .gitignore — skipping"))
+            else:
+                lines = {ln.strip() for ln in gi.read_text().splitlines()}
+                missing_gi = sorted(wanted - lines)
+                if missing_gi:
+                    # Informational — not all repos want .mcp.json gitignored
+                    checks.append(("Project .gitignore", True,
+                                   f"missing entries (consider adding): "
+                                   f"{', '.join(missing_gi)}"))
+                else:
+                    checks.append(("Project .gitignore", True, "covers brain artifacts"))
+
+    # Render
+    print("agent-brain diagnose")
+    print("=" * 60)
+    failed = 0
+    for label, ok, msg in checks:
+        mark = "PASS" if ok else "FAIL"
+        if not ok:
+            failed += 1
+        print(f"  [{mark}] {label}: {msg}")
+    print("=" * 60)
+    if failed:
+        print(f"{failed} check(s) failed.")
+        return 1
+    print("All checks passed.")
+    return 0
+
+
 if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "diagnose":
+        proj = ""
+        for a in _sys.argv[2:]:
+            if a.startswith("--project="):
+                proj = a.split("=", 1)[1]
+            elif a in ("--help", "-h"):
+                print("Usage: server.py diagnose [--project=<path>]")
+                _sys.exit(0)
+            else:
+                print(f"Unknown diagnose flag: {a}")
+                _sys.exit(2)
+        _sys.exit(_diagnose(project=proj))
     mcp.run()

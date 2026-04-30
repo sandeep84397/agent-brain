@@ -3,11 +3,179 @@ set -euo pipefail
 
 # ============================================================================
 # Agent Brain — Setup Script
-# Installs the agent-brain MCP server and configures Claude Code agent team.
+#
+# Modes:
+#   ./setup.sh                          # full install (interactive wizard)
+#   ./setup.sh --link-project=<path>    # link an existing project to brain
+#                                        (writes .mcp.json + project settings;
+#                                         install must already be done)
 # ============================================================================
 
 BRAIN_DIR="${AGENT_BRAIN_DIR:-$HOME/.agent-brain}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+LINK_PROJECT=""
+for arg in "$@"; do
+    case "$arg" in
+        --link-project=*) LINK_PROJECT="${arg#*=}" ;;
+        --link-project)   echo "ERROR: --link-project requires a value (use --link-project=/path)"; exit 2 ;;
+        --help|-h)
+            echo "Usage:"
+            echo "  ./setup.sh                          Full install + interactive wizard"
+            echo "  ./setup.sh --link-project=<path>    Link an existing project to a"
+            echo "                                       previously-installed brain"
+            exit 0 ;;
+        *) echo "Unknown flag: $arg"; echo "Try ./setup.sh --help"; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# --link-project mode: do NOT run the install wizard.
+# Brain must already be installed at $BRAIN_DIR.
+# ---------------------------------------------------------------------------
+if [ -n "$LINK_PROJECT" ]; then
+    PROJECT_PATH="$LINK_PROJECT"
+    if [ ! -d "$PROJECT_PATH" ]; then
+        echo "ERROR: project path '$PROJECT_PATH' is not a directory."
+        exit 1
+    fi
+    if [ ! -f "$BRAIN_DIR/server.py" ] || [ ! -x "$BRAIN_DIR/.venv/bin/python" ]; then
+        echo "ERROR: agent-brain is not installed at $BRAIN_DIR."
+        echo "Run ./setup.sh (no flags) first to install, then re-run with --link-project."
+        exit 1
+    fi
+
+    PROJECT_PATH="$(cd "$PROJECT_PATH" && pwd)"
+    PYBIN="$BRAIN_DIR/.venv/bin/python"
+    SERVER_PY="$BRAIN_DIR/server.py"
+
+    echo "============================================"
+    echo "  Agent Brain — Link Project"
+    echo "============================================"
+    echo "  Project:  $PROJECT_PATH"
+    echo "  Brain:    $BRAIN_DIR"
+    echo ""
+
+    # Use the brain venv's python for safe JSON merging — every action below is
+    # idempotent: re-running --link-project on the same project must NOT
+    # duplicate entries.
+    "$PYBIN" - "$PROJECT_PATH" "$SERVER_PY" "$PYBIN" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+project = Path(sys.argv[1])
+server_py = sys.argv[2]
+pybin = sys.argv[3]
+
+def load_json(p: Path) -> dict:
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError:
+        print(f"  WARN: {p} is not valid JSON, leaving untouched and bailing.")
+        sys.exit(1)
+
+def write_json(p: Path, data: dict):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2) + "\n")
+
+# 1. .mcp.json (project-scoped server registration; subagents read this)
+mcp_path = project / ".mcp.json"
+mcp = load_json(mcp_path)
+mcp.setdefault("mcpServers", {})
+brain_entry = {
+    "command": pybin,
+    "args": [server_py],
+    "type": "stdio",
+    "env": {},
+}
+existing = mcp["mcpServers"].get("agent-brain")
+if existing == brain_entry:
+    print(f"  ✓ {mcp_path} already up to date")
+else:
+    mcp["mcpServers"]["agent-brain"] = brain_entry
+    write_json(mcp_path, mcp)
+    print(f"  ✓ Wrote {mcp_path}")
+
+# 2. .claude/settings.local.json
+settings_path = project / ".claude" / "settings.local.json"
+settings = load_json(settings_path)
+changed = False
+if settings.get("enableAllProjectMcpServers") is not True:
+    settings["enableAllProjectMcpServers"] = True
+    changed = True
+allowlist = settings.get("enabledMcpjsonServers")
+if allowlist is None:
+    settings["enabledMcpjsonServers"] = ["agent-brain"]
+    changed = True
+elif isinstance(allowlist, list) and "agent-brain" not in allowlist:
+    allowlist.append("agent-brain")
+    changed = True
+elif not isinstance(allowlist, list):
+    print(f"  WARN: enabledMcpjsonServers in {settings_path} is not a list; "
+          "leaving as-is. Convert it to an array containing 'agent-brain' manually.")
+if changed:
+    write_json(settings_path, settings)
+    print(f"  ✓ Updated {settings_path}")
+else:
+    print(f"  ✓ {settings_path} already up to date")
+
+# 3. .gitignore (append-if-missing for the brain artifacts)
+gitignore_path = project / ".gitignore"
+required_lines = [
+    ".mcp.json",
+    ".san/.san_hashes.json",
+    ".san/_cache/",
+]
+existing_lines: list[str] = []
+if gitignore_path.exists():
+    existing_lines = gitignore_path.read_text().splitlines()
+existing_set = {ln.strip() for ln in existing_lines}
+to_append = [ln for ln in required_lines if ln not in existing_set]
+if to_append:
+    block = ["", "# agent-brain"] + to_append + [""]
+    with gitignore_path.open("a") as f:
+        # Add a leading newline if file didn't end in one
+        if existing_lines and existing_lines[-1].strip():
+            f.write("\n")
+        f.write("\n".join(block) + "\n")
+    print(f"  ✓ Appended {len(to_append)} line(s) to {gitignore_path}")
+else:
+    print(f"  ✓ .gitignore already covers brain artifacts (or no gitignore — skipping)")
+
+# 4. Friendly note: confirm the project name is registered in brain config
+brain_config = Path(sys.argv[2]).parent / "config.json"
+known_repos: list[str] = []
+if brain_config.exists():
+    try:
+        known_repos = list(json.loads(brain_config.read_text()).get("repos", {}).keys())
+    except json.JSONDecodeError:
+        pass
+project_name = project.name
+matching = [r for r in known_repos if r.lower() == project_name.lower()
+            or project.as_posix().endswith("/" + r)]
+if not matching:
+    print()
+    print(f"  ⚠ '{project_name}' is not registered in {brain_config}.")
+    print( "    Add an entry like:")
+    print( '      "repos": {')
+    print(f'        "{project_name}": "{project.as_posix()}"')
+    print( '      }')
+    print( "    so brain decisions can be filed under this repo's name.")
+PYEOF
+
+    PROJECT_NAME="$(basename "$PROJECT_PATH")"
+    echo ""
+    echo "Next steps:"
+    echo "  1. If '$PROJECT_NAME' is missing from $BRAIN_DIR/config.json, add it (see above)."
+    echo "  2. Restart Claude Code in the project: '/exit' then 'claude'."
+    echo "  3. Verify:  $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py diagnose --project=$PROJECT_PATH"
+    exit 0
+fi
 
 echo "============================================"
 echo "  Agent Brain — Setup"
@@ -304,6 +472,15 @@ if command -v claude &>/dev/null; then
     fi
 fi
 
+# Run the standalone diagnose CLI (works post-install too)
+echo ""
+echo "  Running diagnose..."
+if "$BRAIN_DIR/.venv/bin/python" "$BRAIN_DIR/server.py" diagnose; then
+    true
+else
+    ERRORS=$((ERRORS + 1))
+fi
+
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
@@ -324,6 +501,8 @@ echo "  1. Edit $BRAIN_DIR/config.json (add repos if not done above)"
 echo "  2. Customize agent names in $AGENTS_DIR/*.md (if skipped)"
 echo "  3. Restart Claude Code"
 echo "  4. Test: ask any agent to call brain_stats()"
+echo "  5. Re-run health check anytime:"
+echo "       $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py diagnose"
 echo ""
 echo "Expected brain_stats() output:"
 echo '  Brain Stats:'

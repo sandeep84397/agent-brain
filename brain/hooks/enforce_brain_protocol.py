@@ -16,12 +16,41 @@ Exit codes:
 import json
 import sys
 import os
+import fnmatch
 from datetime import datetime
 from pathlib import Path
 
 BRAIN_DIR = Path(os.environ.get("AGENT_BRAIN_DIR", str(Path.home() / ".agent-brain")))
 MARKER_FILE = BRAIN_DIR / ".last_decision_marker"
+CONFIG_FILE = BRAIN_DIR / "config.json"
 STALE_MINUTES = 30  # Decision older than this = stale, agent must log again
+
+
+def _load_user_skip_patterns() -> list[str]:
+    """
+    Read optional `hook_skip_paths` from ~/.agent-brain/config.json.
+
+    The list is a set of fnmatch-style glob patterns (matched against the
+    absolute file path). Examples:
+        ["**/docs/**", "**/.github/**", "**/*.md"]
+
+    Returns an empty list when:
+      - config.json does not exist
+      - it isn't valid JSON
+      - the key is missing or not a list of strings
+
+    Failure is silent: hook overhead must never break a session.
+    """
+    try:
+        if not CONFIG_FILE.exists():
+            return []
+        cfg = json.loads(CONFIG_FILE.read_text())
+        patterns = cfg.get("hook_skip_paths")
+        if isinstance(patterns, list):
+            return [p for p in patterns if isinstance(p, str)]
+    except Exception:
+        pass
+    return []
 
 
 def main():
@@ -59,6 +88,11 @@ def main():
     skip_dirs = ("/.claude/", "/.git/", "/node_modules/", "/build/", "/.san/")
     if any(d in file_path for d in skip_dirs):
         sys.exit(0)
+
+    # User-extensible: fnmatch globs from config.json hook_skip_paths
+    for pattern in _load_user_skip_patterns():
+        if fnmatch.fnmatch(file_path, pattern):
+            sys.exit(0)
 
     # Check for recent decision marker
     if not MARKER_FILE.exists():

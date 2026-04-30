@@ -3,11 +3,21 @@
     "my-backend": "/path/to/your/backend-repo",
     "my-frontend": "/path/to/your/frontend-repo"
   },
+
+  "_comment_team": "Flat global team. Entries with no 'repos' key apply to every repo. Add 'repos': ['my-backend'] to scope a member to specific repos.",
   "team": [
     {"name": "marcus", "role": "principal-engineer"},
     {"name": "maya", "role": "product-owner"},
-    {"name": "arjun", "role": "backend-engineer"},
-    {"name": "priya", "role": "frontend-engineer"},
+    {"name": "arjun", "role": "backend-engineer", "repos": ["my-backend"]},
+    {"name": "priya", "role": "frontend-engineer", "repos": ["my-frontend"]},
     {"name": "rahul", "role": "qa-engineer"}
-  ]
+  ],
+
+  "_comment_teams_per_repo": "Optional: explicit full per-repo team. If set for a repo, replaces team filtering for that repo entirely. Use only when you want a clean override.",
+  "_example_teams_per_repo": {
+    "my-backend": [
+      {"name": "marcus", "role": "principal-engineer"},
+      {"name": "arjun", "role": "backend-engineer"}
+    ]
+  }
 }
