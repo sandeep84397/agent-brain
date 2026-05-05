@@ -59,6 +59,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path in ("/3d", "/3d/"):
+            # Internal redirect to the 3D dashboard HTML
+            self.path = "/office3d.html"
+            super().do_GET()
         else:
             super().do_GET()
 
@@ -95,8 +99,9 @@ def main():
 
     server = ThreadingHTTPServer(("", PORT), DashboardHandler)
     print(f"\n\U0001f3e2 Agent Brain Office")
-    print(f"   Dashboard:  http://localhost:{PORT}")
-    print(f"   State file: {STATE_FILE}")
+    print(f"   Pixel-art view: http://localhost:{PORT}")
+    print(f"   3D view:        http://localhost:{PORT}/3d")
+    print(f"   State file:     {STATE_FILE}")
     print(f"   Ctrl+C to stop\n")
 
     threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()

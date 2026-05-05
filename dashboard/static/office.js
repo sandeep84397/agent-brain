@@ -156,18 +156,32 @@ function ensureBackground() {
     bg.fillStyle = PAL.wallAccent;
     gRect(bg, 0, 19, GAME_W, 1);
 
-    // Title on wall
-    bg.fillStyle = PAL.white;
-    bg.font = `${7 * SCALE}px 'Press Start 2P', monospace`;
+    // Title on wall — bigger + shadow for stronger presence
+    bg.font = `${8 * SCALE}px 'Press Start 2P', monospace`;
     bg.textAlign = 'center';
-    bg.fillText('AGENT BRAIN', CANVAS_W / 2, 9 * SCALE);
+    bg.fillStyle = 'rgba(0,0,0,0.6)';
+    bg.fillText('AGENT BRAIN', CANVAS_W / 2 + 2, 10 * SCALE + 2);
+    bg.fillStyle = PAL.white;
+    bg.fillText('AGENT BRAIN', CANVAS_W / 2, 10 * SCALE);
+
+    bg.font = `${3.5 * SCALE}px 'Press Start 2P', monospace`;
     bg.fillStyle = PAL.red;
-    bg.font = `${3 * SCALE}px 'Press Start 2P', monospace`;
-    bg.fillText('OFFICE', CANVAS_W / 2, 16 * SCALE);
+    bg.fillText('OFFICE', CANVAS_W / 2, 17 * SCALE);
 
     // Desks
     for (const desk of DESK_POSITIONS) {
         drawDesk(bg, desk.x, desk.y, desk.role);
+    }
+
+    // Rug under meeting table — adds warmth + breaks up dark floor
+    bg.fillStyle = '#3a2a4a';
+    gRect(bg, MEETING.x - 24, MEETING.y - 8, 48, 28);
+    bg.fillStyle = '#4a3560';
+    gRect(bg, MEETING.x - 22, MEETING.y - 6, 44, 24);
+    // Rug pattern stripes
+    bg.fillStyle = '#5a4570';
+    for (let i = 0; i < 3; i++) {
+        gRect(bg, MEETING.x - 20, MEETING.y - 4 + i * 7, 40, 1);
     }
 
     // Meeting table
@@ -177,11 +191,11 @@ function ensureBackground() {
     gRect(bg, MEETING.x - 14, MEETING.y - 1, 28, 14);
     bg.fillStyle = PAL.deskTop;
     gRect(bg, MEETING.x - 13, MEETING.y, 26, 12);
-    // "MEETING" text on table
-    bg.fillStyle = '#5a4a35';
-    bg.font = `${2 * SCALE}px 'Press Start 2P', monospace`;
+    // "MEETING" text on table — outlined for legibility against the desk wood
+    bg.font = `${2.4 * SCALE}px 'Press Start 2P', monospace`;
     bg.textAlign = 'center';
-    bg.fillText('MEETING', MEETING.x * SCALE, (MEETING.y + 8) * SCALE);
+    bg.fillStyle = '#f5e7c8';
+    strokedText(bg, 'MEETING', MEETING.x * SCALE, (MEETING.y + 8) * SCALE, '#3a2a1a');
 
     // Plants
     drawPlant(bg, 15, 28);
@@ -196,19 +210,19 @@ function ensureBackground() {
     gRect(bg, COFFEE.x - 3, COFFEE.y + 1, 6, 4);
     bg.fillStyle = PAL.red;
     gRect(bg, COFFEE.x - 1, COFFEE.y + 6, 2, 2);
-    bg.fillStyle = '#555';
-    bg.font = `${1.5 * SCALE}px 'Press Start 2P', monospace`;
+    bg.font = `${2 * SCALE}px 'Press Start 2P', monospace`;
     bg.textAlign = 'center';
-    bg.fillText('COFFEE', COFFEE.x * SCALE, (COFFEE.y + 13) * SCALE);
+    bg.fillStyle = '#bbb';
+    strokedText(bg, 'COFFEE', COFFEE.x * SCALE, (COFFEE.y + 14) * SCALE);
 
     // Whiteboard
     bg.fillStyle = '#ddd';
     gRect(bg, 120, 22, 80, 10);
     bg.fillStyle = '#f5f5f0';
     gRect(bg, 121, 23, 78, 8);
-    bg.fillStyle = '#aaa';
-    bg.font = `${2 * SCALE}px 'Press Start 2P', monospace`;
+    bg.font = `${2.5 * SCALE}px 'Press Start 2P', monospace`;
     bg.textAlign = 'center';
+    bg.fillStyle = '#1a1a30';
     bg.fillText('Sprint Board', 160 * SCALE, 28 * SCALE);
 }
 
@@ -223,15 +237,27 @@ function drawDesk(bg, gx, gy, role) {
     bg.fillStyle = PAL.deskTop;
     gRect(bg, gx - 4, gy - 4, 16, 10);
 
+    // Screen glow halo (soft cyan ring around the monitor)
+    bg.fillStyle = 'rgba(80,180,255,0.10)';
+    gRect(bg, gx - 4, gy - 13, 16, 13);
+    bg.fillStyle = 'rgba(80,180,255,0.18)';
+    gRect(bg, gx - 3, gy - 12, 14, 11);
+
     // Monitor
     bg.fillStyle = PAL.monitor;
     gRect(bg, gx - 1, gy - 10, 10, 7);
     bg.fillStyle = PAL.screen;
     gRect(bg, gx, gy - 9, 8, 5);
 
-    // Screen glow
+    // Screen glow (existing)
     bg.fillStyle = PAL.screenGlow;
     gRect(bg, gx - 3, gy - 12, 14, 11);
+
+    // Tiny code-ish lines on the screen for life
+    bg.fillStyle = 'rgba(0,228,54,0.6)';
+    gRect(bg, gx + 1, gy - 8, 4, 1);
+    gRect(bg, gx + 1, gy - 6, 6, 1);
+    gRect(bg, gx + 1, gy - 4, 3, 1);
 
     // Monitor stand
     bg.fillStyle = '#444';
@@ -247,11 +273,11 @@ function drawDesk(bg, gx, gy, role) {
     bg.fillStyle = colors.tag;
     gRect(bg, gx - 6, gy + 7, 20, 1);
 
-    // Role label
-    bg.fillStyle = colors.tag;
-    bg.font = `${2 * SCALE}px 'Press Start 2P', monospace`;
+    // Role label — outlined so it pops against the dark floor
+    bg.font = `${2.4 * SCALE}px 'Press Start 2P', monospace`;
     bg.textAlign = 'center';
-    bg.fillText(colors.label, (gx + 4) * SCALE, (gy + 18) * SCALE);
+    bg.fillStyle = colors.tag;
+    strokedText(bg, colors.label, (gx + 4) * SCALE, (gy + 18) * SCALE);
 }
 
 function drawPlant(bg, gx, gy) {
@@ -362,12 +388,61 @@ function drawStatusDot(gx, gy, status) {
     ctx.fill();
 }
 
+// Draw text with a 1-px black outline so canvas labels stay legible
+// against any background. Uses the currently-active fillStyle as the
+// fill color and writes the outline first so the fill sits on top.
+function strokedText(c, text, x, y, outlineColor = '#000') {
+    const fill = c.fillStyle;
+    c.lineWidth = Math.max(2, Math.round(SCALE * 0.6));
+    c.strokeStyle = outlineColor;
+    c.lineJoin = 'round';
+    c.miterLimit = 2;
+    c.strokeText(text, x, y);
+    c.fillStyle = fill;
+    c.fillText(text, x, y);
+}
+
 function drawNameTag(gx, gy, name, role) {
     const colors = ROLE_COLORS[role] || ROLE_COLORS['unknown'];
-    ctx.fillStyle = colors.tag;
-    ctx.font = `${2.5 * SCALE}px 'Press Start 2P', monospace`;
+    const s = SCALE;
+
+    // Pill background — colored by role tag, so the name floats on a
+    // small chip that's readable against any office background.
+    ctx.font = `${3 * s}px 'Press Start 2P', monospace`;
     ctx.textAlign = 'center';
-    ctx.fillText(name, (gx + 4) * SCALE, (gy + 20) * SCALE);
+    const tw = ctx.measureText(name.toUpperCase()).width;
+    const padX = 3 * s;
+    const padY = 1.5 * s;
+    const pillH = 4 * s + padY * 2;
+    const pillW = tw + padX * 2;
+    const cx = (gx + 4) * s;
+    const py = (gy + 18) * s;
+
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, cx - pillW / 2 + 1, py + 1, pillW, pillH, 3);
+    ctx.fill();
+
+    // Pill
+    ctx.fillStyle = colors.tag;
+    roundRect(ctx, cx - pillW / 2, py, pillW, pillH, 3);
+    ctx.fill();
+
+    // Name in white on the pill
+    ctx.fillStyle = '#ffffff';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(name.toUpperCase(), cx, py + pillH / 2 + 1);
+    ctx.textBaseline = 'alphabetic';
+}
+
+function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y,     x + w, y + h, r);
+    c.arcTo(x + w, y + h, x,     y + h, r);
+    c.arcTo(x,     y + h, x,     y,     r);
+    c.arcTo(x,     y,     x + w, y,     r);
+    c.closePath();
 }
 
 function drawBubble(gx, gy, text) {
@@ -413,14 +488,17 @@ function drawBubble(gx, gy, text) {
     ctx.fillText(truncated, (gx + 4) * s, by + bh - pad + s);
 }
 
-function drawTaskLabel(gx, gy, task) {
-    if (!task) return;
+function drawTaskLabel(gx, gy, task, suppressed = false) {
+    // Caller may set suppressed=true when another agent is too close
+    // vertically — drawing the task here would collide with that
+    // agent's name tag and produce the unreadable stack of text.
+    if (!task || suppressed) return;
     const s = SCALE;
     const text = task.length > 22 ? task.substring(0, 20) + '..' : task;
-    ctx.fillStyle = '#666';
-    ctx.font = `${1.8 * s}px 'Press Start 2P', monospace`;
+    ctx.font = `${2.2 * s}px 'Press Start 2P', monospace`;
     ctx.textAlign = 'center';
-    ctx.fillText(text, (gx + 4) * s, (gy + 23) * s);
+    ctx.fillStyle = '#aaa';
+    strokedText(ctx, text, (gx + 4) * s, (gy + 27) * s);
 }
 
 // ============================================================
@@ -638,8 +716,34 @@ function render() {
     ensureBackground();
     ctx.drawImage(bgCanvas, 0, 0);
 
-    // Sort agents by Y for depth ordering
-    const sorted = Object.values(agents).sort((a, b) => a.y - b.y);
+    // Skip offline agents on canvas — they're still listed in the
+    // sidebar but rendering them at stale positions creates the
+    // "ghost stack" of unreadable overlapping characters at the
+    // bottom of the office.
+    const visible = Object.values(agents).filter(a => a.status !== 'offline');
+
+    // Sort by Y for depth ordering
+    const sorted = visible.sort((a, b) => a.y - b.y);
+
+    // Pre-compute "is this agent's task label going to collide with the
+    // name tag of the agent immediately below them?" Task labels render
+    // at gy+27, name tags at gy+21 — so if the next agent's y is within
+    // ~10 game units, suppress the task to keep things readable.
+    const TASK_COLLISION_DIST = 12;
+    const taskSuppressed = new Map();
+    for (let i = 0; i < sorted.length; i++) {
+        const a = sorted[i];
+        let suppress = false;
+        for (let j = i + 1; j < sorted.length; j++) {
+            const b = sorted[j];
+            // Same x-band (within an agent's width) AND b is just below a
+            if (Math.abs(b.x - a.x) < 14 && (b.y - a.y) < TASK_COLLISION_DIST && (b.y - a.y) >= 0) {
+                suppress = true;
+                break;
+            }
+        }
+        taskSuppressed.set(a.name, suppress);
+    }
 
     for (const agent of sorted) {
         const colors = ROLE_COLORS[agent.role] || ROLE_COLORS['unknown'];
@@ -658,9 +762,9 @@ function render() {
             drawBubble(agent.x, agent.y, agent.message);
         }
 
-        // Task label (when working)
+        // Task label (when working) — suppressed if it would overlap a neighbor
         if (agent.task && (agent.status === 'working' || agent.status === 'planning') && !agent.message) {
-            drawTaskLabel(agent.x, agent.y, agent.task);
+            drawTaskLabel(agent.x, agent.y, agent.task, taskSuppressed.get(agent.name));
         }
     }
 
