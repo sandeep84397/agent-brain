@@ -23,31 +23,46 @@ After conversion:
 3. Call `log_outcome(decision_id="<id>", outcome="accepted", outcome_by="brain-compiler", reason="<files converted>")`
 NON-NEGOTIABLE.
 
-# SAN Rules (STRICT)
-1. Lead with subject: `ClassName @kind {`
-2. Operators not verbs: → = : ? + | ⇒ ×N
-3. Facts as key:value, one per line
-4. Training-native terms (sealed class, not "closed set of types")
-5. Group by: @flow, @state, @deps, @constraint, @threading, @risk
-6. Each line independently meaningful — no pronouns, no "it"
-7. NEVER drop facts. Compress format, preserve ALL information.
-8. Include: function signatures, dependencies, layer, patterns, error handling
+# SAN Rules (STRICT — spec: san/README.md v2)
+1. Header at column 0, EXACTLY: `<qualified_name> @<kind> {` — server indexes
+   via regex `^(\S+)\s+@(\w+)\s*\{`. NEVER use `# qualified_name:` comment headers.
+2. ALWAYS include `src: <line_start>-<line_end>` as the first line of each block.
+3. Operators not verbs: → = : ? + | ⇒ ×N (ASCII -> => xN equivalent)
+4. Facts as key:value, one per line, canonical order:
+   src, purpose, impl, deps, fn:..., @state, @errors, @constraint, @threading, patterns, risk
+5. Identifiers VERBATIM from source — never abbreviate or rename function/param/type names.
+   Compress prose, not code.
+6. Prefix private/internal members with `-` (e.g. `-fn:hashPassword(raw) → String`)
+7. `@errors` mandatory if source has catch blocks, error returns, or fallbacks.
+8. Training-native terms (sealed class, not "closed set of types")
+9. Each line independently meaningful — no pronouns, no "it"
+10. NEVER drop facts. Compress format, preserve ALL information.
+11. Functions in SOURCE ORDER. No timestamps, no opinions. Same source ⇒ same SAN.
+12. NEVER emit stub/placeholder files. Trivial source still gets one real block with its exports.
 
 # Output Format
 ```
 <qualified_name> @<kind> {
+  src: 12-87
   <san_content>
 }
 ```
-kind = svc | repo | route | model | iface | config | test | util | vm | usecase | fragment | activity | module
+kind = svc | repo | route | model | iface | config | test | util | vm | usecase | fragment | activity | module | fn
 
 # Quality Gate
 After conversion, verify:
-- Count functions in raw file vs SAN. Must match.
+- Header matches `^(\S+)\s+@(\w+)\s*\{` on every block (index compatibility).
+- Every block has a `src:` line range.
+- Count functions in raw file vs SAN. Must match (private ones carry `-` prefix).
 - Count classes/interfaces in raw file vs SAN. Must match.
-- All public API surfaces documented.
-- All dependencies listed.
+- Signatures use verbatim identifiers from source.
+- All public API surfaces documented. All dependencies listed.
+- `@errors` present if the source handles errors.
 - If anything missing → add it.
+
+# Skip
+Do NOT convert: build outputs (`build/`, `bin/`, `dist/`, `out/`), generated code,
+vendored deps (`node_modules/`, `Pods/`). Only hand-written source.
 
 # Workflow
 When invoked:

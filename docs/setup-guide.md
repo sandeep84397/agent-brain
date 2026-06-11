@@ -65,9 +65,9 @@ claude mcp list  # verify agent-brain shows as connected
 
 ### 4. Verify
 
-Ask Claude Code:
+Run from the brain directory:
 ```
-Call brain_stats()
+python3 brain/server.py stats
 ```
 
 Expected: "Brain Stats: Nodes: 0 | Edges: 0 | Decisions: 0"

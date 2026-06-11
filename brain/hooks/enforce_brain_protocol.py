@@ -74,14 +74,15 @@ def main():
 
     file_path = tool_input.get("file_path", "")
 
-    # Skip non-code files: docs, configs, generated files
-    skip_patterns = (
-        ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
-        ".lock", ".gitignore", ".env",
-        "CLAUDE.md", "README", "LICENSE", "CHANGELOG",
-        ".san", "_index.json", ".san_hashes",
-    )
-    if any(file_path.endswith(p) or p in file_path for p in skip_patterns):
+    # Skip non-code files: docs, configs, generated files.
+    # Extensions match by suffix, names by basename prefix — substring
+    # matching previously skipped enforcement for any path containing
+    # e.g. "sandbox" (matched ".san") or "envoy" (matched ".env").
+    basename = os.path.basename(file_path)
+    skip_exts = (".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+                 ".lock", ".gitignore", ".env", ".san")
+    skip_name_prefixes = ("README", "LICENSE", "CHANGELOG", ".san_hashes", ".env")
+    if file_path.endswith(skip_exts) or basename.startswith(skip_name_prefixes):
         sys.exit(0)
 
     # Skip if editing inside .claude/, .git/, node_modules/, build/

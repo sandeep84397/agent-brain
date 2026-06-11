@@ -74,15 +74,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        last_data = ""
+        last_mtime = None
         try:
             while True:
-                state = load_state()
-                data = json.dumps(state, separators=(",", ":"))
-                if data != last_data:
+                # stat() before read: skip parse+serialize when nothing changed
+                try:
+                    mtime = STATE_FILE.stat().st_mtime_ns
+                except OSError:
+                    mtime = None
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    state = load_state()
+                    data = json.dumps(state, separators=(",", ":"))
                     self.wfile.write(f"data: {data}\n\n".encode())
                     self.wfile.flush()
-                    last_data = data
                 time.sleep(0.5)
         except (BrokenPipeError, ConnectionError, OSError):
             pass

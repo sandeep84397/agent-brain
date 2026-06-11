@@ -1,20 +1,38 @@
 # Agent Brain
 
-Persistent decision memory for AI code agent teams. Agents learn from mistakes, coordinate across sessions, and never repeat the same error twice.
+Persistent decision memory for AI code agent teams. Agents learn from mistakes, coordinate across sessions, and never repeat the same error twice — and read your codebase at ~10-15% of the usual token cost.
 
-**Works with any MCP-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, etc. Agent templates (`.md` files) are Claude Code specific — the MCP server itself is universal.
+**Works with any [MCP](https://modelcontextprotocol.io) (Model Context Protocol)-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, etc. Agent templates (`.md` files) are Claude Code specific — the MCP server itself is universal.
+
+## Contents
+
+- [What This Does](#what-this-does) · [Features](#features)
+- [Quick Start](#quick-start) — install in 2 minutes
+- [How To Use It](#how-to-use-it) — the agent loop, a worked example, what you get
+- [Architecture](#architecture) — what lives where, [performance & internals](#performance--internals)
+- [MCP Tools (17)](#mcp-tools-17) — the agent-facing API
+- [Agent Team](#agent-team) — bundled role templates
+- [Brain Protocol](#brain-protocol) — the enforced decision loop
+- [SAN Protocol](#san-protocol) — code compression: is it worth it, measuring savings (`token_savings`)
+- [SAN Setup](#san-setup) — turning SAN on, model choice, other platforms
+- [Adaptive Warnings](#adaptive-warnings) · [Office Dashboard](#office-dashboard-live-visualization) — live pixel-art team view
+- [Verification](#verification) · [Requirements](#requirements) · [Configuration](#configuration) · [Customization](#customization)
 
 ## What This Does
 
-Claude Code agents start fresh every session. No memory of past decisions, no learning from rejections, no cross-agent knowledge sharing. Agent Brain fixes this.
+AI coding agents start fresh every session: no memory of past decisions, no learning from rejections, no cross-agent knowledge sharing — and they burn tokens re-reading the same source files task after task. Agent Brain fixes both:
+
+1. **Memory** — decisions, outcomes, and review feedback persist across sessions and agents:
 
 ```
-Agent → pre_check()    → "WARNING: similar approach was rejected last week"
-Agent → log_decision() → records what you decided and why
-Agent → does work      → PR created
-PE    → log_outcome()  → "rejected: violates DIP"
+Agent    → pre_check()    → "WARNING: similar approach was rejected last week"
+Agent    → log_decision() → records what you decided and why
+Agent    → does work      → PR created
+Reviewer → log_outcome()  → "rejected: violates DIP (dependency inversion)"
 Next time, any agent → pre_check() → sees that rejection → avoids the mistake
 ```
+
+2. **Cheap code reading** — the optional [SAN protocol](#san-protocol) compresses source files to ~10-15% of their original tokens, and [`token_savings`](#measuring-your-savings-token_savings) shows you exactly how much it saved, per session, in numbers and %.
 
 ## Features
 
@@ -23,11 +41,13 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Decision Memory** | Log decisions, outcomes, feedback. Persists across sessions. |
 | **Pre-Check Warnings** | Before starting work, see past failures in the same area. |
 | **Fuzzy Matching** | "Rate limiting on signup" finds "rate limiting on login" rejection. |
-| **Code Bridge** | Link decisions to code-review-graph nodes. "Show me all decisions that touched AuthService." |
+| **Code Bridge** | Link decisions to code symbols: "Show me all decisions that touched AuthService." (Richer with the optional code-review-graph MCP server; works standalone too.) |
 | **Agent Scorecards** | Acceptance rate, trends, top rejection categories per agent. |
 | **Adaptive Warnings** | Agents with high rejection rates get stricter pre-check warnings. |
 | **Team Dashboard** | All agents at a glance — for project managers. |
-| **SAN Protocol** | Compress code to 15% of original tokens. Full codebase fits in context. |
+| **SAN Protocol** | Compress code to ~10-15% of original tokens. Full codebase fits in context. |
+| **Token Savings Tracker** | [`token_savings`](#measuring-your-savings-token_savings) reports tokens saved this session / today / all-time, with %. |
+| **Enforcement Hook** | Code edits are blocked until the agent logs a decision — memory actually gets populated. |
 
 ## Quick Start
 
@@ -51,6 +71,8 @@ The setup wizard will:
 > ```
 > The server gracefully handles a missing `config.json` — it starts with an empty brain.
 
+**Where things land:** `setup.sh` installs a copy of the server to `~/.agent-brain/` with its own venv — that copy is what Claude Code runs. The repo checkout keeps the source. CLI examples in this README use `python3 brain/server.py <cmd>` from the repo root; against the installed copy, the equivalent is `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py <cmd>`. If you edit the repo copy, re-copy it to `~/.agent-brain/server.py` (or re-run `setup.sh`) and restart Claude Code.
+
 ### Linking a project (so subagents can use brain)
 
 `./setup.sh` registers brain at the user level. That's enough for the **main Claude Code session**, but **subagents spawned inside a project** read MCP config from project-scoped files. Run:
@@ -71,20 +93,87 @@ After running it, restart Claude Code in the project (`/exit` then `claude`), th
 ~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose --project=/absolute/path/to/your/project
 ```
 
-### How brain MCP reaches Claude Code subagents (4-layer model)
+> Subagents not seeing brain tools? See [the 4-layer model](#how-brain-mcp-reaches-claude-code-subagents-4-layer-model) under Verification.
 
-Brain tools work in BOTH the main Claude Code session AND spawned subagents only when all four layers are correctly configured:
+## How To Use It
 
-| Layer | File | What it does | Set by |
-|---|---|---|---|
-| 1 | `~/.claude.json` *or* `~/.claude/settings.json` `mcpServers` | Registers `agent-brain` server for the main session | `setup.sh` (initial install) |
-| 2 | `~/.claude/settings.local.json` `enabledMcpjsonServers` | User-level allowlist (only relevant if you use allowlist mode) | `setup.sh` (auto-detects allowlist; appends `agent-brain` if needed) |
-| 3 | `<project>/.mcp.json` | Project-scoped server registration — **subagents read this** | `setup.sh --link-project=<path>` |
-| 4 | `<project>/.claude/settings.local.json` `enableAllProjectMcpServers: true` + `enabledMcpjsonServers: ["agent-brain"]` | Project-level activation | `setup.sh --link-project=<path>` |
+Once set up, **you don't call brain tools yourself** — your agents do, automatically, as part of their normal work. Your job is just to give agents tasks and (optionally) review the memory that builds up.
 
-**Plus** the agent frontmatter rule (see [Already have custom agents?](#already-have-custom-agents) below): **omit the `tools:` field** so MCP tools are inherited. Setting `tools: [Read, Write, ...]` makes it an allowlist that silently strips every `mcp__*` tool, and `mcp__agent-brain__*` is not a valid wildcard.
+### The loop every agent runs
 
-After any config change, restart Claude Code (`/exit` then `claude`) — MCP and agent definitions are loaded at session start. Then run `server.py diagnose --project=<path>` to confirm all four layers are wired up.
+For any non-trivial task, an agent follows this cycle (enforced by the hook — see [Enforcement Hook](#enforcement-hook)):
+
+```
+1. pre_check(agent, area, action)     ← "has anyone tried this before? did it fail?"
+2. log_decision(agent, repo, area,    ← records the plan; unlocks code edits
+                action, reasoning)
+3. … writes the code …
+4. log_outcome(decision_id, outcome,  ← records accepted / rejected / failed + why
+               outcome_by, reason)
+```
+
+You just say *"add rate limiting to the signup endpoint"*. The agent does the rest.
+
+### Worked example — across two sessions
+
+**Monday — a decision gets rejected:**
+
+```
+You:   "Add rate limiting to /login"
+Agent: pre_check(agent="karan", area="auth", action="rate limit login")
+       → "No past failures in 'auth'. Proceed."
+Agent: log_decision(... action="in-memory counter per IP", reasoning="simplest")
+       → dec_20260609_..._a1b2c3
+Agent: …writes code, opens PR…
+PE:    log_outcome(dec_..._a1b2c3, outcome="rejected", outcome_by="marcus",
+                   reason="in-memory won't survive multi-instance deploy; use Redis")
+```
+
+**Friday — a different agent, a related task, a different machine/session:**
+
+```
+You:   "Add rate limiting to the signup endpoint"
+Agent: pre_check(agent="dev", area="auth", action="rate limit signup")
+       → "SIMILAR REJECTIONS (1, 78% match):
+          [2026-06-09] karan tried: in-memory counter per IP
+          REJECTED by marcus: in-memory won't survive multi-instance deploy; use Redis"
+Agent: …goes straight to a Redis-backed limiter, skips the mistake…
+```
+
+No human re-explained the Redis constraint. The brain carried it forward.
+
+### How it behaves
+
+| When an agent calls… | What happens | What you see |
+|----------------------|--------------|--------------|
+| `pre_check` | Searches past decisions in the same area + fuzzy-matches similar actions across all areas | Agent mentions relevant past rejections before coding |
+| `log_decision` | Appends the decision to the journal + drops a marker file | Code edits are now unblocked for ~30 min |
+| Edit/Write **without** a recent `log_decision` | PreToolUse hook blocks the edit (exit 2) | Agent is forced to log a decision first, then retries |
+| `log_outcome` (rejected) | Records the rejection; raises that agent's rejection rate | Future `pre_check`s surface it; repeat offenders get stricter warnings |
+| Any tool with a `repo`/status | Updates the live office dashboard | Agent appears working/reviewing/blocked at `localhost:3333` |
+
+### What you get out of it (outcomes)
+
+| Outcome | How it helps |
+|---------|--------------|
+| **Mistakes aren't repeated** | A rejection logged once warns every agent, every future session — even on a different machine. |
+| **No re-explaining context** | Constraints ("use Redis", "don't bypass the auth middleware") live in the brain, not in your head. |
+| **Cross-agent learning** | What backend-engineer learns, frontend-engineer and QA see. Knowledge is team-wide, not per-agent. |
+| **Accountability & trends** | Scorecards show each agent's acceptance rate and recurring failure patterns — `agent_scorecard("karan", detail=True)`. |
+| **Auditable history** | "Why did we build it this way?" → `decisions_for("AuthService.login")` returns every decision that touched it, with reasoning and outcome. |
+| **Enforced discipline** | The hook means the memory actually gets populated — agents can't silently skip logging and edit code anyway. |
+
+### Inspecting the memory yourself
+
+You rarely need to, but from the repo root (where you cloned agent-brain):
+
+```bash
+python3 brain/server.py stats        # overall health: how many decisions/agents/repos
+python3 brain/server.py office       # who's working on what right now
+python3 brain/server.py savings      # tokens SAN saved (last session / today / all-time)
+```
+
+From any agent/MCP client you can also ask in plain language — *"show me the team dashboard"*, *"what decisions touched the payment service?"*, *"what's karan's scorecard?"*, *"how many tokens did SAN save this session?"* — and the agent picks the right tool (`team_dashboard`, `decisions_for`, `agent_scorecard`, `token_savings`).
 
 ## Architecture
 
@@ -93,9 +182,10 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 │  Your Machine (global)                          │
 │                                                 │
 │  ~/.agent-brain/                                │
-│  ├── server.py        ← MCP server (25 tools)  │
+│  ├── server.py        ← MCP server (17 tools)  │
 │  ├── config.json      ← your repos + team      │
-│  └── decisions.json   ← persistent memory       │
+│  ├── decisions.json   ← memory snapshot         │
+│  └── decisions.journal← append-only deltas      │
 │                                                 │
 │  ~/.claude/agents/                              │
 │  ├── project-manager.md                         │
@@ -115,7 +205,21 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 └─────────────────────────────────────────────────┘
 ```
 
-## MCP Tools (25)
+### Performance & internals
+
+The brain is built to stay fast as the decision history grows into thousands of entries:
+
+| Concern | How it's handled |
+|---------|------------------|
+| **Reading the graph** | `decisions.json` is parsed once and held in an in-memory cache keyed on file mtime+size — repeat tool calls in a session reuse it (~0.03ms vs ~140ms re-parse). The cache self-invalidates if another session writes the file. |
+| **Writing a decision** | Writes are **O(delta), not O(graph)**. `decisions.json` is a periodic full snapshot; `decisions.journal` is an append-only log of mutations. Logging an outcome on a ~4MB brain appends ~800 bytes instead of rewriting 4MB. The journal auto-compacts back into the snapshot once it passes 256KB. |
+| **SAN freshness** | The freshness sweep (stat every indexed file + scan the `.san/` tree) is debounced to once per 60s per repo, so bursts of `get_san`/`query_san` calls don't each pay for it. |
+| **Bounded responses** | Every list/detail tool caps its output (row limits, per-field truncation) so one giant decision can't blow up a response. Stored text fields are capped at write time too. |
+| **Multi-session safety** | Each Claude Code session runs its own server process sharing `~/.agent-brain/`. Writes use `os.replace` with pid-unique temp files to avoid cross-process rename collisions. |
+
+> **Files in `~/.agent-brain/`:** `decisions.json` (snapshot) + `decisions.journal` (deltas) are the decision memory — both are needed; don't delete one without the other. `office-state.json` is live dashboard state (self-pruning), `san_savings.jsonl` is the token-savings log. All are per-machine and git-ignored.
+
+## MCP Tools (17)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -130,45 +234,48 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 |------|---------|
 | `query_decisions` | Filter decisions by area/agent/repo/outcome |
 | `get_decision` | Full detail + feedback for one decision |
-| `brain_stats` | Overall brain health |
 
 ### Code Bridge
 | Tool | Purpose |
 |------|---------|
-| `decisions_for_code` | All decisions that touched a code symbol |
-| `decisions_for_file` | All decisions that touched a file |
+| `decisions_for` | Decisions touching a code symbol or file (auto-detected) |
 | `code_impact` | Blast radius: code symbols + callers |
 
 ### Patterns
 | Tool | Purpose |
 |------|---------|
-| `similar_failures` | Fuzzy cross-area search for similar rejections |
-| `get_patterns` | Cluster similar rejection reasons |
+| `get_patterns` | Cluster recurring rejections; pass `action` to find similar past failures |
 
 ### Scorecards
 | Tool | Purpose |
 |------|---------|
-| `get_agent_stats` | Quick stats for one or all agents |
-| `agent_scorecard` | Detailed breakdown with trends and advice |
-| `team_dashboard` | All agents at a glance |
+| `agent_scorecard` | Stats for one/all agents; `detail=True` for trends + advice |
+| `team_dashboard` | All agents at a glance (`limit` caps rows) |
 
 ### Office Dashboard
 | Tool | Purpose |
 |------|---------|
 | `heartbeat` | Report agent status (working/idle/discussing/blocked) for live dashboard |
-| `office_state` | Get current office state (debugging) |
 | `detect_stalls` | Find agents with open decisions but no activity for N minutes (default 5) |
 
 ### SAN (Structured Associative Notation)
 | Tool | Purpose |
 |------|---------|
-| `check_san_freshness` | Check which SAN files are stale vs source |
-| `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. Does NOT generate content. |
+| `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. `dry_run=True` for a freshness report only. Does NOT generate content. |
 | `query_san` | Search SAN files by keyword (index + content) |
-| `get_san` | Get SAN-compressed content for a source file |
-| `update_san_index` | Rebuild `_index.json` from .san/ directory |
-| `validate_san_system` | Run self-tests on hash/orphan/staleness system. Safe — uses temp directory. |
-| `validate_brain` | Run comprehensive self-tests on the entire brain (79 tests). Safe — uses temp directory. |
+| `get_san` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+| `token_savings` | Tokens saved by SAN this session / today / all-time — number + % |
+
+### Admin (CLI only — not exposed via MCP)
+Run from the repo root. These live on the CLI (not MCP) to keep the agent-facing tool surface lean:
+```bash
+python3 brain/server.py validate        # full brain self-tests (81 checks)
+python3 brain/server.py validate-san    # SAN subsystem self-tests
+python3 brain/server.py san-index <repo> # rebuild _index.json from .san/
+python3 brain/server.py stats           # overall brain health
+python3 brain/server.py office [repo]    # current office state (debug)
+python3 brain/server.py savings         # SAN token savings (last session / today / all-time)
+```
 
 ## Agent Team
 
@@ -319,7 +426,7 @@ Patterns are matched against the absolute file path. The hook fails open: an inv
 
 ## SAN Protocol
 
-Structured Associative Notation compresses code by ~85% while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.
+Structured Associative Notation compresses code to ~10-15% of its original tokens (≈85-90% savings, [measured](#is-san-worth-it-measured-numbers)) while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.
 
 ```
 # Before: 80 lines, ~1200 tokens
@@ -336,6 +443,161 @@ AuthServiceImpl @svc {
 }
 ```
 
+### Is SAN worth it? (measured numbers)
+
+Measured across 5 production repos (Kotlin/TS, ~1,026 source files, ~1.1M source tokens). Compression ratio varies by code style — 9-30% of original size, ~10% blended:
+
+| Scenario | Raw source | Via SAN | Saved |
+|----------|----------:|--------:|------:|
+| Agent reads 1 file | ~1,080 tokens | ~100 tokens | **~980 (90%)** |
+| One task (agent explores ~10 files) | ~10,800 tokens | ~1,000 tokens | **~10k per task** |
+| Whole codebase in context (1,026 files) | ~1.1M tokens — *doesn't fit* | ~100k tokens — *fits in one window* | **~1M (91%)** |
+
+Savings recur on **every read by every agent**; generation cost is one-time per file (plus regeneration when the file changes):
+
+| Cost side | Amount |
+|-----------|--------|
+| Generate 1 file (Sonnet) | ~1 read of the source + ~100-150 output tokens |
+| Break-even | After **~1-2 reads** of that file via `get_san` instead of raw |
+
+**Use SAN when:**
+- Agents repeatedly explore the same codebase (every task re-reads files)
+- The repo is too big to fit in context raw — SAN makes whole-repo reasoning possible
+- Multiple agents work the same repo (generation cost amortizes across the team)
+
+**Skip SAN when:**
+- The repo is small enough to fit in context anyway (< ~50 files)
+- Files churn rapidly — stale SANs need regeneration, eroding the one-time-cost advantage
+- One-off scripts / repos agents rarely revisit (won't reach break-even)
+
+> Token counts estimated at ~4 chars/token. Run the numbers for your own repos: `du -ch` your source extensions vs your `.san/` directory after converting a sample.
+
+### Measuring your savings (`token_savings`)
+
+You don't have to estimate — the brain **measures it live**. Every `get_san` call records what the raw source read *would* have cost vs the SAN tokens actually served. Ask any agent:
+
+```
+"how many tokens did SAN save this session?"   → agent calls token_savings()
+```
+
+```
+=== SAN TOKEN SAVINGS ===
+
+This session:
+  SAN reads: 14
+  Raw source cost avoided: 15,120 tokens
+  SAN tokens served: 1,402 tokens
+  SAVED: 13,718 tokens (91%)
+
+Today (2026-06-11):  ...
+All time:            ...
+```
+
+Or from the shell (reports the last recorded session instead of a live one):
+
+```bash
+python3 brain/server.py savings
+```
+
+How it counts — deliberately conservative, so the number is trustworthy:
+- Only `get_san` reads count (a read that replaced opening the raw file)
+- `query_san` searches and decision-memory benefits are **not** included
+- Reads where SAN wouldn't have saved anything are skipped
+- ~4 chars/token estimate; events persist in `~/.agent-brain/san_savings.jsonl`
+
+Use it to decide whether SAN is paying off: if "All time" savings stay near zero after a week, your agents aren't reading via SAN — check coverage with `recompile_san(dry_run=True)`.
+
+## SAN Setup
+
+SAN (Structured Associative Notation) compresses source code to ~10-15% of its original tokens for LLM context. This is **optional** — the decision memory works without it.
+
+1. **Create `.san/` in your repo:**
+   ```bash
+   mkdir -p your-repo/.san
+   ```
+
+2. **Generate SAN files** using the brain-compiler agent (see `san/brain-compiler.md`):
+   ```
+   # In Claude Code, spawn the brain-compiler agent:
+   # "Convert src/services/AuthService.kt to SAN"
+   ```
+   The compiler writes `your-repo/.san/src/services/AuthService.san`.
+
+3. **Build the index:**
+   ```bash
+   python3 brain/server.py san-index my-backend   # admin CLI; recompile_san also rebuilds it
+   ```
+
+4. **Query SAN:**
+   ```
+   query_san("my-backend", "Auth")      # search by keyword
+   get_san("my-backend", "src/services/AuthService.kt")  # get specific file
+   recompile_san("my-backend", dry_run=True)    # find stale files
+   ```
+
+### SAN Commands
+
+| Command | What it does |
+|---------|-------------|
+| `recompile_san("repo", dry_run=True)` | Report which SANs are stale, missing, or orphaned vs source (no changes) |
+| `recompile_san("repo")` | Refresh metadata: rebuild index, clean orphans, update hashes. Does NOT generate SAN content. |
+| `query_san("repo", "keyword")` | Search SAN index + file contents by keyword |
+| `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+| `python3 brain/server.py san-index <repo>` | (CLI) Rebuild `_index.json` from all `.san` files |
+| `python3 brain/server.py validate-san` | (CLI) 24 self-tests: hashing, orphan cleanup, staleness, index building. Isolated temp dir. |
+
+### How SAN Generation Works
+
+SAN files are **only generated by the brain-compiler agent** (LLM-powered). The server itself does NOT generate SAN content — it only manages metadata, detects staleness, and cleans up orphans. Asking the agent-brain MCP server to "generate SAN" does nothing; spawn the brain-compiler agent instead.
+
+**Workflow:**
+1. Brain-compiler generates rich SAN files (dependencies, patterns, execution flow)
+2. Server tracks source hashes to detect when SANs become stale
+3. `recompile_san(dry_run=True)` / `query_san` / `get_san` report stale SANs
+4. You re-run brain-compiler on stale files to regenerate
+
+### Which model to use for generation
+
+**Use Sonnet.** SAN conversion is mechanical (read source → emit facts in SAN notation) — it doesn't need a frontier model, and you'll be converting hundreds of files. The bundled [`san/brain-compiler.md`](san/brain-compiler.md) agent already pins this:
+
+```yaml
+model: claude-sonnet-4-6   # cheap, fast, accurate enough for mechanical conversion
+```
+
+Spend the savings where it matters: your engineering agents *consuming* SAN can run on bigger models, since SAN cuts their input cost to ~10-15% of raw anyway. Only escalate the compiler to a bigger model if you find SAN files missing relationships on gnarly, highly-dynamic code.
+
+### Generating SAN from other platforms (ChatGPT, Cursor, etc.)
+
+The **MCP server is platform-agnostic** — any MCP client can call `query_san`/`get_san`/`recompile_san`. Only the brain-compiler *agent template* is Claude Code specific. SAN files themselves are plain text, so any capable LLM can generate them:
+
+1. Give the model the SAN spec ([`san/README.md`](san/README.md)) + the source file
+2. Save its output to `<repo>/.san/<source-path>.san` (mirror the source tree, swap extension to `.san`)
+3. Rebuild the index: `python3 brain/server.py san-index <repo>` (or call `recompile_san("<repo>")` from any MCP client)
+
+The server's hash-based staleness tracking works identically regardless of which model wrote the file. Cheap-tier models on other platforms (e.g. GPT-4o-mini class) generally handle the conversion; verify a few files against the spec before bulk-converting.
+
+### Content Hashing
+
+SAN staleness detection uses **sha256 content hashing** to avoid false positives:
+
+- Source file hashes are stored in `.san/.san_hashes.json`
+- When checking freshness, if the source content hash matches the stored hash, the file is skipped (even if mtime changed)
+- This catches false positives from `git checkout`, `git stash pop`, `touch`, or editor save-without-change
+- Hashes are updated when `recompile_san` runs
+
+### Orphan Cleanup
+
+When a source file is deleted, its SAN file becomes an orphan. Orphans are detected and cleaned up automatically:
+
+- Every source tracked in `.san_hashes.json` is checked for existence
+- If the source is gone, the corresponding `.san` file and hash entry are removed
+- `.san` files with no matching source (even if not in hash tracker) are also cleaned up
+- Stats report `orphans_removed` so you can see what was cleaned up
+
+> **Important: SAN refresh is NOT automatic.** Staleness checks run when you call `query_san`, `get_san`, or `recompile_san(dry_run=True)` — they report stale SANs but do NOT regenerate them. To force a full metadata refresh (e.g., after a large merge or branch switch), call `recompile_san("repo")`. To regenerate stale SAN content, run the brain-compiler agent on the reported files.
+
+> **Commit `.san/` to git.** SAN files are prebuilt knowledge — they help any developer (or agent) working on the project. Don't `.gitignore` them. Add `.san/.san_hashes.json` to `.gitignore` — it's a local cache.
+
 ## Adaptive Warnings
 
 Agents with high rejection rates get progressively stricter warnings:
@@ -343,8 +605,10 @@ Agents with high rejection rates get progressively stricter warnings:
 | Rejection Rate | Warning Level | Behavior |
 |---------------|--------------|----------|
 | < 30% | NORMAL | Standard pre_check |
-| 30-50% | ELEVATED | "Pay close attention to past failures" |
-| > 50% | STRICT | Shows top rejection patterns, demands extra scrutiny |
+| 30-49% | ELEVATED | "Pay close attention to past failures" |
+| ≥ 50% | STRICT | Shows top rejection patterns, demands extra scrutiny |
+
+Agents with fewer than 3 logged decisions always get NORMAL — no judgment on a tiny sample.
 
 ## Office Dashboard (Live Visualization)
 
@@ -387,33 +651,33 @@ heartbeat(agent="arjun", status="discussing", talking_to="marcus", message="DIP 
 
 ## Verification
 
-After setup, restart Claude Code and run the full validation:
+After setup, run the full validation from the repo root:
 
-```
-# From any MCP client — call validate_brain()
-# Expected: "Agent Brain Validation: 79 passed, 0 failed ✓ ALL TESTS PASSED"
+```bash
+python3 brain/server.py validate
+# Expected: "Agent Brain Validation: 81 passed, 0 failed ✓ ALL TESTS PASSED"
 ```
 
 This tests every subsystem in isolation using a temp directory:
 
-| Section | Tests | What's validated |
-|---------|-------|-----------------|
+| Section | Checks | What's validated |
+|---------|--------|-----------------|
 | Graph Persistence | 4 | Save/load, atomic writes, empty state |
-| Decision Memory | 10 | log_decision, log_outcome, log_feedback, error handling |
+| Decision Memory | 16 | log_decision, log_outcome, log_feedback, error handling |
 | Pre-check & Warnings | 7 | Exact matches, similar rejections, adaptive warning levels |
-| Similarity Matching | 6 | Tokenizer, Jaccard + domain boost, false positive rejection |
+| Similarity Matching | 7 | Tokenizer (camelCase split), Jaccard + domain boost, false positives |
 | Pattern Clustering | 1 | DIP-related rejections cluster together |
-| Scorecards & Dashboard | 9 | Acceptance rates, trends, team_dashboard rendering |
+| Scorecards & Dashboard | 11 | Acceptance rates, trends, team_dashboard rendering |
 | Query & Retrieval | 6 | Filters, missing ID handling, file-based search |
 | Code Bridge | 4 | Symbol linking, callers, impact radius |
 | Office State | 11 | Heartbeat, role resolution, messages, auto-heartbeat |
 | Config & Edge Cases | 3 | Missing/corrupt config and graph files |
-| SAN System | 23 | Hashing, orphan cleanup, staleness, index building |
-| Integration Workflow | 9 | Full end-to-end: pre_check → decide → reject → feedback → re-check |
+| SAN System | 1 | Delegates to the 24-check `validate-san` suite (hashing, orphans, staleness, indexing) |
+| Integration Workflow | 10 | Full end-to-end: pre_check → decide → reject → feedback → re-check |
 
-You can also run just the SAN subsystem: `validate_san_system()`
+You can also run just the SAN subsystem: `python3 brain/server.py validate-san`
 
-Or verify basic connectivity with `brain_stats()`:
+Or verify basic connectivity with `python3 brain/server.py stats`:
 
 ```
 Brain Stats:
@@ -428,7 +692,7 @@ Brain Stats:
 
 | Problem | Fix |
 |---------|-----|
-| `brain_stats` not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
+| brain tools not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
 | MCP connection error | Check venv: `~/.agent-brain/.venv/bin/python -c "import mcp, networkx"` |
 | No tools registered | Verify: `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py` shouldn't error |
 | `config.json` not found | Server works without it (empty brain). Create one if you want repo integration. |
@@ -461,76 +725,21 @@ Runs a standalone health check from the shell — no Claude session required.
 
 Exit code is `0` when all checks pass, `1` otherwise — safe to call from a CI pre-flight or a dotfiles bootstrap.
 
-## SAN Setup
+### How brain MCP reaches Claude Code subagents (4-layer model)
 
-SAN (Structured Associative Notation) compresses source code by ~85% for LLM context. This is **optional** — the decision memory works without it.
+Brain tools work in BOTH the main Claude Code session AND spawned subagents only when all four layers are correctly configured:
 
-1. **Create `.san/` in your repo:**
-   ```bash
-   mkdir -p your-repo/.san
-   ```
+| Layer | File | What it does | Set by |
+|---|---|---|---|
+| 1 | `~/.claude.json` *or* `~/.claude/settings.json` `mcpServers` | Registers `agent-brain` server for the main session | `setup.sh` (initial install) |
+| 2 | `~/.claude/settings.local.json` `enabledMcpjsonServers` | User-level allowlist (only relevant if you use allowlist mode) | `setup.sh` (auto-detects allowlist; appends `agent-brain` if needed) |
+| 3 | `<project>/.mcp.json` | Project-scoped server registration — **subagents read this** | `setup.sh --link-project=<path>` |
+| 4 | `<project>/.claude/settings.local.json` `enableAllProjectMcpServers: true` + `enabledMcpjsonServers: ["agent-brain"]` | Project-level activation | `setup.sh --link-project=<path>` |
 
-2. **Generate SAN files** using the brain-compiler agent (see `san/brain-compiler.md`):
-   ```
-   # In Claude Code, spawn the brain-compiler agent:
-   # "Convert src/services/AuthService.kt to SAN"
-   ```
-   The compiler writes `your-repo/.san/src/services/AuthService.san`.
+**Plus** the agent frontmatter rule (see [Already have custom agents?](#already-have-custom-agents) below): **omit the `tools:` field** so MCP tools are inherited. Setting `tools: [Read, Write, ...]` makes it an allowlist that silently strips every `mcp__*` tool, and `mcp__agent-brain__*` is not a valid wildcard.
 
-3. **Build the index:**
-   ```
-   # Call update_san_index("my-backend") via any agent
-   ```
+After any config change, restart Claude Code (`/exit` then `claude`) — MCP and agent definitions are loaded at session start. Then run `server.py diagnose --project=<path>` to confirm all four layers are wired up.
 
-4. **Query SAN:**
-   ```
-   query_san("my-backend", "Auth")      # search by keyword
-   get_san("my-backend", "src/services/AuthService.kt")  # get specific file
-   check_san_freshness("my-backend")    # find stale files
-   ```
-
-### SAN Commands
-
-| Command | What it does |
-|---------|-------------|
-| `check_san_freshness("repo")` | Reports which SANs are stale, missing, or orphaned vs source |
-| `recompile_san("repo")` | Refresh metadata: rebuild index, clean orphans, update hashes. Does NOT generate SAN content. |
-| `query_san("repo", "keyword")` | Search SAN index + file contents by keyword |
-| `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file |
-| `update_san_index("repo")` | Rebuild `_index.json` from all `.san` files |
-| `validate_san_system()` | Run 23 self-tests: hashing, orphan cleanup, staleness detection, index building. Uses isolated temp dir. |
-
-### How SAN Generation Works
-
-SAN files are **only generated by the brain-compiler agent** (LLM-powered). The server itself does NOT generate SAN content — it only manages metadata, detects staleness, and cleans up orphans.
-
-**Workflow:**
-1. Brain-compiler generates rich SAN files (dependencies, patterns, execution flow)
-2. Server tracks source hashes to detect when SANs become stale
-3. `check_san_freshness` / `query_san` / `get_san` report stale SANs
-4. You re-run brain-compiler on stale files to regenerate
-
-### Content Hashing
-
-SAN staleness detection uses **sha256 content hashing** to avoid false positives:
-
-- Source file hashes are stored in `.san/.san_hashes.json`
-- When checking freshness, if the source content hash matches the stored hash, the file is skipped (even if mtime changed)
-- This catches false positives from `git checkout`, `git stash pop`, `touch`, or editor save-without-change
-- Hashes are updated when `recompile_san` runs
-
-### Orphan Cleanup
-
-When a source file is deleted, its SAN file becomes an orphan. Orphans are detected and cleaned up automatically:
-
-- Every source tracked in `.san_hashes.json` is checked for existence
-- If the source is gone, the corresponding `.san` file and hash entry are removed
-- `.san` files with no matching source (even if not in hash tracker) are also cleaned up
-- Stats report `orphans_removed` so you can see what was cleaned up
-
-> **Important: SAN refresh is NOT automatic.** Staleness checks run when you call `query_san`, `get_san`, or `check_san_freshness` — they report stale SANs but do NOT regenerate them. To force a full metadata refresh (e.g., after a large merge or branch switch), call `recompile_san("repo")`. To regenerate stale SAN content, run the brain-compiler agent on the reported files.
-
-> **Commit `.san/` to git.** SAN files are prebuilt knowledge — they help any developer (or agent) working on the project. Don't `.gitignore` them. Add `.san/.san_hashes.json` to `.gitignore` — it's a local cache.
 
 ## Requirements
 
@@ -592,7 +801,7 @@ A flat `team` list applies to every repo — fine when one team owns everything.
 
 **Backwards compatible**: configs without `teams_per_repo` and no `repos` field on entries behave exactly like before.
 
-**How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, `office_state`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. `office_state(repo="my-backend")` shows only that repo's agents.
+**How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. The `office` CLI command (`python3 brain/server.py office my-backend`) shows only that repo's agents.
 
 ## Customization
 
