@@ -1307,6 +1307,15 @@ def detect_stalls(stall_minutes: int = 5, limit: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 
+_SAN_SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
+
+
+def _is_skipped_source(rel: str) -> bool:
+    """True for build outputs / vendored dirs that should never get SAN files."""
+    parts = rel.replace("\\", "/").split("/")
+    return any(p in _SAN_SKIP_DIRS for p in parts[:-1])
+
+
 def _resolve_repo_path(repo: str) -> Optional[Path]:
     """Resolve repo name to path from config."""
     repo_paths = _get_repo_paths()
@@ -1475,7 +1484,7 @@ def _ensure_san_fresh(repo: str) -> Optional[str]:
         for ext in ("**/*.kt", "**/*.java"):
             for source_path in repo_path.glob(ext):
                 rel = str(source_path.relative_to(repo_path))
-                if rel.startswith("build/") or "/.gradle/" in rel:
+                if _is_skipped_source(rel):
                     continue
                 san_path = _source_to_san_path(san_dir, rel)
                 if not san_path.exists():
@@ -1737,7 +1746,7 @@ def recompile_san(repo: str, dry_run: bool = False) -> str:
     for ext in ("**/*.kt", "**/*.java"):
         for source_path in repo_path.glob(ext):
             rel = str(source_path.relative_to(repo_path))
-            if rel.startswith("build/") or "/.gradle/" in rel or "/build/" in rel:
+            if _is_skipped_source(rel):
                 continue
             san_path = _source_to_san_path(san_dir, rel)
             if not san_path.exists():
