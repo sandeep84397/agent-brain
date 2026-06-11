@@ -128,12 +128,33 @@ def _load_office_state() -> dict:
     return {"agents": {}, "messages": []}
 
 
+_OFFICE_AGENT_TTL_H = 48
+
+
 def _save_office_state(state: dict) -> None:
-    """Persist office state atomically."""
+    """Persist office state atomically. Evicts agents idle > 48h (one-off
+    subagent names otherwise accumulate forever)."""
     BRAIN_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = OFFICE_STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    agents = state.get("agents")
+    if isinstance(agents, dict):
+        cutoff = datetime.now().timestamp() - _OFFICE_AGENT_TTL_H * 3600
+        for name in list(agents.keys()):
+            try:
+                seen = datetime.fromisoformat(agents[name].get("last_seen", "")).timestamp()
+                if seen < cutoff:
+                    del agents[name]
+            except (ValueError, TypeError, AttributeError):
+                pass
+    tmp = OFFICE_STATE_FILE.with_suffix(f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(state, separators=(",", ":")))
     tmp.rename(OFFICE_STATE_FILE)
+
+
+def _cap_text(text: str, limit: int) -> str:
+    """Cap stored free-text fields so single nodes can't bloat the graph."""
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    return text[:limit] + "…[truncated]"
 
 
 DECISION_MARKER_FILE = BRAIN_DIR / ".last_decision_marker"
@@ -180,7 +201,7 @@ mcp = FastMCP(
         "Call pre_check BEFORE starting work. "
         "Call log_decision when you decide on an approach. "
         "Call log_outcome after review/result. "
-        "Use decisions_for_code to find past decisions touching a code symbol. "
+        "Use decisions_for to find past decisions touching a code symbol or file. "
         "This is NON-NEGOTIABLE for all agents."
     ),
 )
@@ -191,25 +212,48 @@ mcp = FastMCP(
 # ===========================================================================
 
 
+# Graph cache: parsing the full graph costs ~140ms at a few MB, paid on every
+# tool call without this. Keyed on (path, mtime_ns, size) so it stays correct
+# when validate_brain swaps GRAPH_FILE to a temp dir or another session writes
+# the file. Invariant: mutate the returned graph only under LOCK and always
+# _save_graph afterwards (which refreshes the cache).
+_GRAPH_CACHE: dict = {"key": None, "graph": None}
+
+
+def _graph_cache_key():
+    try:
+        st = GRAPH_FILE.stat()
+        return (str(GRAPH_FILE), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def _load_graph() -> nx.DiGraph:
-    """Load the decision graph from disk. Returns empty graph if none exists."""
-    if GRAPH_FILE.exists():
-        try:
-            data = json.loads(GRAPH_FILE.read_text())
-            return nx.node_link_graph(data)
-        except (json.JSONDecodeError, OSError):
-            return nx.DiGraph()
-    return nx.DiGraph()
+    """Load the decision graph (mtime-cached). Returns empty graph if none exists."""
+    key = _graph_cache_key()
+    if key is None:
+        return nx.DiGraph()
+    if _GRAPH_CACHE["key"] == key and _GRAPH_CACHE["graph"] is not None:
+        return _GRAPH_CACHE["graph"]
+    try:
+        data = json.loads(GRAPH_FILE.read_text())
+        G = nx.node_link_graph(data)
+    except (json.JSONDecodeError, OSError):
+        return nx.DiGraph()
+    _GRAPH_CACHE["key"] = key
+    _GRAPH_CACHE["graph"] = G
+    return G
 
 
 def _save_graph(G: nx.DiGraph) -> None:
-    """Persist the decision graph to disk."""
+    """Persist the decision graph to disk (compact JSON, atomic write)."""
     BRAIN_DIR.mkdir(parents=True, exist_ok=True)
     data = nx.node_link_data(G)
-    # Atomic write: write to temp file then rename
-    tmp = GRAPH_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp = GRAPH_FILE.with_suffix(f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, separators=(",", ":")))
     tmp.rename(GRAPH_FILE)
+    _GRAPH_CACHE["key"] = _graph_cache_key()
+    _GRAPH_CACHE["graph"] = G
 
 
 # ===========================================================================
@@ -261,8 +305,21 @@ def _resolve_files_to_code_nodes(repo: str, files: list[str]) -> list[dict]:
     return results
 
 
-def _get_code_node_details(repo: str, qualified_name: str) -> Optional[dict]:
+def _get_code_node_details(repo: str, qualified_name: str,
+                           conn: Optional[sqlite3.Connection] = None) -> Optional[dict]:
     """Get details for a specific code node by qualified_name."""
+    if conn is not None:
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT kind, name, qualified_name, file_path, line_start, line_end, "
+                "parent_name, params, return_type "
+                "FROM nodes WHERE qualified_name = ?",
+                (qualified_name,),
+            ).fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
     db_path = _get_crg_db(repo)
     if not db_path:
         return None
@@ -280,8 +337,19 @@ def _get_code_node_details(repo: str, qualified_name: str) -> Optional[dict]:
         return None
 
 
-def _get_callers_of(repo: str, qualified_name: str) -> list[str]:
+def _get_callers_of(repo: str, qualified_name: str,
+                    conn: Optional[sqlite3.Connection] = None) -> list[str]:
     """Find what calls a given code node."""
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT source_qualified FROM edges "
+                "WHERE target_qualified = ? AND kind = 'CALLS'",
+                (qualified_name,),
+            ).fetchall()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
     db_path = _get_crg_db(repo)
     if not db_path:
         return []
@@ -329,10 +397,8 @@ _DOMAIN_TERMS = {
 }
 
 
-def _similarity(a: str, b: str) -> float:
-    """Enhanced similarity: Jaccard + domain-term bonus."""
-    tokens_a = _tokenize(a)
-    tokens_b = _tokenize(b)
+def _similarity_sets(tokens_a: set, tokens_b: set) -> float:
+    """Jaccard + domain-term bonus over pre-tokenized sets."""
     if not tokens_a or not tokens_b:
         return 0.0
     intersection = tokens_a & tokens_b
@@ -341,6 +407,11 @@ def _similarity(a: str, b: str) -> float:
     domain_shared = intersection & _DOMAIN_TERMS
     domain_boost = len(domain_shared) / len(union) * 0.3 if domain_shared else 0.0
     return min(jaccard + domain_boost, 1.0)
+
+
+def _similarity(a: str, b: str) -> float:
+    """Enhanced similarity: Jaccard + domain-term bonus."""
+    return _similarity_sets(_tokenize(a), _tokenize(b))
 
 
 def _find_similar_rejections(
@@ -362,7 +433,7 @@ def _find_similar_rejections(
         if sim >= threshold:
             similar.append({
                 "id": node_id, "agent": data.get("agent", "?"),
-                "action": past_action, "reason": past_reason,
+                "action": past_action[:200], "reason": past_reason[:300],
                 "outcome_by": data.get("outcome_by", "?"),
                 "area": data.get("area", "?"), "similarity": sim,
                 "timestamp": data.get("timestamp", "?")[:10],
@@ -387,6 +458,10 @@ def _cluster_rejection_reasons(G: nx.DiGraph, area: str = "") -> list[list[dict]
         })
     if not rejections:
         return []
+    # O(R^2) pairwise clustering: cap input to the most recent 500 rejections
+    # and tokenize each reason exactly once (was re-tokenized per pair).
+    rejections = rejections[-500:]
+    token_sets = [_tokenize(r["reason"]) for r in rejections]
     clusters: list[list[dict]] = []
     used: set[int] = set()
     for i, r in enumerate(rejections):
@@ -397,7 +472,7 @@ def _cluster_rejection_reasons(G: nx.DiGraph, area: str = "") -> list[list[dict]
         for j, other in enumerate(rejections):
             if j in used:
                 continue
-            if _similarity(r["reason"], other["reason"]) >= 0.20:
+            if _similarity_sets(token_sets[i], token_sets[j]) >= 0.20:
                 cluster.append(other)
                 used.add(j)
         if len(cluster) >= 2:
@@ -505,13 +580,8 @@ def _adaptive_warning_level(G: nx.DiGraph, agent: str, area: str) -> str:
 @mcp.tool()
 def pre_check(agent: str, area: str, action_description: str) -> str:
     """
-    CHECK THIS BEFORE DOING WORK. Returns past failures, similar rejections,
-    and adaptive warnings based on agent history.
-
-    Args:
-        agent: Name of the agent calling (e.g. "arjun")
-        area: Domain area (e.g. "auth", "feed", "schema", "ui")
-        action_description: Brief description of what you plan to do
+    CHECK BEFORE DOING WORK. Returns past failures in this area, similar
+    rejections elsewhere, and adaptive warnings from this agent's history.
     """
     _auto_heartbeat(agent, "planning", action_description)
     with LOCK:
@@ -534,9 +604,9 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
         if data.get("outcome") in ("rejected", "failed"):
             exact_warnings.append(
                 f"- [{data.get('timestamp', '?')[:10]}] "
-                f"{data.get('agent', '?')} tried: {data.get('action', '?')}\n"
+                f"{data.get('agent', '?')} tried: {str(data.get('action', '?'))[:200]}\n"
                 f"  REJECTED by {data.get('outcome_by', '?')}: "
-                f"{data.get('outcome_reason', '?')}")
+                f"{str(data.get('outcome_reason', '?'))[:300]}")
     if exact_warnings:
         sections.append(
             f"EXACT MATCHES in '{area}' ({len(exact_warnings)}):\n\n"
@@ -579,22 +649,19 @@ def log_decision(
     code_symbols: Optional[list[str]] = None,
 ) -> str:
     """
-    Log a decision. Call AFTER pre_check, BEFORE doing work. Required before code edits.
-
-    Args:
-        agent: Agent name (e.g. "arjun")
-        repo: Repository name
-        area: Domain area (e.g. "auth", "feed", "schema")
-        action: What you decided to do
-        reasoning: Why you chose this approach
-        files_touched: File paths being modified (optional)
-        code_symbols: qualified_names from code-review-graph (optional)
+    Log a decision. Call AFTER pre_check, BEFORE doing work — required before
+    code edits. area e.g. "auth"; optional files_touched paths and
+    code_symbols qualified_names link the decision to code.
     """
+    # Cap stored text — unbounded fields produced 31KB decision nodes that
+    # bloat the graph file and every query/pre_check response echoing them.
+    action = _cap_text(action, 1000)
+    reasoning = _cap_text(reasoning, 2000)
     with LOCK:
         G = _load_graph()
         node_id = f"dec_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        resolved_symbols = code_symbols or []
-        files = files_touched or []
+        resolved_symbols = (code_symbols or [])[:50]
+        files = (files_touched or [])[:50]
         if files and not resolved_symbols:
             code_nodes = _resolve_files_to_code_nodes(repo, files)
             resolved_symbols = list(set(n["qualified_name"] for n in code_nodes))
@@ -620,13 +687,8 @@ def log_decision(
 @mcp.tool()
 def log_outcome(decision_id: str, outcome: str, outcome_by: str, reason: str) -> str:
     """
-    Log the outcome of a decision after review or execution.
-
-    Args:
-        decision_id: The ID returned by log_decision
-        outcome: One of: accepted, rejected, failed, revised
-        outcome_by: Who reviewed (e.g. "marcus", "qa-1", "runtime")
-        reason: Why it was accepted/rejected/failed
+    Record a decision's outcome after review/execution.
+    outcome: accepted | rejected | failed | revised. outcome_by: reviewer name.
     """
     with LOCK:
         G = _load_graph()
@@ -634,7 +696,7 @@ def log_outcome(decision_id: str, outcome: str, outcome_by: str, reason: str) ->
             return f"ERROR: decision '{decision_id}' not found"
         G.nodes[decision_id]["outcome"] = outcome
         G.nodes[decision_id]["outcome_by"] = outcome_by
-        G.nodes[decision_id]["outcome_reason"] = reason
+        G.nodes[decision_id]["outcome_reason"] = _cap_text(reason, 1000)
         G.nodes[decision_id]["outcome_timestamp"] = datetime.now().isoformat()
         dec_agent = G.nodes[decision_id].get("agent", "")
         dec_repo = G.nodes[decision_id].get("repo", "")
@@ -659,7 +721,7 @@ def log_feedback(agent: str, decision_id: str, feedback: str, severity: str = "i
         if decision_id not in G:
             return f"ERROR: decision '{decision_id}' not found"
         fb_id = f"fb_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        G.add_node(fb_id, type="feedback", agent=agent, feedback=feedback,
+        G.add_node(fb_id, type="feedback", agent=agent, feedback=_cap_text(feedback, 2000),
                     severity=severity, timestamp=datetime.now().isoformat())
         G.add_edge(fb_id, decision_id, relation="feedback_on")
         dec_agent = G.nodes.get(decision_id, {}).get("agent", "")
@@ -675,27 +737,22 @@ def log_feedback(agent: str, decision_id: str, feedback: str, severity: str = "i
 
 
 @mcp.tool()
-def decisions_for(target: str, repo: str = "", outcome: str = "") -> str:
+def decisions_for(target: str, repo: str = "", outcome: str = "", limit: int = 10) -> str:
     """
-    Find decisions touching a code symbol or file. Auto-detects which:
-    targets with "/" or a file extension are treated as file paths,
-    otherwise as code-review-graph qualified_names.
-
-    Args:
-        target: A qualified_name (e.g. "com.x.Auth.login") or file path
-        repo: Filter by repo (optional)
-        outcome: Filter by outcome (optional, code symbols only)
+    Find decisions touching a code symbol or file (auto-detected: "/" or an
+    extension means file path, else qualified_name). Optional repo/outcome
+    filters; limit caps results (default 10).
     """
     _SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
                     ".swift", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
                     ".php", ".scala", ".m", ".mm")
     looks_like_file = "/" in target or target.lower().endswith(_SOURCE_EXTS)
     if looks_like_file:
-        return _decisions_for_file(target, repo)
-    return _decisions_for_code(target, repo, outcome)
+        return _decisions_for_file(target, repo, limit)
+    return _decisions_for_code(target, repo, outcome, limit)
 
 
-def _decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") -> str:
+def _decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "", limit: int = 10) -> str:
     """Find all decisions that touched a specific code symbol."""
     with LOCK:
         G = _load_graph()
@@ -714,7 +771,7 @@ def _decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") 
             if outcome and data.get("outcome") != outcome:
                 continue
             results.append(
-                f"[{pred}] {data.get('agent','?')} | {data.get('action','?')} "
+                f"[{pred}] {data.get('agent','?')} | {str(data.get('action','?'))[:150]} "
                 f"-> {data.get('outcome','pending')}")
     for node_id, data in G.nodes(data=True):
         if data.get("type") != "decision":
@@ -725,16 +782,20 @@ def _decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") 
                 continue
             if outcome and data.get("outcome") != outcome:
                 continue
-            line = (f"[{node_id}] {data.get('agent','?')} | {data.get('action','?')} "
+            line = (f"[{node_id}] {data.get('agent','?')} | {str(data.get('action','?'))[:150]} "
                     f"-> {data.get('outcome','pending')}")
             if line not in results:
                 results.append(line)
     if not results:
         return f"No decisions found touching '{qualified_name}'."
-    return f"{len(results)} decision(s) touching '{qualified_name}':\n\n" + "\n".join(results)
+    shown = results[-limit:]
+    header = f"{len(results)} decision(s) touching '{qualified_name}'"
+    if len(results) > len(shown):
+        header += f" (showing last {len(shown)})"
+    return header + ":\n\n" + "\n".join(shown)
 
 
-def _decisions_for_file(file_path: str, repo: str = "") -> str:
+def _decisions_for_file(file_path: str, repo: str = "", limit: int = 10) -> str:
     """Find all decisions that touched a specific file."""
     with LOCK:
         G = _load_graph()
@@ -753,11 +814,15 @@ def _decisions_for_file(file_path: str, repo: str = "") -> str:
         files = data.get("files", [])
         if any(rel_path in f or f in rel_path for f in files):
             results.append(
-                f"[{node_id}] {data.get('agent','?')} | {data.get('action','?')} "
+                f"[{node_id}] {data.get('agent','?')} | {str(data.get('action','?'))[:150]} "
                 f"-> {data.get('outcome','pending')}")
     if not results:
         return f"No decisions found touching '{rel_path}'."
-    return f"{len(results)} decision(s) touching '{rel_path}':\n\n" + "\n".join(results)
+    shown = results[-limit:]
+    header = f"{len(results)} decision(s) touching '{rel_path}'"
+    if len(results) > len(shown):
+        header += f" (showing last {len(shown)})"
+    return header + ":\n\n" + "\n".join(shown)
 
 
 @mcp.tool()
@@ -776,25 +841,42 @@ def code_impact(decision_id: str) -> str:
     repo = data.get("repo", "")
     symbols = data.get("code_symbols", [])
     files = data.get("files", [])
-    lines = [f"Decision: {decision_id}", f"Action: {data.get('action', '?')}", ""]
+    lines = [f"Decision: {decision_id}", f"Action: {str(data.get('action', '?'))[:200]}", ""]
     if files:
         lines.append(f"Files touched ({len(files)}):")
-        for f in files:
+        for f in files[:20]:
             lines.append(f"  - {f}")
+        if len(files) > 20:
+            lines.append(f"  ... and {len(files) - 20} more")
     if symbols:
         lines.append(f"\nCode symbols ({len(symbols)}):")
-        for sym in symbols:
-            detail = _get_code_node_details(repo, sym)
-            if detail:
-                lines.append(f"  - [{detail['kind']}] {detail['name']} "
-                             f"({detail['file_path']}:{detail.get('line_start', '?')})")
-                callers = _get_callers_of(repo, sym)
-                if callers:
-                    lines.append(f"    Called by: {', '.join(callers[:5])}")
-                    if len(callers) > 5:
-                        lines.append(f"    ... and {len(callers) - 5} more")
-            else:
-                lines.append(f"  - {sym} (not in current code graph)")
+        # One connection for all symbol lookups (was 2 connects + 2 config
+        # reads per symbol)
+        conn = None
+        db_path = _get_crg_db(repo)
+        if db_path:
+            try:
+                conn = sqlite3.connect(str(db_path))
+            except Exception:
+                conn = None
+        try:
+            for sym in symbols[:20]:
+                detail = _get_code_node_details(repo, sym, conn=conn)
+                if detail:
+                    lines.append(f"  - [{detail['kind']}] {detail['name']} "
+                                 f"({detail['file_path']}:{detail.get('line_start', '?')})")
+                    callers = _get_callers_of(repo, sym, conn=conn)
+                    if callers:
+                        lines.append(f"    Called by: {', '.join(callers[:5])}")
+                        if len(callers) > 5:
+                            lines.append(f"    ... and {len(callers) - 5} more")
+                else:
+                    lines.append(f"  - {sym} (not in current code graph)")
+            if len(symbols) > 20:
+                lines.append(f"  ... and {len(symbols) - 20} more symbols")
+        finally:
+            if conn is not None:
+                conn.close()
     if not symbols and not files:
         lines.append("No code symbols or files linked.")
     return "\n".join(lines)
@@ -825,13 +907,8 @@ def similar_failures(action_description: str, area: str = "", threshold: float =
 @mcp.tool()
 def get_patterns(area: str = "", min_count: int = 1, action: str = "") -> str:
     """
-    Analyze past rejections. With `action` set, returns failures similar to that
-    proposed action; otherwise clusters recurring failure patterns.
-
-    Args:
-        area: Optionally filter to a specific area
-        min_count: Minimum cluster size (default 1)
-        action: If set, find rejections similar to this proposed action
+    Analyze past rejections. With action set: failures similar to that plan.
+    Without: clusters of recurring failure patterns (min_count filters size).
     """
     if action:
         return similar_failures(action, area)
@@ -845,19 +922,25 @@ def get_patterns(area: str = "", min_count: int = 1, action: str = "") -> str:
                 continue
             if area and data.get("area") != area:
                 continue
-            rejections.append(f"- {data.get('agent','?')}: {data.get('outcome_reason','unknown')}")
+            rejections.append(f"- {data.get('agent','?')}: {str(data.get('outcome_reason','unknown'))[:150]}")
         if rejections:
-            return f"No clusters, {len(rejections)} individual rejection(s):\n\n" + "\n".join(rejections)
+            shown = rejections[-20:]
+            return (f"No clusters, {len(rejections)} individual rejection(s)"
+                    + (f" (last {len(shown)})" if len(rejections) > 20 else "")
+                    + ":\n\n" + "\n".join(shown))
         return "No rejection patterns found."
+    clusters = [c for c in clusters if len(c) >= min_count][:10]
+    if not clusters:
+        return f"No rejection clusters with at least {min_count} member(s)."
     lines = [f"{len(clusters)} pattern cluster(s):\n"]
     for i, cluster in enumerate(clusters, 1):
         agents_in = sorted(set(r["agent"] for r in cluster))
         areas_in = sorted(set(r["area"] for r in cluster))
         lines.append(f"Pattern #{i} ({len(cluster)}x, agents: {', '.join(agents_in)}, "
                       f"areas: {', '.join(areas_in)}):")
-        lines.append(f"  Core issue: {cluster[0]['reason']}")
+        lines.append(f"  Core issue: {str(cluster[0]['reason'])[:150]}")
         if len(cluster) > 1:
-            lines.append(f"  Also: {cluster[1]['reason']}")
+            lines.append(f"  Also: {str(cluster[1]['reason'])[:150]}")
     return "\n\n".join(lines)
 
 
@@ -897,12 +980,8 @@ def get_agent_stats(agent: str = "") -> str:
 @mcp.tool()
 def agent_scorecard(agent: str = "", detail: bool = False) -> str:
     """
-    Agent performance stats. Compact one-line summary by default;
-    set detail=True for trends, top rejections, and area breakdown.
-
-    Args:
-        agent: Agent name (leave empty for all agents — compact mode only)
-        detail: True for the full single-agent scorecard (requires agent)
+    Agent performance stats. Compact summary by default (empty agent = all);
+    detail=True adds trends, top rejections, area breakdown (needs agent).
     """
     if not detail:
         return get_agent_stats(agent)
@@ -928,8 +1007,10 @@ def agent_scorecard(agent: str = "", detail: bool = False) -> str:
         f"Warning level: {level.upper()}",
     ]
     if s["areas"]:
-        lines.append("\nArea breakdown:")
-        for area_name, area_stats in sorted(s["areas"].items()):
+        lines.append("\nArea breakdown (top 10 by rejections):")
+        ranked_areas = sorted(s["areas"].items(),
+                              key=lambda kv: (-kv[1]["rejected"], -kv[1]["total"]))[:10]
+        for area_name, area_stats in sorted(ranked_areas):
             ar = (area_stats["rejected"] / area_stats["total"] * 100) if area_stats["total"] else 0
             flag = " !!!" if ar > 50 else ""
             lines.append(f"  {area_name}: {area_stats['total']} dec, "
@@ -974,7 +1055,9 @@ def team_dashboard(limit: int = 10) -> str:
     for name, s in sorted(shown, key=lambda kv: kv[0]):
         total = s["total"]
         rate = (s["accepted"] / total * 100) if total else 0
-        level = _adaptive_warning_level(G, name, "")
+        rej_rate = (s["rejected"] + s["failed"]) / total if total else 0
+        level = ("strict" if total >= 3 and rej_rate >= 0.5
+                 else "elevated" if total >= 3 and rej_rate >= 0.3 else "normal")
         flag = f" [{level.upper()}]" if level != "normal" else ""
         lines.append(f"  {name}: {total} dec, {s['accepted']} ok ({rate:.0f}%), "
                       f"{s['rejected']} rej, trend={s['trend']}{flag}")
@@ -1024,14 +1107,8 @@ def brain_stats() -> str:
 def query_decisions(area: str = "", agent: str = "", repo: str = "",
                     outcome: str = "", limit: int = 10) -> str:
     """
-    Query past decisions with optional filters.
-
-    Args:
-        area: Filter by domain area
-        agent: Filter by agent name
-        repo: Filter by repository name
-        outcome: Filter by outcome (pending, accepted, rejected, failed, revised)
-        limit: Max results (default 10)
+    Query past decisions, filtered by area/agent/repo/outcome
+    (pending|accepted|rejected|failed|revised). limit defaults to 10.
     """
     with LOCK:
         G = _load_graph()
@@ -1048,7 +1125,7 @@ def query_decisions(area: str = "", agent: str = "", repo: str = "",
         if outcome and data.get("outcome") != outcome:
             continue
         results.append(f"[{node_id}] {data.get('agent','?')} @ {data.get('repo','?')} | "
-                        f"area={data.get('area','?')} | {data.get('action','?')} "
+                        f"area={data.get('area','?')} | {str(data.get('action','?'))[:150]} "
                         f"-> {data.get('outcome','pending')}")
     if not results:
         return "No matching decisions."
@@ -1070,7 +1147,10 @@ def get_decision(decision_id: str) -> str:
     data = dict(G.nodes[decision_id])
     lines = [f"Decision: {decision_id}", ""]
     for k, v in sorted(data.items()):
-        lines.append(f"  {k}: {v}")
+        text = str(v)
+        if len(text) > 600:  # legacy uncapped nodes can hold 30KB+ per field
+            text = text[:600] + f"…[{len(text) - 600} more chars]"
+        lines.append(f"  {k}: {text}")
     feedback = []
     for pred in G.predecessors(decision_id):
         edge = G.edges[pred, decision_id]
@@ -1078,7 +1158,7 @@ def get_decision(decision_id: str) -> str:
             fb = G.nodes[pred]
             feedback.append((fb.get("timestamp", ""),
                              f"  [{fb.get('severity','info')}] {fb.get('agent','?')}: "
-                             f"{fb.get('feedback','')}"))
+                             f"{str(fb.get('feedback',''))[:300]}"))
     if feedback:
         feedback.sort(key=lambda x: x[0])
         recent = feedback[-10:]
@@ -1094,8 +1174,10 @@ def get_decision(decision_id: str) -> str:
             code_syms.append(sym_data.get("qualified_name", succ))
     if code_syms:
         lines.append("\nCode symbols:")
-        for sym in code_syms:
+        for sym in code_syms[:30]:
             lines.append(f"  - {sym}")
+        if len(code_syms) > 30:
+            lines.append(f"  ... and {len(code_syms) - 30} more")
     return "\n".join(lines)
 
 
@@ -1107,15 +1189,9 @@ def get_decision(decision_id: str) -> str:
 @mcp.tool()
 def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", message: str = "", repo: str = "") -> str:
     """
-    Report agent status for the live office dashboard. Call at task START and END.
-
-    Args:
-        agent: Your name (e.g. "arjun")
-        status: working | idle | planning | discussing | reviewing | blocked | waiting
-        task: What you're working on (label, max 100 chars)
-        talking_to: Agent you're interacting with
-        message: Chat message (speech bubble + chat log)
-        repo: Repo scope for role resolution and per-repo dashboard views
+    Report status to the office dashboard. Call at task START and END.
+    status: working | idle | planning | discussing | reviewing | blocked | waiting.
+    Optional: task label, talking_to agent, message (chat), repo scope.
     """
     with OFFICE_LOCK:
         state = _load_office_state()
@@ -1200,13 +1276,8 @@ def office_state(repo: str = "") -> str:
 @mcp.tool()
 def detect_stalls(stall_minutes: int = 5, limit: int = 10) -> str:
     """
-    Detect agents that appear stalled: have open decisions (outcome=pending)
-    but no heartbeat activity within stall_minutes. Returns a report for the
-    Project Manager to act on.
-
-    Args:
-        stall_minutes: Minutes of inactivity before an agent is considered stalled (default 5)
-        limit: Max stalled agents listed in detail (default 10)
+    Find agents with open (pending) decisions but no heartbeat within
+    stall_minutes (default 5). PM report. limit caps detail rows.
     """
     with OFFICE_LOCK:
         state = _load_office_state()
@@ -1284,14 +1355,16 @@ def detect_stalls(stall_minutes: int = 5, limit: int = 10) -> str:
 
     if no_heartbeat:
         lines.append(f"NO HEARTBEAT ({len(no_heartbeat)} agent(s) with open decisions but no activity):\n")
-        for agent, decisions in no_heartbeat:
+        for agent, decisions in no_heartbeat[:limit]:
             lines.append(f"  {agent} — never checked in, {len(decisions)} open decision(s)")
+        if len(no_heartbeat) > limit:
+            lines.append(f"  ... and {len(no_heartbeat) - limit} more")
         lines.append("")
 
     if active:
-        lines.append(f"ACTIVE ({len(active)}):")
-        for agent, status, detail in active:
-            lines.append(f"  {agent}: {status} ({detail})")
+        names = ", ".join(f"{a}({s})" for a, s, _ in active[:15])
+        extra = f" +{len(active) - 15} more" if len(active) > 15 else ""
+        lines.append(f"ACTIVE ({len(active)}): {names}{extra}")
 
     return "\n".join(lines)
 
@@ -1399,6 +1472,17 @@ def _format_savings_report(session: dict, events: list[dict], today_str: str) ->
 
 _SAN_SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
 
+# One extension list for ALL SAN code paths (index build, freshness, orphan
+# cleanup). Divergent lists previously made non-JVM repos report wrong
+# stale/missing counts and risked deleting valid SAN files as "orphans".
+SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
+               ".swift", ".go", ".rs")
+
+# Freshness sweeps stat every indexed file + rglob the .san tree — too heavy
+# to repeat per get_san/query_san call. Debounce per repo.
+_SAN_FRESH_TTL_S = 60
+_SAN_FRESH_CHECKED: dict[str, float] = {}
+
 
 def _is_skipped_source(rel: str) -> bool:
     """True for build outputs / vendored dirs that should never get SAN files."""
@@ -1482,7 +1566,7 @@ def _refresh_san(repo_path: Path, san_dir: Path, stale_files: list[str],
         source_path = repo_path / source_rel
         if not source_path.exists():
             continue
-        if source_path.suffix not in (".kt", ".java"):
+        if source_path.suffix not in SOURCE_EXTS:
             continue
 
         try:
@@ -1513,12 +1597,21 @@ def _refresh_san(repo_path: Path, san_dir: Path, stale_files: list[str],
     return stats
 
 
-def _ensure_san_fresh(repo: str) -> Optional[str]:
+def _ensure_san_fresh(repo: str, force: bool = False) -> Optional[str]:
     """
     Check SAN freshness: detect stale/orphaned SANs, clean up orphans.
     Does NOT generate SAN content — only reports staleness and cleans up.
     Called internally by query_san and get_san before serving results.
+    Debounced per repo (_SAN_FRESH_TTL_S) — the sweep stats every indexed
+    file, far too heavy to repeat on burst reads. force=True skips the TTL.
     """
+    now = time.monotonic()
+    if not force:
+        last = _SAN_FRESH_CHECKED.get(repo)
+        if last is not None and (now - last) < _SAN_FRESH_TTL_S:
+            return None
+    _SAN_FRESH_CHECKED[repo] = now
+
     repo_path = _resolve_repo_path(repo)
     if not repo_path:
         return None
@@ -1558,7 +1651,7 @@ def _ensure_san_fresh(repo: str) -> Optional[str]:
             for san_file in san_dir.rglob("*.san"):
                 rel = str(san_file.relative_to(san_dir))
                 source_rel = str(Path(rel).with_suffix(""))
-                for ext in (".kt", ".java"):
+                for ext in SOURCE_EXTS:
                     candidate = repo_path / (source_rel + ext) if not source_rel.endswith(ext) else repo_path / source_rel
                     if candidate.exists():
                         break
@@ -1571,7 +1664,7 @@ def _ensure_san_fresh(repo: str) -> Optional[str]:
             pass
     else:
         # No index — scan source tree to detect stale SANs
-        for ext in ("**/*.kt", "**/*.java"):
+        for ext in ("**/*" + e for e in SOURCE_EXTS):
             for source_path in repo_path.glob(ext):
                 rel = str(source_path.relative_to(repo_path))
                 if _is_skipped_source(rel):
@@ -1645,22 +1738,15 @@ def _rebuild_san_index(san_dir: Path, repo_path: Optional[Path] = None):
             except OSError:
                 continue
 
-            source_rel = str(Path(rel).with_suffix(""))
-            # Determine source extension — check disk if repo_path available
-            for ext in (".kt", ".java"):
-                if source_rel.endswith(ext):
-                    break
-            else:
-                resolved = False
-                if repo_path:
-                    for ext in (".kt", ".java"):
-                        if (repo_path / (source_rel + ext)).exists():
-                            source_rel = source_rel + ext
-                            resolved = True
-                            break
-                if not resolved:
-                    # Fallback: default to .kt
-                    source_rel = source_rel + ".kt" if not source_rel.endswith(".kt") else source_rel
+            # Canonical name form is <source>.san, so stripping .san usually
+            # leaves the real source path. Legacy replace-form names need the
+            # extension resolved from disk; never fabricate one.
+            source_rel = rel[:-4] if rel.endswith(".san") else rel
+            if not source_rel.endswith(SOURCE_EXTS) and repo_path:
+                for ext in SOURCE_EXTS:
+                    if (repo_path / (source_rel + ext)).exists():
+                        source_rel = source_rel + ext
+                        break
 
             # Extract qualified names from SAN content
             for match in re.finditer(r'^([\w.]+)\s+@(\w+)\s*\{', content, re.MULTILINE):
@@ -1710,10 +1796,20 @@ def _load_san_index(san_dir: Path) -> dict:
 
 
 def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
-    """Convert a source file relative path to its .san counterpart."""
-    # src/main/kotlin/com/example/Auth.kt → src/main/kotlin/com/example/Auth.san
-    p = Path(source_rel)
-    return san_dir / p.with_suffix(".san")
+    """
+    Convert a source file relative path to its .san counterpart.
+    Canonical convention (per san/brain-compiler.md): APPEND .san —
+    src/.../Auth.kt → src/.../Auth.kt.san. Legacy files used
+    extension-replacement (Auth.san); prefer whichever exists on disk,
+    defaulting to the canonical append form for new files.
+    """
+    appended = san_dir / (source_rel + ".san")
+    if appended.exists():
+        return appended
+    legacy = san_dir / Path(source_rel).with_suffix(".san")
+    if legacy.exists():
+        return legacy
+    return appended
 
 
 def check_san_freshness(repo: str) -> str:
@@ -1726,7 +1822,7 @@ def check_san_freshness(repo: str) -> str:
         return f"ERROR: repo '{repo}' not found in config"
 
     # Clean up orphans and detect staleness
-    result = _ensure_san_fresh(repo)
+    result = _ensure_san_fresh(repo, force=True)
 
     # Now report current state
     san_dir = repo_path / ".san"
@@ -1769,13 +1865,8 @@ def check_san_freshness(repo: str) -> str:
 @mcp.tool()
 def recompile_san(repo: str, dry_run: bool = False) -> str:
     """
-    Refresh SAN metadata: rebuild index, clean up orphans, update content hashes.
-    Does NOT generate SAN content — use brain-compiler for that.
-    Set dry_run=True for a freshness report only (no rebuild).
-
-    Args:
-        repo: Repository name from config.json
-        dry_run: Report stale/missing SANs without modifying anything
+    Refresh SAN metadata: rebuild index, clean orphans, update hashes.
+    Does NOT generate content (use brain-compiler). dry_run=True = report only.
     """
     if dry_run:
         return check_san_freshness(repo)
@@ -1814,7 +1905,7 @@ def recompile_san(repo: str, dry_run: bool = False) -> str:
             rel = str(san_file.relative_to(san_dir))
             source_rel = str(Path(rel).with_suffix(""))
             source_exists = False
-            for ext in (".kt", ".java"):
+            for ext in SOURCE_EXTS:
                 candidate = repo_path / (source_rel + ext) if not source_rel.endswith(ext) else repo_path / source_rel
                 if candidate.exists():
                     source_exists = True
@@ -1833,7 +1924,7 @@ def recompile_san(repo: str, dry_run: bool = False) -> str:
     # 2. Check hashes for all source files with existing SANs
     #    Only update hash if SAN mtime >= source mtime (SAN is fresh).
     #    If SAN is stale, do NOT update hash — it would hide staleness.
-    for ext in ("**/*.kt", "**/*.java"):
+    for ext in ("**/*" + e for e in SOURCE_EXTS):
         for source_path in repo_path.glob(ext):
             rel = str(source_path.relative_to(repo_path))
             if _is_skipped_source(rel):
@@ -1911,24 +2002,29 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
     # Phase 1: Search index (qualified names + metadata)
     for qname, meta in index.items():
         if keyword_lower in qname.lower():
-            san_path = _source_to_san_path(san_dir, meta.get("file", ""))
-            content = ""
-            if san_path.exists():
-                try:
-                    content = san_path.read_text()[:500]
-                except OSError:
-                    content = "(read error)"
             results.append({
                 "qualified_name": qname,
                 "kind": meta.get("kind", "?"),
                 "file": meta.get("file", "?"),
                 "match_type": "index",
-                "preview": content,
+                "preview": "",
             })
+            if len(results) >= max_results:
+                break
+    # Read previews only for results that will be shown
+    for r in results[:max_results]:
+        san_path = _source_to_san_path(san_dir, r["file"])
+        if san_path.exists():
+            try:
+                r["preview"] = san_path.read_text()[:500]
+            except OSError:
+                r["preview"] = "(read error)"
 
     # Phase 2: Search .san file contents (if not enough index hits)
     if len(results) < max_results:
-        seen_files = {r["file"] for r in results}
+        # Compare in .san-path units; r["file"] is the SOURCE path
+        seen_files = {str(_source_to_san_path(san_dir, r["file"]).relative_to(san_dir))
+                      for r in results}
         try:
             for san_file in san_dir.rglob("*.san"):
                 rel = str(san_file.relative_to(san_dir))
@@ -1938,11 +2034,12 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
                     content = san_file.read_text()
                 except OSError:
                     continue
-                if keyword_lower in content.lower():
-                    # Find the matching line for context
+                content_lower = content.lower()
+                if keyword_lower in content_lower:
+                    # Find the matching line for context (single lowercase pass)
                     context_lines = []
-                    for line in content.split("\n"):
-                        if keyword_lower in line.lower():
+                    for line, line_lower in zip(content.split("\n"), content_lower.split("\n")):
+                        if keyword_lower in line_lower:
                             context_lines.append(line.strip())
                     results.append({
                         "qualified_name": rel.replace(".san", ""),
@@ -2096,7 +2193,7 @@ def update_san_index(repo: str) -> str:
             rel = str(san_file.relative_to(san_dir))
             source_rel = str(Path(rel).with_suffix(""))  # Remove .san
             # Try to detect suffix from source tree
-            for ext in [".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx", ".swift", ".go", ".rs"]:
+            for ext in SOURCE_EXTS:
                 candidate = repo_path / (source_rel + ext)
                 if candidate.exists():
                     source_rel = source_rel + ext
@@ -2218,7 +2315,15 @@ def validate_san_system() -> str:
 
         # --- Test 6: _source_to_san_path correct mapping ---
         sp = _source_to_san_path(san_dir, "src/A.kt")
-        _test("source_to_san_path maps .kt → .san", sp == san_dir / "src" / "A.san")
+        _test("source_to_san_path canonical append form",
+              sp == san_dir / "src" / "A.kt.san")
+        legacy_dir = san_dir / "src"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        legacy_f = legacy_dir / "L.san"
+        legacy_f.write_text("legacy")
+        _test("source_to_san_path honors existing legacy file",
+              _source_to_san_path(san_dir, "src/L.kt") == legacy_f)
+        legacy_f.unlink()
 
         # --- Setup: create a proper SAN file for remaining tests ---
         source_a = src_dir / "A.kt"

@@ -529,7 +529,7 @@ SAN (Structured Associative Notation) compresses source code to ~10-15% of its o
 | `query_san("repo", "keyword")` | Search SAN index + file contents by keyword |
 | `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file (`max_chars` caps output) |
 | `python3 brain/server.py san-index <repo>` | (CLI) Rebuild `_index.json` from all `.san` files |
-| `python3 brain/server.py validate-san` | (CLI) 23 self-tests: hashing, orphan cleanup, staleness, index building. Isolated temp dir. |
+| `python3 brain/server.py validate-san` | (CLI) 24 self-tests: hashing, orphan cleanup, staleness, index building. Isolated temp dir. |
 
 ### How SAN Generation Works
 
@@ -657,7 +657,7 @@ This tests every subsystem in isolation using a temp directory:
 | Code Bridge | 4 | Symbol linking, callers, impact radius |
 | Office State | 11 | Heartbeat, role resolution, messages, auto-heartbeat |
 | Config & Edge Cases | 3 | Missing/corrupt config and graph files |
-| SAN System | 1 | Delegates to the 23-check `validate-san` suite (hashing, orphans, staleness, indexing) |
+| SAN System | 1 | Delegates to the 24-check `validate-san` suite (hashing, orphans, staleness, indexing) |
 | Integration Workflow | 10 | Full end-to-end: pre_check → decide → reject → feedback → re-check |
 
 You can also run just the SAN subsystem: `python3 brain/server.py validate-san`
