@@ -372,8 +372,10 @@ def _get_callers_of(repo: str, qualified_name: str,
 
 def _tokenize(text: str) -> set[str]:
     """Extract meaningful tokens from text, lowercased."""
-    text = text.lower()
+    # Split camelCase BEFORE lowercasing — once lowered there are no
+    # uppercase letters left for the regex to match.
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = text.lower()
     text = text.replace("_", " ").replace("-", " ")
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     tokens = set(text.split())
@@ -2655,10 +2657,13 @@ def validate_brain() -> str:
         # ===================================================================
         results.append("\n--- Similarity Matching ---")
 
-        # Test 14: Tokenizer
+        # Test 14: Tokenizer (camelCase split before lowercasing)
         tokens = _tokenize("AuthService rate limiting middleware")
+        _test("tokenizer splits camelCase",
+              "auth" in tokens and "service" in tokens and "authservice" not in tokens,
+              f"got {tokens}")
         _test("tokenizer extracts meaningful terms",
-              "authservice" in tokens and "rate" in tokens and "limiting" in tokens)
+              "rate" in tokens and "limiting" in tokens)
 
         # Test 15: stopwords removed
         tokens = _tokenize("the is and or but for")
