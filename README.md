@@ -9,7 +9,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [What This Does](#what-this-does) · [Features](#features)
 - [Quick Start](#quick-start) — install in 2 minutes
 - [How To Use It](#how-to-use-it) — the agent loop, a worked example, what you get
-- [Architecture](#architecture) — what lives where
+- [Architecture](#architecture) — what lives where, [performance & internals](#performance--internals)
 - [MCP Tools (17)](#mcp-tools-17) — the agent-facing API
 - [Agent Team](#agent-team) — bundled role templates
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
@@ -147,7 +147,7 @@ No human re-explained the Redis constraint. The brain carried it forward.
 | When an agent calls… | What happens | What you see |
 |----------------------|--------------|--------------|
 | `pre_check` | Searches past decisions in the same area + fuzzy-matches similar actions across all areas | Agent mentions relevant past rejections before coding |
-| `log_decision` | Writes the decision to `decisions.json` + drops a marker file | Code edits are now unblocked for ~30 min |
+| `log_decision` | Appends the decision to the journal + drops a marker file | Code edits are now unblocked for ~30 min |
 | Edit/Write **without** a recent `log_decision` | PreToolUse hook blocks the edit (exit 2) | Agent is forced to log a decision first, then retries |
 | `log_outcome` (rejected) | Records the rejection; raises that agent's rejection rate | Future `pre_check`s surface it; repeat offenders get stricter warnings |
 | Any tool with a `repo`/status | Updates the live office dashboard | Agent appears working/reviewing/blocked at `localhost:3333` |
@@ -184,7 +184,8 @@ From any agent/MCP client you can also ask in plain language — *"show me the t
 │  ~/.agent-brain/                                │
 │  ├── server.py        ← MCP server (17 tools)  │
 │  ├── config.json      ← your repos + team      │
-│  └── decisions.json   ← persistent memory       │
+│  ├── decisions.json   ← memory snapshot         │
+│  └── decisions.journal← append-only deltas      │
 │                                                 │
 │  ~/.claude/agents/                              │
 │  ├── project-manager.md                         │
@@ -203,6 +204,20 @@ From any agent/MCP client you can also ask in plain language — *"show me the t
 │  └── static/          (HTML5 Canvas + SSE)      │
 └─────────────────────────────────────────────────┘
 ```
+
+### Performance & internals
+
+The brain is built to stay fast as the decision history grows into thousands of entries:
+
+| Concern | How it's handled |
+|---------|------------------|
+| **Reading the graph** | `decisions.json` is parsed once and held in an in-memory cache keyed on file mtime+size — repeat tool calls in a session reuse it (~0.03ms vs ~140ms re-parse). The cache self-invalidates if another session writes the file. |
+| **Writing a decision** | Writes are **O(delta), not O(graph)**. `decisions.json` is a periodic full snapshot; `decisions.journal` is an append-only log of mutations. Logging an outcome on a ~4MB brain appends ~800 bytes instead of rewriting 4MB. The journal auto-compacts back into the snapshot once it passes 256KB. |
+| **SAN freshness** | The freshness sweep (stat every indexed file + scan the `.san/` tree) is debounced to once per 60s per repo, so bursts of `get_san`/`query_san` calls don't each pay for it. |
+| **Bounded responses** | Every list/detail tool caps its output (row limits, per-field truncation) so one giant decision can't blow up a response. Stored text fields are capped at write time too. |
+| **Multi-session safety** | Each Claude Code session runs its own server process sharing `~/.agent-brain/`. Writes use `os.replace` with pid-unique temp files to avoid cross-process rename collisions. |
+
+> **Files in `~/.agent-brain/`:** `decisions.json` (snapshot) + `decisions.journal` (deltas) are the decision memory — both are needed; don't delete one without the other. `office-state.json` is live dashboard state (self-pruning), `san_savings.jsonl` is the token-savings log. All are per-machine and git-ignored.
 
 ## MCP Tools (17)
 
@@ -254,7 +269,7 @@ From any agent/MCP client you can also ask in plain language — *"show me the t
 ### Admin (CLI only — not exposed via MCP)
 Run from the repo root. These live on the CLI (not MCP) to keep the agent-facing tool surface lean:
 ```bash
-python3 brain/server.py validate        # full brain self-tests (80 checks)
+python3 brain/server.py validate        # full brain self-tests (81 checks)
 python3 brain/server.py validate-san    # SAN subsystem self-tests
 python3 brain/server.py san-index <repo> # rebuild _index.json from .san/
 python3 brain/server.py stats           # overall brain health
@@ -640,7 +655,7 @@ After setup, run the full validation from the repo root:
 
 ```bash
 python3 brain/server.py validate
-# Expected: "Agent Brain Validation: 80 passed, 0 failed ✓ ALL TESTS PASSED"
+# Expected: "Agent Brain Validation: 81 passed, 0 failed ✓ ALL TESTS PASSED"
 ```
 
 This tests every subsystem in isolation using a temp directory:
@@ -650,7 +665,7 @@ This tests every subsystem in isolation using a temp directory:
 | Graph Persistence | 4 | Save/load, atomic writes, empty state |
 | Decision Memory | 16 | log_decision, log_outcome, log_feedback, error handling |
 | Pre-check & Warnings | 7 | Exact matches, similar rejections, adaptive warning levels |
-| Similarity Matching | 6 | Tokenizer, Jaccard + domain boost, false positive rejection |
+| Similarity Matching | 7 | Tokenizer (camelCase split), Jaccard + domain boost, false positives |
 | Pattern Clustering | 1 | DIP-related rejections cluster together |
 | Scorecards & Dashboard | 11 | Acceptance rates, trends, team_dashboard rendering |
 | Query & Retrieval | 6 | Filters, missing ID handling, file-based search |
