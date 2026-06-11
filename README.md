@@ -86,6 +86,85 @@ Brain tools work in BOTH the main Claude Code session AND spawned subagents only
 
 After any config change, restart Claude Code (`/exit` then `claude`) — MCP and agent definitions are loaded at session start. Then run `server.py diagnose --project=<path>` to confirm all four layers are wired up.
 
+## How To Use It
+
+Once set up, **you don't call brain tools yourself** — your agents do, automatically, as part of their normal work. Your job is just to give agents tasks and (optionally) review the memory that builds up.
+
+### The loop every agent runs
+
+For any non-trivial task, an agent follows this cycle (enforced by the hook — see [Enforcement Hook](#enforcement-hook)):
+
+```
+1. pre_check(agent, area, action)     ← "has anyone tried this before? did it fail?"
+2. log_decision(agent, repo, area,    ← records the plan; unlocks code edits
+                action, reasoning)
+3. … writes the code …
+4. log_outcome(decision_id, outcome,  ← records accepted / rejected / failed + why
+               outcome_by, reason)
+```
+
+You just say *"add rate limiting to the signup endpoint"*. The agent does the rest.
+
+### Worked example — across two sessions
+
+**Monday — a decision gets rejected:**
+
+```
+You:   "Add rate limiting to /login"
+Agent: pre_check(agent="karan", area="auth", action="rate limit login")
+       → "No past failures in 'auth'. Proceed."
+Agent: log_decision(... action="in-memory counter per IP", reasoning="simplest")
+       → dec_20260609_..._a1b2c3
+Agent: …writes code, opens PR…
+PE:    log_outcome(dec_..._a1b2c3, outcome="rejected", outcome_by="marcus",
+                   reason="in-memory won't survive multi-instance deploy; use Redis")
+```
+
+**Friday — a different agent, a related task, a different machine/session:**
+
+```
+You:   "Add rate limiting to the signup endpoint"
+Agent: pre_check(agent="dev", area="auth", action="rate limit signup")
+       → "SIMILAR REJECTIONS (1, 78% match):
+          [2026-06-09] karan tried: in-memory counter per IP
+          REJECTED by marcus: in-memory won't survive multi-instance deploy; use Redis"
+Agent: …goes straight to a Redis-backed limiter, skips the mistake…
+```
+
+No human re-explained the Redis constraint. The brain carried it forward.
+
+### How it behaves
+
+| When an agent calls… | What happens | What you see |
+|----------------------|--------------|--------------|
+| `pre_check` | Searches past decisions in the same area + fuzzy-matches similar actions across all areas | Agent mentions relevant past rejections before coding |
+| `log_decision` | Writes the decision to `decisions.json` + drops a marker file | Code edits are now unblocked for ~30 min |
+| Edit/Write **without** a recent `log_decision` | PreToolUse hook blocks the edit (exit 2) | Agent is forced to log a decision first, then retries |
+| `log_outcome` (rejected) | Records the rejection; raises that agent's rejection rate | Future `pre_check`s surface it; repeat offenders get stricter warnings |
+| Any tool with a `repo`/status | Updates the live office dashboard | Agent appears working/reviewing/blocked at `localhost:3333` |
+
+### What you get out of it (outcomes)
+
+| Outcome | How it helps |
+|---------|--------------|
+| **Mistakes aren't repeated** | A rejection logged once warns every agent, every future session — even on a different machine. |
+| **No re-explaining context** | Constraints ("use Redis", "don't bypass the auth middleware") live in the brain, not in your head. |
+| **Cross-agent learning** | What backend-engineer learns, frontend-engineer and QA see. Knowledge is team-wide, not per-agent. |
+| **Accountability & trends** | Scorecards show each agent's acceptance rate and recurring failure patterns — `agent_scorecard("karan", detail=True)`. |
+| **Auditable history** | "Why did we build it this way?" → `decisions_for("AuthService.login")` returns every decision that touched it, with reasoning and outcome. |
+| **Enforced discipline** | The hook means the memory actually gets populated — agents can't silently skip logging and edit code anyway. |
+
+### Inspecting the memory yourself
+
+You rarely need to, but from the brain directory:
+
+```bash
+python3 brain/server.py stats        # overall health: how many decisions/agents/repos
+python3 brain/server.py office       # who's working on what right now
+```
+
+From any agent/MCP client you can also ask in plain language — *"show me the team dashboard"*, *"what decisions touched the payment service?"*, *"what's karan's scorecard?"* — and the agent picks the right tool (`team_dashboard`, `decisions_for`, `agent_scorecard`).
+
 ## Architecture
 
 ```
@@ -93,7 +172,7 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 │  Your Machine (global)                          │
 │                                                 │
 │  ~/.agent-brain/                                │
-│  ├── server.py        ← MCP server (25 tools)  │
+│  ├── server.py        ← MCP server (16 tools)  │
 │  ├── config.json      ← your repos + team      │
 │  └── decisions.json   ← persistent memory       │
 │                                                 │
@@ -115,7 +194,7 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 └─────────────────────────────────────────────────┘
 ```
 
-## MCP Tools (25)
+## MCP Tools (16)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -130,45 +209,46 @@ After any config change, restart Claude Code (`/exit` then `claude`) — MCP and
 |------|---------|
 | `query_decisions` | Filter decisions by area/agent/repo/outcome |
 | `get_decision` | Full detail + feedback for one decision |
-| `brain_stats` | Overall brain health |
 
 ### Code Bridge
 | Tool | Purpose |
 |------|---------|
-| `decisions_for_code` | All decisions that touched a code symbol |
-| `decisions_for_file` | All decisions that touched a file |
+| `decisions_for` | Decisions touching a code symbol or file (auto-detected) |
 | `code_impact` | Blast radius: code symbols + callers |
 
 ### Patterns
 | Tool | Purpose |
 |------|---------|
-| `similar_failures` | Fuzzy cross-area search for similar rejections |
-| `get_patterns` | Cluster similar rejection reasons |
+| `get_patterns` | Cluster recurring rejections; pass `action` to find similar past failures |
 
 ### Scorecards
 | Tool | Purpose |
 |------|---------|
-| `get_agent_stats` | Quick stats for one or all agents |
-| `agent_scorecard` | Detailed breakdown with trends and advice |
-| `team_dashboard` | All agents at a glance |
+| `agent_scorecard` | Stats for one/all agents; `detail=True` for trends + advice |
+| `team_dashboard` | All agents at a glance (`limit` caps rows) |
 
 ### Office Dashboard
 | Tool | Purpose |
 |------|---------|
 | `heartbeat` | Report agent status (working/idle/discussing/blocked) for live dashboard |
-| `office_state` | Get current office state (debugging) |
 | `detect_stalls` | Find agents with open decisions but no activity for N minutes (default 5) |
 
 ### SAN (Structured Associative Notation)
 | Tool | Purpose |
 |------|---------|
-| `check_san_freshness` | Check which SAN files are stale vs source |
-| `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. Does NOT generate content. |
+| `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. `dry_run=True` for a freshness report only. Does NOT generate content. |
 | `query_san` | Search SAN files by keyword (index + content) |
-| `get_san` | Get SAN-compressed content for a source file |
-| `update_san_index` | Rebuild `_index.json` from .san/ directory |
-| `validate_san_system` | Run self-tests on hash/orphan/staleness system. Safe — uses temp directory. |
-| `validate_brain` | Run comprehensive self-tests on the entire brain (79 tests). Safe — uses temp directory. |
+| `get_san` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+
+### Admin (CLI only — not exposed via MCP)
+Run from the brain directory to keep the agent-facing tool surface lean:
+```bash
+python3 brain/server.py validate        # full brain self-tests (79 checks)
+python3 brain/server.py validate-san    # SAN subsystem self-tests
+python3 brain/server.py san-index <repo> # rebuild _index.json from .san/
+python3 brain/server.py stats           # overall brain health
+python3 brain/server.py office [repo]    # current office state (debug)
+```
 
 ## Agent Team
 
@@ -387,10 +467,10 @@ heartbeat(agent="arjun", status="discussing", talking_to="marcus", message="DIP 
 
 ## Verification
 
-After setup, restart Claude Code and run the full validation:
+After setup, run the full validation from the brain directory:
 
-```
-# From any MCP client — call validate_brain()
+```bash
+python3 brain/server.py validate
 # Expected: "Agent Brain Validation: 79 passed, 0 failed ✓ ALL TESTS PASSED"
 ```
 
@@ -411,9 +491,9 @@ This tests every subsystem in isolation using a temp directory:
 | SAN System | 23 | Hashing, orphan cleanup, staleness, index building |
 | Integration Workflow | 9 | Full end-to-end: pre_check → decide → reject → feedback → re-check |
 
-You can also run just the SAN subsystem: `validate_san_system()`
+You can also run just the SAN subsystem: `python3 brain/server.py validate-san`
 
-Or verify basic connectivity with `brain_stats()`:
+Or verify basic connectivity with `python3 brain/server.py stats`:
 
 ```
 Brain Stats:
@@ -428,7 +508,7 @@ Brain Stats:
 
 | Problem | Fix |
 |---------|-----|
-| `brain_stats` not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
+| brain tools not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
 | MCP connection error | Check venv: `~/.agent-brain/.venv/bin/python -c "import mcp, networkx"` |
 | No tools registered | Verify: `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py` shouldn't error |
 | `config.json` not found | Server works without it (empty brain). Create one if you want repo integration. |
@@ -478,27 +558,27 @@ SAN (Structured Associative Notation) compresses source code by ~85% for LLM con
    The compiler writes `your-repo/.san/src/services/AuthService.san`.
 
 3. **Build the index:**
-   ```
-   # Call update_san_index("my-backend") via any agent
+   ```bash
+   python3 brain/server.py san-index my-backend   # admin CLI; recompile_san also rebuilds it
    ```
 
 4. **Query SAN:**
    ```
    query_san("my-backend", "Auth")      # search by keyword
    get_san("my-backend", "src/services/AuthService.kt")  # get specific file
-   check_san_freshness("my-backend")    # find stale files
+   recompile_san("my-backend", dry_run=True)    # find stale files
    ```
 
 ### SAN Commands
 
 | Command | What it does |
 |---------|-------------|
-| `check_san_freshness("repo")` | Reports which SANs are stale, missing, or orphaned vs source |
+| `recompile_san("repo", dry_run=True)` | Report which SANs are stale, missing, or orphaned vs source (no changes) |
 | `recompile_san("repo")` | Refresh metadata: rebuild index, clean orphans, update hashes. Does NOT generate SAN content. |
 | `query_san("repo", "keyword")` | Search SAN index + file contents by keyword |
-| `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file |
-| `update_san_index("repo")` | Rebuild `_index.json` from all `.san` files |
-| `validate_san_system()` | Run 23 self-tests: hashing, orphan cleanup, staleness detection, index building. Uses isolated temp dir. |
+| `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+| `python3 brain/server.py san-index <repo>` | (CLI) Rebuild `_index.json` from all `.san` files |
+| `python3 brain/server.py validate-san` | (CLI) 23 self-tests: hashing, orphan cleanup, staleness, index building. Isolated temp dir. |
 
 ### How SAN Generation Works
 
@@ -507,7 +587,7 @@ SAN files are **only generated by the brain-compiler agent** (LLM-powered). The 
 **Workflow:**
 1. Brain-compiler generates rich SAN files (dependencies, patterns, execution flow)
 2. Server tracks source hashes to detect when SANs become stale
-3. `check_san_freshness` / `query_san` / `get_san` report stale SANs
+3. `recompile_san(dry_run=True)` / `query_san` / `get_san` report stale SANs
 4. You re-run brain-compiler on stale files to regenerate
 
 ### Content Hashing
@@ -528,7 +608,7 @@ When a source file is deleted, its SAN file becomes an orphan. Orphans are detec
 - `.san` files with no matching source (even if not in hash tracker) are also cleaned up
 - Stats report `orphans_removed` so you can see what was cleaned up
 
-> **Important: SAN refresh is NOT automatic.** Staleness checks run when you call `query_san`, `get_san`, or `check_san_freshness` — they report stale SANs but do NOT regenerate them. To force a full metadata refresh (e.g., after a large merge or branch switch), call `recompile_san("repo")`. To regenerate stale SAN content, run the brain-compiler agent on the reported files.
+> **Important: SAN refresh is NOT automatic.** Staleness checks run when you call `query_san`, `get_san`, or `recompile_san(dry_run=True)` — they report stale SANs but do NOT regenerate them. To force a full metadata refresh (e.g., after a large merge or branch switch), call `recompile_san("repo")`. To regenerate stale SAN content, run the brain-compiler agent on the reported files.
 
 > **Commit `.san/` to git.** SAN files are prebuilt knowledge — they help any developer (or agent) working on the project. Don't `.gitignore` them. Add `.san/.san_hashes.json` to `.gitignore` — it's a local cache.
 
@@ -592,7 +672,7 @@ A flat `team` list applies to every repo — fine when one team owns everything.
 
 **Backwards compatible**: configs without `teams_per_repo` and no `repos` field on entries behave exactly like before.
 
-**How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, `office_state`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. `office_state(repo="my-backend")` shows only that repo's agents.
+**How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. The `office` CLI command (`python3 brain/server.py office my-backend`) shows only that repo's agents.
 
 ## Customization
 

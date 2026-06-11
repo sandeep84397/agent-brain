@@ -38,8 +38,9 @@ import threading
 BRAIN_DIR = Path(os.environ.get("AGENT_BRAIN_DIR", str(Path.home() / ".agent-brain")))
 GRAPH_FILE = BRAIN_DIR / "decisions.json"
 CONFIG_FILE = BRAIN_DIR / "config.json"
-LOCK = threading.Lock()
-OFFICE_LOCK = threading.Lock()
+# Reentrant: validate_brain holds these while calling tools that re-acquire them.
+LOCK = threading.RLock()
+OFFICE_LOCK = threading.RLock()
 OFFICE_STATE_FILE = BRAIN_DIR / "office-state.json"
 
 
@@ -578,16 +579,16 @@ def log_decision(
     code_symbols: Optional[list[str]] = None,
 ) -> str:
     """
-    Log a decision an agent is making. Call AFTER pre_check, BEFORE doing work.
+    Log a decision. Call AFTER pre_check, BEFORE doing work. Required before code edits.
 
     Args:
-        agent: Name of the agent (e.g. "arjun")
-        repo: Repository name (e.g. "my-backend")
+        agent: Agent name (e.g. "arjun")
+        repo: Repository name
         area: Domain area (e.g. "auth", "feed", "schema")
         action: What you decided to do
         reasoning: Why you chose this approach
-        files_touched: List of file paths being modified (optional)
-        code_symbols: List of qualified_names from code-review-graph (optional)
+        files_touched: File paths being modified (optional)
+        code_symbols: qualified_names from code-review-graph (optional)
     """
     with LOCK:
         G = _load_graph()
@@ -674,15 +675,28 @@ def log_feedback(agent: str, decision_id: str, feedback: str, severity: str = "i
 
 
 @mcp.tool()
-def decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") -> str:
+def decisions_for(target: str, repo: str = "", outcome: str = "") -> str:
     """
-    Find all decisions that touched a specific code symbol.
+    Find decisions touching a code symbol or file. Auto-detects which:
+    targets with "/" or a file extension are treated as file paths,
+    otherwise as code-review-graph qualified_names.
 
     Args:
-        qualified_name: The code-review-graph qualified_name
+        target: A qualified_name (e.g. "com.x.Auth.login") or file path
         repo: Filter by repo (optional)
-        outcome: Filter by outcome (optional)
+        outcome: Filter by outcome (optional, code symbols only)
     """
+    _SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
+                    ".swift", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
+                    ".php", ".scala", ".m", ".mm")
+    looks_like_file = "/" in target or target.lower().endswith(_SOURCE_EXTS)
+    if looks_like_file:
+        return _decisions_for_file(target, repo)
+    return _decisions_for_code(target, repo, outcome)
+
+
+def _decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") -> str:
+    """Find all decisions that touched a specific code symbol."""
     with LOCK:
         G = _load_graph()
     sym_node = f"code:{qualified_name}"
@@ -720,15 +734,8 @@ def decisions_for_code(qualified_name: str, repo: str = "", outcome: str = "") -
     return f"{len(results)} decision(s) touching '{qualified_name}':\n\n" + "\n".join(results)
 
 
-@mcp.tool()
-def decisions_for_file(file_path: str, repo: str = "") -> str:
-    """
-    Find all decisions that touched a specific file.
-
-    Args:
-        file_path: File path (relative or absolute)
-        repo: Filter by repo (optional)
-    """
+def _decisions_for_file(file_path: str, repo: str = "") -> str:
+    """Find all decisions that touched a specific file."""
     with LOCK:
         G = _load_graph()
     rel_path = file_path
@@ -798,16 +805,8 @@ def code_impact(decision_id: str) -> str:
 # ===========================================================================
 
 
-@mcp.tool()
 def similar_failures(action_description: str, area: str = "", threshold: float = 0.15) -> str:
-    """
-    Find past rejections/failures similar to a proposed action.
-
-    Args:
-        action_description: What you plan to do
-        area: Optionally restrict to an area
-        threshold: Similarity threshold 0.0-1.0 (default 0.15)
-    """
+    """Find past rejections/failures similar to a proposed action (internal helper)."""
     with LOCK:
         G = _load_graph()
     similar = _find_similar_rejections(G, action_description, area, threshold)
@@ -824,14 +823,18 @@ def similar_failures(action_description: str, area: str = "", threshold: float =
 
 
 @mcp.tool()
-def get_patterns(area: str = "", min_count: int = 1) -> str:
+def get_patterns(area: str = "", min_count: int = 1, action: str = "") -> str:
     """
-    Find recurring failure patterns using fuzzy clustering.
+    Analyze past rejections. With `action` set, returns failures similar to that
+    proposed action; otherwise clusters recurring failure patterns.
 
     Args:
         area: Optionally filter to a specific area
         min_count: Minimum cluster size (default 1)
+        action: If set, find rejections similar to this proposed action
     """
+    if action:
+        return similar_failures(action, area)
     with LOCK:
         G = _load_graph()
     clusters = _cluster_rejection_reasons(G, area)
@@ -863,14 +866,8 @@ def get_patterns(area: str = "", min_count: int = 1) -> str:
 # ===========================================================================
 
 
-@mcp.tool()
 def get_agent_stats(agent: str = "") -> str:
-    """
-    Get decision statistics for an agent or all agents.
-
-    Args:
-        agent: Agent name (leave empty for all)
-    """
+    """Compact decision stats for an agent or all agents (internal helper)."""
     with LOCK:
         G = _load_graph()
     stats: dict[str, dict] = {}
@@ -898,13 +895,19 @@ def get_agent_stats(agent: str = "") -> str:
 
 
 @mcp.tool()
-def agent_scorecard(agent: str) -> str:
+def agent_scorecard(agent: str = "", detail: bool = False) -> str:
     """
-    Detailed scorecard: acceptance rate, trends, top rejections, area breakdown.
+    Agent performance stats. Compact one-line summary by default;
+    set detail=True for trends, top rejections, and area breakdown.
 
     Args:
-        agent: Agent name (e.g. "arjun")
+        agent: Agent name (leave empty for all agents — compact mode only)
+        detail: True for the full single-agent scorecard (requires agent)
     """
+    if not detail:
+        return get_agent_stats(agent)
+    if not agent:
+        return "ERROR: detail=True requires an agent name."
     with LOCK:
         G = _load_graph()
     scorecards = _compute_scorecard(G, agent)
@@ -948,8 +951,13 @@ def agent_scorecard(agent: str) -> str:
 
 
 @mcp.tool()
-def team_dashboard() -> str:
-    """Team-wide dashboard: all agents' stats, patterns, health."""
+def team_dashboard(limit: int = 10) -> str:
+    """
+    Team-wide dashboard: agents' stats, patterns, health.
+
+    Args:
+        limit: Max agents shown, by decision volume (default 10)
+    """
     with LOCK:
         G = _load_graph()
     decisions = sum(1 for _, d in G.nodes(data=True) if d.get("type") == "decision")
@@ -961,13 +969,18 @@ def team_dashboard() -> str:
              f"Decisions: {decisions} | Feedback: {fb_count} | Code refs: {code_refs}",
              "", "--- Agents ---"]
     scorecards = _compute_scorecard(G)
-    for name, s in sorted(scorecards.items()):
+    ranked = sorted(scorecards.items(), key=lambda kv: -kv[1]["total"])
+    shown = ranked[:limit]
+    for name, s in sorted(shown, key=lambda kv: kv[0]):
         total = s["total"]
         rate = (s["accepted"] / total * 100) if total else 0
         level = _adaptive_warning_level(G, name, "")
         flag = f" [{level.upper()}]" if level != "normal" else ""
         lines.append(f"  {name}: {total} dec, {s['accepted']} ok ({rate:.0f}%), "
                       f"{s['rejected']} rej, trend={s['trend']}{flag}")
+    if len(ranked) > limit:
+        lines.append(f"  ... and {len(ranked) - limit} more agent(s) "
+                     f"(raise limit to see all)")
     clusters = _cluster_rejection_reasons(G)
     if clusters:
         lines.append("\n--- Patterns ---")
@@ -985,9 +998,8 @@ def team_dashboard() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
 def brain_stats() -> str:
-    """Get overall brain statistics."""
+    """Get overall brain statistics. (CLI/internal only — see team_dashboard for MCP.)"""
     with LOCK:
         G = _load_graph()
     decisions = sum(1 for _, d in G.nodes(data=True) if d.get("type") == "decision")
@@ -1064,11 +1076,16 @@ def get_decision(decision_id: str) -> str:
         edge = G.edges[pred, decision_id]
         if edge.get("relation") == "feedback_on":
             fb = G.nodes[pred]
-            feedback.append(f"  [{fb.get('severity','info')}] {fb.get('agent','?')}: "
-                            f"{fb.get('feedback','')}")
+            feedback.append((fb.get("timestamp", ""),
+                             f"  [{fb.get('severity','info')}] {fb.get('agent','?')}: "
+                             f"{fb.get('feedback','')}"))
     if feedback:
+        feedback.sort(key=lambda x: x[0])
+        recent = feedback[-10:]
         lines.append("\nFeedback:")
-        lines.extend(feedback)
+        if len(feedback) > 10:
+            lines.append(f"  [+{len(feedback) - 10} older feedback omitted]")
+        lines.extend(line for _, line in recent)
     code_syms = []
     for _, succ in G.out_edges(decision_id):
         edge = G.edges[decision_id, succ]
@@ -1090,19 +1107,15 @@ def get_decision(decision_id: str) -> str:
 @mcp.tool()
 def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", message: str = "", repo: str = "") -> str:
     """
-    Report agent status for the live office dashboard.
-    Call this to update your visible state in the pixel art office.
+    Report agent status for the live office dashboard. Call at task START and END.
 
     Args:
         agent: Your name (e.g. "arjun")
-        status: One of: working, idle, planning, discussing, reviewing, blocked, waiting
-        task: What you're working on (shown as label, max 100 chars)
-        talking_to: Name of agent you're interacting with (shows discussion animation)
-        message: Chat message content (appears as speech bubble + in chat log)
-        repo: Optional repo this heartbeat is scoped to. When set, role
-              resolution honours teams_per_repo / per-entry 'repos' filters,
-              and the office state entry includes the repo so dashboards can
-              segment views per repo.
+        status: working | idle | planning | discussing | reviewing | blocked | waiting
+        task: What you're working on (label, max 100 chars)
+        talking_to: Agent you're interacting with
+        message: Chat message (speech bubble + chat log)
+        repo: Repo scope for role resolution and per-repo dashboard views
     """
     with OFFICE_LOCK:
         state = _load_office_state()
@@ -1131,10 +1144,9 @@ def heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", mes
     return "ok"
 
 
-@mcp.tool()
 def office_state(repo: str = "") -> str:
     """
-    Get current office state (for debugging the dashboard).
+    Get current office state (CLI/dashboard only — not exposed via MCP).
 
     Args:
         repo: Optional repo filter. Shows only agents scoped to this repo.
@@ -1186,7 +1198,7 @@ def office_state(repo: str = "") -> str:
 
 
 @mcp.tool()
-def detect_stalls(stall_minutes: int = 5) -> str:
+def detect_stalls(stall_minutes: int = 5, limit: int = 10) -> str:
     """
     Detect agents that appear stalled: have open decisions (outcome=pending)
     but no heartbeat activity within stall_minutes. Returns a report for the
@@ -1194,6 +1206,7 @@ def detect_stalls(stall_minutes: int = 5) -> str:
 
     Args:
         stall_minutes: Minutes of inactivity before an agent is considered stalled (default 5)
+        limit: Max stalled agents listed in detail (default 10)
     """
     with OFFICE_LOCK:
         state = _load_office_state()
@@ -1256,12 +1269,15 @@ def detect_stalls(stall_minutes: int = 5) -> str:
     lines = [f"=== STALL DETECTION (threshold: {stall_minutes}m) ===\n"]
 
     if stalled:
+        stalled.sort(key=lambda s: -s["idle_minutes"])
         lines.append(f"STALLED ({len(stalled)} agent(s)):\n")
-        for s in stalled:
+        for s in stalled[:limit]:
             lines.append(f"  {s['agent']} — idle {s['idle_minutes']}m, last status: {s['last_status']}")
             for d in s["open_decisions"]:
                 lines.append(f"    [{d['id']}] {d['area']}: {d['action']}")
             lines.append("")
+        if len(stalled) > limit:
+            lines.append(f"  ... and {len(stalled) - limit} more stalled agent(s)\n")
         lines.append("ACTION: Nudge these agents to continue or log_outcome if done.\n")
     else:
         lines.append("No stalled agents.\n")
@@ -1601,14 +1617,10 @@ def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
     return san_dir / p.with_suffix(".san")
 
 
-@mcp.tool()
 def check_san_freshness(repo: str) -> str:
     """
     Check SAN freshness: detect stale/missing SANs, clean up orphans.
-    Does NOT regenerate SAN content — reports what needs brain-compiler.
-
-    Args:
-        repo: Repository name from config.json
+    Internal helper — exposed via recompile_san(dry_run=True).
     """
     repo_path = _resolve_repo_path(repo)
     if not repo_path:
@@ -1656,15 +1668,18 @@ def check_san_freshness(repo: str) -> str:
 
 
 @mcp.tool()
-def recompile_san(repo: str) -> str:
+def recompile_san(repo: str, dry_run: bool = False) -> str:
     """
     Refresh SAN metadata: rebuild index, clean up orphans, update content hashes.
     Does NOT generate SAN content — use brain-compiler for that.
-    Call this after large merges, branch switches, or to force cleanup.
+    Set dry_run=True for a freshness report only (no rebuild).
 
     Args:
         repo: Repository name from config.json
+        dry_run: Report stale/missing SANs without modifying anything
     """
+    if dry_run:
+        return check_san_freshness(repo)
     repo_path = _resolve_repo_path(repo)
     if not repo_path:
         return f"ERROR: repo '{repo}' not found in config"
@@ -1858,13 +1873,14 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
 
 
 @mcp.tool()
-def get_san(repo: str, file_path: str) -> str:
+def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
     """
     Get the SAN-compressed content for a source file.
 
     Args:
         repo: Repository name from config.json
-        file_path: Source file path (relative to repo root, e.g. "src/main/kotlin/com/example/Auth.kt")
+        file_path: Source file path relative to repo root (e.g. "src/.../Auth.kt")
+        max_chars: Truncate content above this size (default 4000; raise to read more)
     """
     # Check SAN freshness before reading
     _ensure_san_fresh(repo)
@@ -1903,6 +1919,13 @@ def get_san(repo: str, file_path: str) -> str:
     except OSError as e:
         return f"ERROR reading SAN file: {e}"
 
+    # Cap output to keep token cost bounded
+    total_chars = len(content)
+    if total_chars > max_chars:
+        content = (content[:max_chars]
+                   + f"\n[truncated {max_chars} of {total_chars} chars — "
+                     f"raise max_chars or use query_san]")
+
     # Include freshness info
     repo_paths = _get_repo_paths()
     repo_path = repo_paths.get(repo)
@@ -1921,10 +1944,10 @@ def get_san(repo: str, file_path: str) -> str:
     return f"SAN: {rel}{freshness}\n{'=' * 40}\n{content}"
 
 
-@mcp.tool()
 def update_san_index(repo: str) -> str:
     """
     Rebuild _index.json by scanning all .san files in the repo's .san/ directory.
+    (CLI/internal only — recompile_san covers this for MCP callers.)
     Extracts qualified_name, kind, and file mapping from each .san file.
 
     Args:
@@ -2014,10 +2037,10 @@ def update_san_index(repo: str) -> str:
             f"  Index: {idx_file}")
 
 
-@mcp.tool()
 def validate_san_system() -> str:
     """
     Run self-tests on the SAN hash/orphan/staleness system.
+    (CLI only: `server.py validate-san` — not exposed via MCP.)
     Creates a temporary repo, simulates scenarios, and verifies each one.
     Safe to run anytime — uses an isolated temp directory, touches nothing real.
     """
@@ -2238,7 +2261,6 @@ def validate_san_system() -> str:
     return header + "\n" + "\n".join(results)
 
 
-@mcp.tool()
 def validate_brain() -> str:
     """
     Run comprehensive self-tests on the entire Agent Brain system:
@@ -2497,10 +2519,12 @@ def validate_brain() -> str:
         result = get_agent_stats("star")
         _test("get_agent_stats finds agent", "star:" in result)
 
-        # Test agent_scorecard
-        result = agent_scorecard("star")
+        # Test agent_scorecard (detail mode)
+        result = agent_scorecard("star", detail=True)
         _test("agent_scorecard renders", "SCORECARD: star" in result)
         _test("agent_scorecard shows acceptance rate", "83%" in result, f"got: {result}")
+        # Compact mode delegates to get_agent_stats
+        _test("agent_scorecard compact mode", "star:" in agent_scorecard("star"))
 
         # Test team_dashboard
         result = team_dashboard()
@@ -2533,8 +2557,8 @@ def validate_brain() -> str:
         G = _load_graph()
         G.nodes["d_acc_0"]["files"] = ["src/api/handler.kt"]
         _save_graph(G)
-        result = decisions_for_file("src/api/handler.kt")
-        _test("decisions_for_file finds by path", "decision(s)" in result)
+        result = decisions_for("src/api/handler.kt")
+        _test("decisions_for (file mode) finds by path", "decision(s)" in result)
 
         # ===================================================================
         # SECTION 8: Code Bridge
@@ -2550,11 +2574,11 @@ def validate_brain() -> str:
         G.add_edge("d_acc_0", code_node, relation="touches")
         _save_graph(G)
 
-        result = decisions_for_code("com.example.AuthService.login")
-        _test("decisions_for_code finds linked decision", "decision(s)" in result)
+        result = decisions_for("com.example.AuthService.login")
+        _test("decisions_for (code mode) finds linked decision", "decision(s)" in result)
 
-        result = decisions_for_code("com.example.NonExistent")
-        _test("decisions_for_code empty for unknown symbol", "No decisions" in result)
+        result = decisions_for("com.example.NonExistent")
+        _test("decisions_for (code mode) empty for unknown symbol", "No decisions" in result)
 
         result = code_impact("d_acc_0")
         _test("code_impact shows symbols", "AuthService" in result)
@@ -2671,7 +2695,7 @@ def validate_brain() -> str:
         _test("workflow: get_decision shows feedback", "blocker" in r or "DIP" in r)
 
         # Step 7: Scorecard reflects rejection
-        r = agent_scorecard("dev")
+        r = agent_scorecard("dev", detail=True)
         _test("workflow: scorecard shows 100% rejection", "100%" in r and "rejected" in r.lower())
 
         # Step 8: query finds it
@@ -2949,7 +2973,9 @@ def _diagnose(project: str = "") -> int:
 
 if __name__ == "__main__":
     import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] == "diagnose":
+    cmd = _sys.argv[1] if len(_sys.argv) > 1 else ""
+
+    if cmd == "diagnose":
         proj = ""
         for a in _sys.argv[2:]:
             if a.startswith("--project="):
@@ -2961,4 +2987,30 @@ if __name__ == "__main__":
                 print(f"Unknown diagnose flag: {a}")
                 _sys.exit(2)
         _sys.exit(_diagnose(project=proj))
+
+    # Admin commands moved off MCP to keep the tool surface lean.
+    if cmd == "validate":
+        print(validate_brain())
+        _sys.exit(0)
+    if cmd == "validate-san":
+        print(validate_san_system())
+        _sys.exit(0)
+    if cmd == "san-index":
+        if len(_sys.argv) < 3:
+            print("Usage: server.py san-index <repo>")
+            _sys.exit(2)
+        print(update_san_index(_sys.argv[2]))
+        _sys.exit(0)
+    if cmd == "stats":
+        print(brain_stats())
+        _sys.exit(0)
+    if cmd == "office":
+        print(office_state(_sys.argv[2] if len(_sys.argv) > 2 else ""))
+        _sys.exit(0)
+    if cmd in ("--help", "-h", "help"):
+        print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
+              "stats|office [repo]]")
+        print("  (no args)        run the MCP server")
+        _sys.exit(0)
+
     mcp.run()

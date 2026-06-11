@@ -91,8 +91,8 @@ decision ──touches──→ code_ref (qualified_name)
 ```
 
 This enables:
-- "What decisions touched AuthService?" → `decisions_for_code`
-- "Who changed this file and what happened?" → `decisions_for_file`
+- "What decisions touched AuthService?" → `decisions_for` (code symbol)
+- "Who changed this file and what happened?" → `decisions_for` (file path)
 - "What's the blast radius of this decision?" → `code_impact`
 
 ## Similarity Engine
