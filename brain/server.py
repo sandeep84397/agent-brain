@@ -212,48 +212,170 @@ mcp = FastMCP(
 # ===========================================================================
 
 
-# Graph cache: parsing the full graph costs ~140ms at a few MB, paid on every
-# tool call without this. Keyed on (path, mtime_ns, size) so it stays correct
-# when validate_brain swaps GRAPH_FILE to a temp dir or another session writes
-# the file. Invariant: mutate the returned graph only under LOCK and always
-# _save_graph afterwards (which refreshes the cache).
-_GRAPH_CACHE: dict = {"key": None, "graph": None}
+# Persistence model: decisions.json is a periodic full SNAPSHOT; decisions.journal
+# is an append-only JSONL of mutations since the snapshot. Each _save_graph diffs
+# the graph against its pre-save state and appends only the delta — so a single
+# log_* writes a few hundred bytes instead of rewriting the whole (multi-MB)
+# snapshot. The journal is replayed on top of the snapshot at load. When the
+# journal grows past _JOURNAL_COMPACT_BYTES, the next save compacts: rewrite the
+# snapshot and truncate the journal.
+#
+# Cache: parsing snapshot+journal costs ~140ms at a few MB, paid per tool call
+# without this. Keyed on (snapshot stat, journal stat) so it self-invalidates
+# when validate_brain swaps GRAPH_FILE to a temp dir or another process writes.
+# Invariant: mutate the returned graph only under LOCK and _save_graph after.
+_GRAPH_CACHE: dict = {"key": None, "graph": None, "shadow": None}
+_JOURNAL_COMPACT_BYTES = 256 * 1024
 
 
-def _graph_cache_key():
+def _journal_file() -> Path:
+    return GRAPH_FILE.with_suffix(".journal")
+
+
+def _stat_tuple(path: Path):
     try:
-        st = GRAPH_FILE.stat()
-        return (str(GRAPH_FILE), st.st_mtime_ns, st.st_size)
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
 
 
+def _graph_cache_key():
+    if not GRAPH_FILE.exists() and not _journal_file().exists():
+        return None
+    return (str(GRAPH_FILE), _stat_tuple(GRAPH_FILE), _stat_tuple(_journal_file()))
+
+
+def _apply_journal_line(G: nx.DiGraph, op: dict) -> None:
+    """Apply one journal mutation to G. Tolerant of malformed/partial lines."""
+    kind = op.get("op")
+    if kind == "node":
+        nid = op.get("id")
+        if nid is not None:
+            G.add_node(nid, **op.get("data", {}))
+    elif kind == "del_node":
+        nid = op.get("id")
+        if nid is not None and nid in G:
+            G.remove_node(nid)
+    elif kind == "edge":
+        u, v = op.get("u"), op.get("v")
+        if u is not None and v is not None:
+            G.add_edge(u, v, **op.get("data", {}))
+    elif kind == "del_edge":
+        u, v = op.get("u"), op.get("v")
+        if u is not None and v is not None and G.has_edge(u, v):
+            G.remove_edge(u, v)
+
+
+def _read_snapshot() -> nx.DiGraph:
+    if not GRAPH_FILE.exists():
+        return nx.DiGraph()
+    try:
+        return nx.node_link_graph(json.loads(GRAPH_FILE.read_text()))
+    except (json.JSONDecodeError, OSError, KeyError):
+        return nx.DiGraph()
+
+
 def _load_graph() -> nx.DiGraph:
-    """Load the decision graph (mtime-cached). Returns empty graph if none exists."""
+    """Load the decision graph: snapshot + replayed journal (cached)."""
     key = _graph_cache_key()
     if key is None:
         return nx.DiGraph()
     if _GRAPH_CACHE["key"] == key and _GRAPH_CACHE["graph"] is not None:
         return _GRAPH_CACHE["graph"]
-    try:
-        data = json.loads(GRAPH_FILE.read_text())
-        G = nx.node_link_graph(data)
-    except (json.JSONDecodeError, OSError):
-        return nx.DiGraph()
+    G = _read_snapshot()
+    journal = _journal_file()
+    if journal.exists():
+        try:
+            for line in journal.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    _apply_journal_line(G, json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
     _GRAPH_CACHE["key"] = key
     _GRAPH_CACHE["graph"] = G
+    _GRAPH_CACHE["shadow"] = nx.node_link_data(G)
     return G
 
 
-def _save_graph(G: nx.DiGraph) -> None:
-    """Persist the decision graph to disk (compact JSON, atomic write)."""
+def _write_snapshot(G: nx.DiGraph) -> None:
+    """Write the full snapshot and clear the journal (compaction)."""
     BRAIN_DIR.mkdir(parents=True, exist_ok=True)
-    data = nx.node_link_data(G)
     tmp = GRAPH_FILE.with_suffix(f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(data, separators=(",", ":")))
-    tmp.rename(GRAPH_FILE)
+    tmp.write_text(json.dumps(nx.node_link_data(G), separators=(",", ":")))
+    os.replace(tmp, GRAPH_FILE)
+    journal = _journal_file()
+    if journal.exists():
+        try:
+            journal.unlink()
+        except OSError:
+            pass
+
+
+def _diff_ops(old: dict, new: dict) -> list[dict]:
+    """Compute journal ops transforming the old node_link_data into new."""
+    ops: list[dict] = []
+    old_nodes = {n["id"]: n for n in old.get("nodes", [])}
+    new_nodes = {n["id"]: n for n in new.get("nodes", [])}
+    for nid, nd in new_nodes.items():
+        if old_nodes.get(nid) != nd:
+            data = {k: v for k, v in nd.items() if k != "id"}
+            ops.append({"op": "node", "id": nid, "data": data})
+    for nid in old_nodes:
+        if nid not in new_nodes:
+            ops.append({"op": "del_node", "id": nid})
+
+    def _edge_key(e):
+        return (e.get("source"), e.get("target"))
+    old_edges = {_edge_key(e): e for e in old.get("links", [])}
+    new_edges = {_edge_key(e): e for e in new.get("links", [])}
+    for ek, ed in new_edges.items():
+        if old_edges.get(ek) != ed:
+            data = {k: v for k, v in ed.items() if k not in ("source", "target")}
+            ops.append({"op": "edge", "u": ek[0], "v": ek[1], "data": data})
+    for ek in old_edges:
+        if ek not in new_edges:
+            ops.append({"op": "del_edge", "u": ek[0], "v": ek[1]})
+    return ops
+
+
+def _save_graph(G: nx.DiGraph) -> None:
+    """Persist G by appending only the delta to the journal (snapshot stays
+    until compaction). Falls back to a full snapshot when there's no prior
+    shadow or the journal has grown large."""
+    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    new_data = nx.node_link_data(G)
+    shadow = _GRAPH_CACHE.get("shadow")
+    journal = _journal_file()
+
+    # First write of a session, or cache was bypassed: snapshot from scratch.
+    if shadow is None or _GRAPH_CACHE.get("graph") is not G:
+        _write_snapshot(G)
+        _GRAPH_CACHE["key"] = _graph_cache_key()
+        _GRAPH_CACHE["graph"] = G
+        _GRAPH_CACHE["shadow"] = new_data
+        return
+
+    ops = _diff_ops(shadow, new_data)
+    if ops:
+        try:
+            journal_size = journal.stat().st_size if journal.exists() else 0
+        except OSError:
+            journal_size = 0
+        if journal_size >= _JOURNAL_COMPACT_BYTES:
+            _write_snapshot(G)  # compaction: fold journal into snapshot
+        else:
+            with journal.open("a") as f:
+                for op in ops:
+                    f.write(json.dumps(op, separators=(",", ":")) + "\n")
     _GRAPH_CACHE["key"] = _graph_cache_key()
     _GRAPH_CACHE["graph"] = G
+    _GRAPH_CACHE["shadow"] = new_data
 
 
 # ===========================================================================
@@ -2525,6 +2647,8 @@ def validate_brain() -> str:
         globals()["CONFIG_FILE"] = tmp_root / "config.json"
         globals()["OFFICE_STATE_FILE"] = tmp_root / "office-state.json"
         globals()["DECISION_MARKER_FILE"] = tmp_root / ".last_decision_marker"
+        # Drop any shadow/cache from the real brain so temp diffs start clean.
+        _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
 
         # ===================================================================
         # SECTION 1: Graph Persistence
@@ -2872,8 +2996,12 @@ def validate_brain() -> str:
         _test("corrupt config returns empty defaults", config == {"repos": {}, "team": []})
         (tmp_root / "config.json").write_text(config_backup)
 
-        # Corrupt graph file
+        # Corrupt graph file (snapshot + journal both unreadable → empty)
         (tmp_root / "decisions.json").write_text("not json")
+        jf = (tmp_root / "decisions.journal")
+        if jf.exists():
+            jf.unlink()
+        _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
         G = _load_graph()
         _test("corrupt graph returns empty graph", G.number_of_nodes() == 0)
 
@@ -2949,6 +3077,8 @@ def validate_brain() -> str:
         globals()["CONFIG_FILE"] = real_config_file
         globals()["OFFICE_STATE_FILE"] = real_office_file
         globals()["DECISION_MARKER_FILE"] = real_marker_file
+        # Drop temp shadow/cache; next real _load_graph re-reads from disk.
+        _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
         # Clean up
         if tmp_root and tmp_root.exists():
             try:

@@ -8,9 +8,13 @@ build/
 
 # Brain data (personal per-machine)
 decisions.json
-decisions.json.tmp
+decisions.journal
+decisions.tmp*
+decisions.json.tmp*
 config.json
 office-state.json
+office-state.tmp*
+san_savings.jsonl
 .last_decision_marker
 
 # SAN local cache (per-machine content hashes)
