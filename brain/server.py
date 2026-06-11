@@ -1307,6 +1307,96 @@ def detect_stalls(stall_minutes: int = 5, limit: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Token savings tracking — how much SAN saves vs reading raw source.
+# Counted conservatively: only get_san reads (raw source tokens minus SAN
+# tokens actually served). query_san is not counted. ~4 chars per token.
+# ---------------------------------------------------------------------------
+
+SAVINGS_FILE = BRAIN_DIR / "san_savings.jsonl"
+_SESSION_ID = f"ses_{uuid.uuid4().hex[:8]}"
+_SESSION_SAVINGS = {"reads": 0, "raw_tokens": 0, "san_tokens": 0}
+
+
+def _tokens(chars: int) -> int:
+    """Estimate tokens from a character count (~4 chars/token for code)."""
+    return max(0, round(chars / 4))
+
+
+def _record_san_saving(repo: str, file_rel: str, raw_chars: int, san_chars: int) -> None:
+    """Record one get_san read that replaced a raw source read. Never raises."""
+    try:
+        raw_t, san_t = _tokens(raw_chars), _tokens(san_chars)
+        if raw_t <= san_t:
+            return  # no saving (tiny source or oversized SAN) — don't inflate stats
+        _SESSION_SAVINGS["reads"] += 1
+        _SESSION_SAVINGS["raw_tokens"] += raw_t
+        _SESSION_SAVINGS["san_tokens"] += san_t
+        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        with SAVINGS_FILE.open("a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(),
+                "session": _SESSION_ID,
+                "repo": repo,
+                "file": file_rel,
+                "raw_tokens": raw_t,
+                "san_tokens": san_t,
+            }) + "\n")
+    except Exception:
+        pass  # savings tracking must never break get_san
+
+
+def _load_savings_events() -> list[dict]:
+    """Read all persisted savings events. Returns [] on any problem."""
+    if not SAVINGS_FILE.exists():
+        return []
+    events = []
+    try:
+        for line in SAVINGS_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return []
+    return events
+
+
+def _format_savings_report(session: dict, events: list[dict], today_str: str) -> str:
+    """Build the savings report from session counters + persisted events."""
+    def block(label: str, reads: int, raw: int, san: int) -> list[str]:
+        saved = raw - san
+        pct = (saved / raw * 100) if raw else 0.0
+        return [f"{label}:",
+                f"  SAN reads: {reads}",
+                f"  Raw source cost avoided: {raw:,} tokens",
+                f"  SAN tokens served: {san:,} tokens",
+                f"  SAVED: {saved:,} tokens ({pct:.0f}%)"]
+
+    lines = ["=== SAN TOKEN SAVINGS ===", ""]
+    lines += block("This session", session["reads"],
+                   session["raw_tokens"], session["san_tokens"])
+
+    today = [e for e in events if str(e.get("ts", "")).startswith(today_str)]
+    t_raw = sum(e.get("raw_tokens", 0) for e in today)
+    t_san = sum(e.get("san_tokens", 0) for e in today)
+    lines += [""] + block(f"Today ({today_str})", len(today), t_raw, t_san)
+
+    a_raw = sum(e.get("raw_tokens", 0) for e in events)
+    a_san = sum(e.get("san_tokens", 0) for e in events)
+    lines += [""] + block("All time", len(events), a_raw, a_san)
+
+    if session["reads"] == 0 and not events:
+        lines += ["", "No SAN reads recorded yet. Savings are counted when",
+                  "agents call get_san instead of reading raw source files."]
+    lines += ["", "Note: conservative estimate — counts get_san reads only",
+              "(query_san and decision-memory benefits not included). ~4 chars/token."]
+    return "\n".join(lines)
+
+
 _SAN_SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
 
 
@@ -1936,11 +2026,15 @@ def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
                      f"raise max_chars or use query_san]")
 
     # Include freshness info
-    repo_paths = _get_repo_paths()
-    repo_path = repo_paths.get(repo)
+    repo_path = _resolve_repo_path(repo)
     freshness = ""
     if repo_path:
         source = repo_path / file_path
+        if not source.exists():
+            # Fuzzy-matched SAN — derive source path from the .san file location
+            derived = str(san_path.relative_to(san_dir))
+            derived = derived[:-4] if derived.endswith(".san") else derived
+            source = repo_path / derived
         if source.exists():
             src_mtime = source.stat().st_mtime
             san_mtime = san_path.stat().st_mtime
@@ -1948,9 +2042,25 @@ def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
                 freshness = "\n⚠ STALE: source is newer than SAN. Re-run brain-compiler."
             else:
                 freshness = "\n✓ Fresh"
+            # Track tokens saved vs reading the raw source
+            try:
+                _record_san_saving(repo, str(source.relative_to(repo_path)),
+                                   source.stat().st_size, len(content))
+            except Exception:
+                pass
 
     rel = san_path.relative_to(san_dir)
     return f"SAN: {rel}{freshness}\n{'=' * 40}\n{content}"
+
+
+@mcp.tool()
+def token_savings() -> str:
+    """
+    Report tokens saved by SAN this session, today, and all-time —
+    raw-source cost avoided vs SAN tokens served, with percentages.
+    """
+    return _format_savings_report(_SESSION_SAVINGS, _load_savings_events(),
+                                  datetime.now().strftime("%Y-%m-%d"))
 
 
 def update_san_index(repo: str) -> str:
@@ -3016,9 +3126,24 @@ if __name__ == "__main__":
     if cmd == "office":
         print(office_state(_sys.argv[2] if len(_sys.argv) > 2 else ""))
         _sys.exit(0)
+    if cmd == "savings":
+        # CLI runs in its own process: "this session" counters are empty here,
+        # so report the most recent recorded session instead.
+        events = _load_savings_events()
+        last = {"reads": 0, "raw_tokens": 0, "san_tokens": 0}
+        if events:
+            last_id = events[-1].get("session")
+            ses = [e for e in events if e.get("session") == last_id]
+            last = {"reads": len(ses),
+                    "raw_tokens": sum(e.get("raw_tokens", 0) for e in ses),
+                    "san_tokens": sum(e.get("san_tokens", 0) for e in ses)}
+        report = _format_savings_report(last, events,
+                                        datetime.now().strftime("%Y-%m-%d"))
+        print(report.replace("This session", "Last recorded session", 1))
+        _sys.exit(0)
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
-              "stats|office [repo]]")
+              "stats|office [repo]|savings]")
         print("  (no args)        run the MCP server")
         _sys.exit(0)
 
