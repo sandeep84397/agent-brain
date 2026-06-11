@@ -416,6 +416,35 @@ AuthServiceImpl @svc {
 }
 ```
 
+### Is SAN worth it? (measured numbers)
+
+Measured across 5 production repos (Kotlin/TS, ~1,026 source files, ~1.1M source tokens). Compression ratio varies by code style — 9-30% of original size, ~10% blended:
+
+| Scenario | Raw source | Via SAN | Saved |
+|----------|----------:|--------:|------:|
+| Agent reads 1 file | ~1,080 tokens | ~100 tokens | **~980 (90%)** |
+| One task (agent explores ~10 files) | ~10,800 tokens | ~1,000 tokens | **~10k per task** |
+| Whole codebase in context (1,026 files) | ~1.1M tokens — *doesn't fit* | ~100k tokens — *fits in one window* | **~1M (91%)** |
+
+Savings recur on **every read by every agent**; generation cost is one-time per file (plus regeneration when the file changes):
+
+| Cost side | Amount |
+|-----------|--------|
+| Generate 1 file (Sonnet) | ~1 read of the source + ~100-150 output tokens |
+| Break-even | After **~1-2 reads** of that file via `get_san` instead of raw |
+
+**Use SAN when:**
+- Agents repeatedly explore the same codebase (every task re-reads files)
+- The repo is too big to fit in context raw — SAN makes whole-repo reasoning possible
+- Multiple agents work the same repo (generation cost amortizes across the team)
+
+**Skip SAN when:**
+- The repo is small enough to fit in context anyway (< ~50 files)
+- Files churn rapidly — stale SANs need regeneration, eroding the one-time-cost advantage
+- One-off scripts / repos agents rarely revisit (won't reach break-even)
+
+> Token counts estimated at ~4 chars/token. Run the numbers for your own repos: `du -ch` your source extensions vs your `.san/` directory after converting a sample.
+
 ## Adaptive Warnings
 
 Agents with high rejection rates get progressively stricter warnings:
