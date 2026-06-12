@@ -264,7 +264,7 @@ The brain is built to stay fast as the decision history grows into thousands of 
 |------|---------|
 | `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. `dry_run=True` for a freshness report only. Does NOT generate content. |
 | `query_san` | Search SAN files by keyword (index + content) |
-| `get_san` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+| `get_san` | Get SAN-compressed content for a source file (`max_chars` caps output; `detail="sig"` returns just the public API surface — ~2x cheaper than full, ~11x cheaper than raw) |
 | `token_savings` | Tokens saved by SAN this session / today / all-time — number + % |
 
 ### Admin (CLI only — not exposed via MCP)
@@ -516,6 +516,19 @@ AuthServiceImpl @svc {
 }
 ```
 
+### The escalation ladder
+
+Agents never load the whole compressed repo — they climb four levels, paying more only when needed:
+
+| Level | What | Avg cost/file | When |
+|-------|------|--------------:|------|
+| 1. Catalog | `_index.json` — every file + its blocks | ~0 (one lookup) | "Where does X live?" |
+| 2. Signatures | `get_san(detail="sig")` — public API surface only | ~110 tokens | "What exists here?" |
+| 3. SAN brief | `get_san` — full compressed facts | ~220 tokens | "How does this work?" |
+| 4. Raw source | Read the real lines via `src:` anchors | ~1,170 tokens | "I'm about to edit this" |
+
+The signatures tier is also the most staleness-resistant: public surfaces churn far slower than function bodies.
+
 ### Is SAN worth it? (measured numbers)
 
 Measured with **real tokenizers** (tiktoken `o200k_base` and `cl100k_base` — both agree within 0.1%) across 3 production repos: 954 source/SAN file pairs, Kotlin/Java/TS/JS, ~1.12M source tokens. Compression varies by code style — boilerplate-heavy Android code compresses to ~17%, dense backend logic to ~27%; **18.9% blended (81% saved)**:
@@ -552,7 +565,7 @@ Savings recur on **every read by every agent**; generation cost is one-time per 
 - Files churn rapidly — stale SANs need regeneration, eroding the one-time-cost advantage
 - One-off scripts / repos agents rarely revisit (won't reach break-even)
 
-> Numbers above are tokenizer-measured (tiktoken). The live `token_savings` tracker below uses a ~4 chars/token estimate, which measured ~1.4 points *optimistic* vs the real tokenizer (17.5% vs 18.9% ratio) — close enough for tracking, but the table above is the honest benchmark. Measure your own repos:
+> Numbers above are tokenizer-measured (tiktoken). The live `token_savings` tracker uses tiktoken too when it's installed in the brain venv (`pip install tiktoken`) — exact counts, same methodology as the table. Without tiktoken it falls back to a ~4 chars/token estimate (measured ~1.4 points optimistic: 17.5% vs 18.9% ratio). Measure your own repos:
 > ```bash
 > pip install tiktoken
 > python3 -c "
@@ -700,6 +713,12 @@ Agents with high rejection rates get progressively stricter warnings:
 | ≥ 50% | STRICT | Shows top rejection patterns, demands extra scrutiny |
 
 Agents with fewer than 3 logged decisions always get NORMAL — no judgment on a tiny sample.
+
+**Old rejections age out gracefully.** Warnings older than ~3 months are tagged
+`[6mo old — verify the reason still applies]` — the codebase may have moved on
+since the rejection, so the agent is told to re-check the reasoning instead of
+treating it as current. The reason is always shown so the agent judges applicability;
+nothing is silently filtered or silently blocked.
 
 ## Office Dashboard (Live Visualization)
 

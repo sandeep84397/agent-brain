@@ -561,6 +561,7 @@ def _find_similar_rejections(
                 "outcome_by": data.get("outcome_by", "?"),
                 "area": data.get("area", "?"), "similarity": sim,
                 "timestamp": data.get("timestamp", "?")[:10],
+                "timestamp_full": data.get("timestamp", ""),
             })
     similar.sort(key=lambda x: -x["similarity"])
     return similar
@@ -676,6 +677,18 @@ def _compute_scorecard(G: nx.DiGraph, agent_name: str = "") -> dict:
     return agents
 
 
+def _age_note(timestamp: str, stale_days: int = 90) -> str:
+    """Age annotation for old rejections — context may have changed since."""
+    try:
+        age_days = (datetime.now() - datetime.fromisoformat(timestamp)).days
+    except (ValueError, TypeError):
+        return ""
+    if age_days >= stale_days:
+        months = max(1, age_days // 30)
+        return f" [{months}mo old — verify the reason still applies]"
+    return ""
+
+
 def _adaptive_warning_level(G: nx.DiGraph, agent: str, area: str) -> str:
     """Determine warning aggressiveness based on agent history."""
     total = 0
@@ -731,7 +744,8 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
             if data.get("agent") == agent:
                 my_failures_here += 1
             exact_warnings.append(
-                f"- [{data.get('timestamp', '?')[:10]}] "
+                f"- [{data.get('timestamp', '?')[:10]}]"
+                f"{_age_note(data.get('timestamp', ''))} "
                 f"{data.get('agent', '?')} tried: {str(data.get('action', '?'))[:200]}\n"
                 f"  REJECTED by {data.get('outcome_by', '?')}: "
                 f"{str(data.get('outcome_reason', '?'))[:300]}")
@@ -768,7 +782,8 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
         for s in similar[:5]:
             pct = int(s["similarity"] * 100)
             sim_lines.append(
-                f"- [{s['timestamp']}] {s['agent']} in area={s['area']} "
+                f"- [{s['timestamp']}]{_age_note(s.get('timestamp_full', ''))} "
+                f"{s['agent']} in area={s['area']} "
                 f"({pct}% similar): {s['action']}\n"
                 f"  REJECTED by {s['outcome_by']}: {s['reason']}")
         sections.append(
@@ -1557,10 +1572,36 @@ def _tokens(chars: int) -> int:
     return max(0, round(chars / 4))
 
 
-def _record_san_saving(repo: str, file_rel: str, raw_chars: int, san_chars: int) -> None:
+_TOKEN_ENCODER = None
+_TOKEN_ENCODER_TRIED = False
+
+
+def _tokens_text(text: str) -> int:
+    """Count tokens with tiktoken (o200k_base) when installed; else chars/4.
+
+    chars/4 measured ~1.4 points optimistic vs the real tokenizer on code —
+    install tiktoken in the brain venv to make token_savings exact.
+    """
+    global _TOKEN_ENCODER, _TOKEN_ENCODER_TRIED
+    if not _TOKEN_ENCODER_TRIED:
+        _TOKEN_ENCODER_TRIED = True
+        try:
+            import tiktoken
+            _TOKEN_ENCODER = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            _TOKEN_ENCODER = None
+    if _TOKEN_ENCODER is not None:
+        try:
+            return len(_TOKEN_ENCODER.encode(text))
+        except Exception:
+            pass
+    return _tokens(len(text))
+
+
+def _record_san_saving(repo: str, file_rel: str, raw_text: str, san_text: str) -> None:
     """Record one get_san read that replaced a raw source read. Never raises."""
     try:
-        raw_t, san_t = _tokens(raw_chars), _tokens(san_chars)
+        raw_t, san_t = _tokens_text(raw_text), _tokens_text(san_text)
         if raw_t <= san_t:
             return  # no saving (tiny source or oversized SAN) — don't inflate stats
         _SESSION_SAVINGS["reads"] += 1
@@ -2229,8 +2270,32 @@ def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
     return "\n".join(lines)
 
 
+_SAN_HEADER_RE = re.compile(r"^\S+\s+@\w+\s*\{")
+
+
+def _san_signatures(content: str) -> str:
+    """Reduce a SAN brief to its public API surface.
+
+    Keeps block headers, src ranges, deps, and public fn signatures
+    (impl detail in [...] stripped). Drops private members (- prefix),
+    @state/@errors/purpose/impl prose. Measured ~2x smaller than full
+    SAN, ~11x smaller than raw source (972 files).
+    """
+    out = []
+    for line in content.splitlines():
+        s = line.strip()
+        if _SAN_HEADER_RE.match(line) or s == "}":
+            out.append(line)
+        elif s.startswith(("src:", "deps:")):
+            out.append(line)
+        elif s.startswith("fn:"):
+            out.append(re.sub(r"\s*\[.*\]\s*$", "", line))
+    return "\n".join(out)
+
+
 @mcp.tool()
-def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
+def get_san(repo: str, file_path: str, max_chars: int = 4000,
+            detail: str = "full") -> str:
     """
     Get the SAN-compressed content for a source file.
 
@@ -2238,6 +2303,10 @@ def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
         repo: Repository name from config.json
         file_path: Source file path relative to repo root (e.g. "src/.../Auth.kt")
         max_chars: Truncate content above this size (default 4000; raise to read more)
+        detail: "full" (default) for the complete SAN brief, or "sig" for the
+            public API surface only — block headers, src ranges, deps, and
+            public function signatures with impl detail stripped (~2x cheaper
+            than full, ~11x cheaper than raw; use for "what exists here?")
     """
     # Check SAN freshness before reading
     _ensure_san_fresh(repo)
@@ -2276,6 +2345,9 @@ def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
     except OSError as e:
         return f"ERROR reading SAN file: {e}"
 
+    if detail == "sig":
+        content = _san_signatures(content)
+
     # Cap output to keep token cost bounded
     total_chars = len(content)
     if total_chars > max_chars:
@@ -2303,7 +2375,7 @@ def get_san(repo: str, file_path: str, max_chars: int = 4000) -> str:
             # Track tokens saved vs reading the raw source
             try:
                 _record_san_saving(repo, str(source.relative_to(repo_path)),
-                                   source.stat().st_size, len(content))
+                                   source.read_text(errors="replace"), content)
             except Exception:
                 pass
 

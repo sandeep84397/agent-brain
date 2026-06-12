@@ -195,7 +195,7 @@ else
 fi
 
 "$BRAIN_DIR/.venv/bin/pip" install --quiet --upgrade pip
-"$BRAIN_DIR/.venv/bin/pip" install --quiet mcp networkx
+"$BRAIN_DIR/.venv/bin/pip" install --quiet mcp networkx tiktoken
 echo "  Dependencies installed."
 
 # ---------------------------------------------------------------------------
