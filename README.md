@@ -1,6 +1,6 @@
 # Agent Brain
 
-Persistent decision memory for AI code agent teams. Agents learn from mistakes, coordinate across sessions, and never repeat the same error twice — and read your codebase at ~10-15% of the usual token cost.
+Persistent decision memory for AI code agent teams. Agents learn from mistakes, coordinate across sessions, and never repeat the same error twice — and read your codebase at ~20% of the usual token cost (tokenizer-measured: 81% saved).
 
 **Works with any [MCP](https://modelcontextprotocol.io) (Model Context Protocol)-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, etc. Agent templates (`.md` files) are Claude Code specific — the MCP server itself is universal.
 
@@ -12,6 +12,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [Architecture](#architecture) — what lives where, [performance & internals](#performance--internals)
 - [MCP Tools (17)](#mcp-tools-17) — the agent-facing API
 - [Agent Team](#agent-team) — bundled role templates
+- [Model Routing](#model-routing-quality-per-cost) — right model per phase, two-strikes escalation, plan handoff
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
 - [SAN Protocol](#san-protocol) — code compression: is it worth it, measuring savings (`token_savings`)
 - [SAN Setup](#san-setup) — turning SAN on, model choice, other platforms
@@ -32,7 +33,7 @@ Reviewer → log_outcome()  → "rejected: violates DIP (dependency inversion)"
 Next time, any agent → pre_check() → sees that rejection → avoids the mistake
 ```
 
-2. **Cheap code reading** — the optional [SAN protocol](#san-protocol) compresses source files to ~10-15% of their original tokens, and [`token_savings`](#measuring-your-savings-token_savings) shows you exactly how much it saved, per session, in numbers and %.
+2. **Cheap code reading** — the optional [SAN protocol](#san-protocol) compresses source files to ~17-27% of their original tokens (81% saved, tokenizer-measured), and [`token_savings`](#measuring-your-savings-token_savings) shows you exactly how much it saved, per session, in numbers and %.
 
 ## Features
 
@@ -45,7 +46,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Agent Scorecards** | Acceptance rate, trends, top rejection categories per agent. |
 | **Adaptive Warnings** | Agents with high rejection rates get stricter pre-check warnings. |
 | **Team Dashboard** | All agents at a glance — for project managers. |
-| **SAN Protocol** | Compress code to ~10-15% of original tokens. Full codebase fits in context. |
+| **SAN Protocol** | Compress code to ~20% of original tokens (81% saved, measured). Full codebase fits in context. |
 | **Token Savings Tracker** | [`token_savings`](#measuring-your-savings-token_savings) reports tokens saved this session / today / all-time, with %. |
 | **Enforcement Hook** | Code edits are blocked until the agent logs a decision — memory actually gets populated. |
 
@@ -224,8 +225,8 @@ The brain is built to stay fast as the decision history grows into thousands of 
 ### Core (every agent uses these)
 | Tool | Purpose |
 |------|---------|
-| `pre_check` | Check past failures before starting work |
-| `log_decision` | Record what you decided and why |
+| `pre_check` | Past failures before starting work + plan pointers, escalation hints, model routing |
+| `log_decision` | Record what you decided and why; optional `plan_file` links a written plan |
 | `log_outcome` | Record accepted/rejected/failed after review |
 | `log_feedback` | Reviewers log feedback on decisions |
 
@@ -281,14 +282,16 @@ python3 brain/server.py savings         # SAN token savings (last session / toda
 
 The repo includes 6 agent templates. Each has the Brain Protocol baked in:
 
-| Role | File | Responsibility |
-|------|------|---------------|
-| Project Manager | `project-manager.md` | Coordination, tracking, blockers |
-| Product Owner | `product-owner.md` | PRDs, acceptance criteria |
-| Principal Engineer | `principal-engineer.md` | Architecture, SOLID, reviews |
-| Backend Engineer | `backend-engineer.md` | API, services, data layer |
-| Frontend Engineer | `frontend-engineer.md` | UI, app logic, integration |
-| QA Engineer | `qa-engineer.md` | Test plans, validation, quality gates |
+| Role | File | Responsibility | Pinned model |
+|------|------|---------------|--------------|
+| Project Manager | `project-manager.md` | Coordination, tracking, blockers | Haiku (cheap coordination) |
+| Product Owner | `product-owner.md` | PRDs, acceptance criteria | Sonnet |
+| Principal Engineer | `principal-engineer.md` | Architecture, SOLID, reviews | Opus (review is high-leverage) |
+| Backend Engineer | `backend-engineer.md` | API, services, data layer | Sonnet |
+| Frontend Engineer | `frontend-engineer.md` | UI, app logic, integration | Sonnet |
+| QA Engineer | `qa-engineer.md` | Test plans, validation, quality gates | Sonnet |
+
+Model pins live in each template's `model:` frontmatter — change them to fit your budget. See [Model Routing](#model-routing-quality-per-cost) for the full strategy.
 
 Scale by duplicating templates (e.g., `backend-engineer-2.md`).
 
@@ -348,6 +351,76 @@ For reviewers (PE, QA), also add:
 ```
 
 `setup.sh` shows this snippet if it detects existing agents (choose `[m]` for manual).
+
+## Model Routing (quality per cost)
+
+Spend the expensive model where mistakes are costly to undo; spend the cheap ones where mistakes are cheap to fix. The brain supports this in three layers:
+
+### 1. Per-role model pins
+
+Each agent template pins a model in frontmatter (`model: claude-sonnet-4-6`). Defaults follow the phase-cost logic:
+
+| Phase | Work | Model | Why |
+|-------|------|-------|-----|
+| Plan / architecture | System design, module boundaries, implementation plan | Fable / Opus | A wrong architecture costs days of rework; one good plan makes every later step cheaper |
+| Scaffolding / boilerplate | Project setup, DI wiring, data classes, mappers | Sonnet / Haiku | Pattern-matching, not reasoning — executing against the plan, not deciding |
+| Core / complex logic | Encryption flows, state machines, tricky concurrency | Opus, escalate on failure | Start mid-tier; escalate only when the data says so (see below) |
+| Review | Architecture + code review of cheap-model output | Opus / Fable | Read-heavy, write-light — high leverage per output token |
+| Tests / docs / polish | Unit tests against spec, KDoc, README | Sonnet / Haiku | Cheap-model territory |
+
+### 2. `model_routing` config
+
+Declare your routing once in `~/.agent-brain/config.json`:
+
+```json
+"model_routing": {
+  "plan": "fable",
+  "implement": "sonnet",
+  "review": "opus",
+  "boilerplate": "haiku",
+  "escalate": "fable"
+}
+```
+
+Every `pre_check` response then ends with one line —
+`MODEL ROUTING: plan=fable | implement=sonnet | review=opus | boilerplate=haiku | escalate=fable` —
+so whatever agent is orchestrating spawns subagents on the right tier without you re-explaining the strategy each session. Omit the key and the line disappears.
+
+### 3. Two-strikes escalation (data-driven)
+
+Repeated failed attempts on a cheap model can cost more than one clean shot on a strong one — but you don't know which problems are "strong-model problems" until the cheap model stumbles. The brain already logs every rejection, so it applies the two-strikes rule automatically:
+
+> When the **same agent** has **≥2 rejected/failed decisions** in the **same area**, `pre_check` returns:
+> `ESCALATION HINT: 'arjun' has 2 rejected/failed decisions in 'auth'. Two-strikes rule: do NOT retry on the same model tier — re-spawn this task on fable.`
+
+The escalation target comes from `model_routing.escalate` (generic wording if unset). This is per-agent — another agent entering the same area is not escalated by someone else's failures.
+
+### 4. Plan files as handoff artifacts
+
+Pay for deep thinking once, reuse it across many cheap executions. The planner writes the plan to a file and logs it:
+
+```python
+log_decision(agent="marcus", repo="my-app", area="payments",
+             action="Designed payment module architecture",
+             reasoning="...", plan_file="docs/plans/payments-plan.md")
+```
+
+Every later `pre_check` in that area surfaces it:
+
+```
+PLAN AVAILABLE: docs/plans/payments-plan.md (by marcus, 2026-06-12).
+Read it before re-deriving the approach — execute against it, don't re-plan.
+```
+
+The pointer stays active while the decision is `pending` or `accepted`; a rejected plan stops being advertised.
+
+### Cost mechanics that matter as much as model choice
+
+- **Context discipline beats model choice.** A Sonnet call with clean context beats an Opus call drowning in irrelevant files. SAN reads (~20% of raw cost) + `pre_check` (past failures only, not full history) are the brain's context discipline.
+- **The orchestrator burns its own tokens.** Spawning a Sonnet subagent from an Opus session still pays Opus rates for coordination. Cheapest pattern: cheap main session as orchestrator, escalate *via subagents* — not an expensive main session delegating down.
+- **Fewer turns > cheaper tokens.** For a genuinely complex task, a strong model finishing in fewer turns can land near mid-tier pricing. Don't be dogmatic — the two-strikes hint exists precisely to catch this case from real outcome data.
+
+Rough split to aim for: ~70% of tokens on Sonnet-tier, ~25% on Opus-tier, ~5% on Fable-tier — that 5% (architecture + final review) determines whether the output is actually good.
 
 ## Brain Protocol
 
@@ -426,13 +499,13 @@ Patterns are matched against the absolute file path. The hook fails open: an inv
 
 ## SAN Protocol
 
-Structured Associative Notation compresses code to ~10-15% of its original tokens (≈85-90% savings, [measured](#is-san-worth-it-measured-numbers)) while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.
+Structured Associative Notation compresses code to ~17-27% of its original tokens (81% saved blended, [tokenizer-measured](#is-san-worth-it-measured-numbers)) while preserving all facts. See [`san/README.md`](san/README.md) for the full spec.
 
 ```
-# Before: 80 lines, ~1200 tokens
+# Before: 80 lines, ~1,200 tokens
 class AuthServiceImpl(...) : AuthService { ... }
 
-# After: ~150 tokens
+# After: ~220 tokens
 AuthServiceImpl @svc {
   impl: AuthService iface
   deps: UserRepository + TokenProvider + RateLimiter
@@ -445,20 +518,29 @@ AuthServiceImpl @svc {
 
 ### Is SAN worth it? (measured numbers)
 
-Measured across 5 production repos (Kotlin/TS, ~1,026 source files, ~1.1M source tokens). Compression ratio varies by code style — 9-30% of original size, ~10% blended:
+Measured with **real tokenizers** (tiktoken `o200k_base` and `cl100k_base` — both agree within 0.1%) across 3 production repos: 954 source/SAN file pairs, Kotlin/Java/TS/JS, ~1.12M source tokens. Compression varies by code style — boilerplate-heavy Android code compresses to ~17%, dense backend logic to ~27%; **18.9% blended (81% saved)**:
 
 | Scenario | Raw source | Via SAN | Saved |
 |----------|----------:|--------:|------:|
-| Agent reads 1 file | ~1,080 tokens | ~100 tokens | **~980 (90%)** |
-| One task (agent explores ~10 files) | ~10,800 tokens | ~1,000 tokens | **~10k per task** |
-| Whole codebase in context (1,026 files) | ~1.1M tokens — *doesn't fit* | ~100k tokens — *fits in one window* | **~1M (91%)** |
+| Agent reads 1 file (avg) | ~1,170 tokens | ~220 tokens | **~950 (81%)** |
+| One task (agent explores ~10 files) | ~11,700 tokens | ~2,200 tokens | **~9.5k per task** |
+| Whole codebase in context (954 files) | ~1.12M tokens — *doesn't fit* | ~211k tokens — *fits in one window* | **~905k (81%)** |
+
+| Repo (style) | Files | Raw tokens | SAN tokens | Ratio |
+|--------------|------:|----------:|-----------:|------:|
+| Android app (Kotlin, boilerplate-heavy) | 651 | 853k | 142k | 16.6% |
+| Backend (Kotlin, dense logic) | 299 | 247k | 67k | 27.0% |
+| Web (TS/JS) | 4 | 15k | 2.4k | 15.7% |
+
+**Do SAN's unicode operators (`→ ⇒ ×`) waste tokens?** Not on modern tokenizers — measured: `→` = 1 token on both, and a typical SAN line costs exactly the same in unicode and ASCII form (19 vs 19 tokens). One caveat: standalone `⇒` is 1 token on o200k but 3 on the older cl100k — if you target older models, prefer the ASCII equivalents (`->`, `=>`, `xN`), which the spec allows everywhere.
 
 Savings recur on **every read by every agent**; generation cost is one-time per file (plus regeneration when the file changes):
 
 | Cost side | Amount |
 |-----------|--------|
-| Generate 1 file (Sonnet) | ~1 read of the source + ~100-150 output tokens |
-| Break-even | After **~1-2 reads** of that file via `get_san` instead of raw |
+| Generate 1 file (Sonnet) | ~1 read of the source (~1,170 input tokens) + ~220 output tokens |
+| Break-even (token count) | After **~1-2 reads** of that file via `get_san` instead of raw |
+| Break-even (dollars) | **~2-3 reads** if reader = generator price (output tokens cost ~5× input); faster when generation runs on cheap Sonnet and reads are saved on expensive models |
 
 **Use SAN when:**
 - Agents repeatedly explore the same codebase (every task re-reads files)
@@ -470,7 +552,16 @@ Savings recur on **every read by every agent**; generation cost is one-time per 
 - Files churn rapidly — stale SANs need regeneration, eroding the one-time-cost advantage
 - One-off scripts / repos agents rarely revisit (won't reach break-even)
 
-> Token counts estimated at ~4 chars/token. Run the numbers for your own repos: `du -ch` your source extensions vs your `.san/` directory after converting a sample.
+> Numbers above are tokenizer-measured (tiktoken). The live `token_savings` tracker below uses a ~4 chars/token estimate, which measured ~1.4 points *optimistic* vs the real tokenizer (17.5% vs 18.9% ratio) — close enough for tracking, but the table above is the honest benchmark. Measure your own repos:
+> ```bash
+> pip install tiktoken
+> python3 -c "
+> import tiktoken; from pathlib import Path
+> enc = tiktoken.get_encoding('o200k_base')
+> raw = sum(len(enc.encode(f.read_text(errors='replace'))) for f in Path('.').rglob('*.kt'))
+> san = sum(len(enc.encode(f.read_text(errors='replace'))) for f in Path('.san').rglob('*.san'))
+> print(f'raw={raw:,} san={san:,} ratio={san/raw:.1%}')"
+> ```
 
 ### Measuring your savings (`token_savings`)
 
@@ -485,9 +576,9 @@ You don't have to estimate — the brain **measures it live**. Every `get_san` c
 
 This session:
   SAN reads: 14
-  Raw source cost avoided: 15,120 tokens
-  SAN tokens served: 1,402 tokens
-  SAVED: 13,718 tokens (91%)
+  Raw source cost avoided: 16,380 tokens
+  SAN tokens served: 3,080 tokens
+  SAVED: 13,300 tokens (81%)
 
 Today (2026-06-11):  ...
 All time:            ...
@@ -509,7 +600,7 @@ Use it to decide whether SAN is paying off: if "All time" savings stay near zero
 
 ## SAN Setup
 
-SAN (Structured Associative Notation) compresses source code to ~10-15% of its original tokens for LLM context. This is **optional** — the decision memory works without it.
+SAN (Structured Associative Notation) compresses source code to ~17-27% of its original tokens for LLM context. This is **optional** — the decision memory works without it.
 
 1. **Create `.san/` in your repo:**
    ```bash
@@ -564,7 +655,7 @@ SAN files are **only generated by the brain-compiler agent** (LLM-powered). The 
 model: claude-sonnet-4-6   # cheap, fast, accurate enough for mechanical conversion
 ```
 
-Spend the savings where it matters: your engineering agents *consuming* SAN can run on bigger models, since SAN cuts their input cost to ~10-15% of raw anyway. Only escalate the compiler to a bigger model if you find SAN files missing relationships on gnarly, highly-dynamic code.
+Spend the savings where it matters: your engineering agents *consuming* SAN can run on bigger models, since SAN cuts their input cost to ~20% of raw anyway. Only escalate the compiler to a bigger model if you find SAN files missing relationships on gnarly, highly-dynamic code.
 
 ### Generating SAN from other platforms (ChatGPT, Cursor, etc.)
 
@@ -802,6 +893,20 @@ A flat `team` list applies to every repo — fine when one team owns everything.
 **Backwards compatible**: configs without `teams_per_repo` and no `repos` field on entries behave exactly like before.
 
 **How it's used:** brain tools that take a `repo` arg (`heartbeat`, `log_decision`, etc.) feed it through `_get_team_for_repo()` for role resolution and dashboard filtering. The `office` CLI command (`python3 brain/server.py office my-backend`) shows only that repo's agents.
+
+### Model routing (optional)
+
+```json
+"model_routing": {
+  "plan": "fable",
+  "implement": "sonnet",
+  "review": "opus",
+  "boilerplate": "haiku",
+  "escalate": "fable"
+}
+```
+
+Shown as one line in every `pre_check`; `escalate` names the tier in the two-strikes escalation hint. See [Model Routing](#model-routing-quality-per-cost).
 
 ## Customization
 

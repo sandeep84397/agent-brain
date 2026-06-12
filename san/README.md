@@ -6,10 +6,12 @@ A compression protocol for converting source code and documentation into a dense
 
 | Metric | Raw Code | SAN |
 |--------|----------|-----|
-| Tokens per file (avg) | ~1200 | ~150 |
-| Compression ratio | — | ~85% |
+| Tokens per file (avg, tokenizer-measured) | ~1,170 | ~220 |
+| Compression ratio | — | ~81% saved (17-27% of raw, varies by code style) |
 | Full repo in context | ~15% | ~100% |
 | Post-compaction recovery | Re-read all files | Query SAN brain instantly |
+
+Measured with tiktoken (`o200k_base` + `cl100k_base`, agree within 0.1%) across 954 source/SAN pairs (Kotlin/Java/TS). Unicode operators (`→ ⇒ ×`) cost the same as ASCII equivalents on modern tokenizers — a typical SAN line is 19 tokens in either form. Caveat: standalone `⇒` is 3 tokens on the older cl100k; targeting older models, prefer ASCII (`->`, `=>`, `xN`).
 
 ## Format Contract (machine-parsed — STRICT)
 

@@ -722,19 +722,42 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
             f"Pay close attention to past failures below.")
 
     exact_warnings = []
+    my_failures_here = 0
+    plan_pointer = None
     for node_id, data in G.nodes(data=True):
         if data.get("type") != "decision" or data.get("area") != area:
             continue
         if data.get("outcome") in ("rejected", "failed"):
+            if data.get("agent") == agent:
+                my_failures_here += 1
             exact_warnings.append(
                 f"- [{data.get('timestamp', '?')[:10]}] "
                 f"{data.get('agent', '?')} tried: {str(data.get('action', '?'))[:200]}\n"
                 f"  REJECTED by {data.get('outcome_by', '?')}: "
                 f"{str(data.get('outcome_reason', '?'))[:300]}")
+        if data.get("plan_file") and data.get("outcome") in ("pending", "accepted"):
+            # Most recent plan wins (nodes iterate in insertion order)
+            plan_pointer = (data.get("plan_file"), data.get("agent", "?"),
+                            data.get("timestamp", "?")[:10])
     if exact_warnings:
         sections.append(
             f"EXACT MATCHES in '{area}' ({len(exact_warnings)}):\n\n"
             + "\n\n".join(exact_warnings[-5:]))
+
+    if plan_pointer:
+        sections.append(
+            f"PLAN AVAILABLE: {plan_pointer[0]} (by {plan_pointer[1]}, {plan_pointer[2]}). "
+            f"Read it before re-deriving the approach — execute against it, don't re-plan.")
+
+    # Two-strikes escalation: this agent failed >=2 times in this area ->
+    # recommend re-spawning the work on a stronger model tier.
+    if my_failures_here >= 2:
+        routing = _load_config().get("model_routing", {})
+        escalate_to = routing.get("escalate", "a stronger model (e.g. opus or fable)")
+        sections.append(
+            f"ESCALATION HINT: '{agent}' has {my_failures_here} rejected/failed "
+            f"decisions in '{area}'. Two-strikes rule: do NOT retry on the same "
+            f"model tier — re-spawn this task on {escalate_to}.")
 
     similar = _find_similar_rejections(G, action_description, threshold=0.15)
     exact_ids = {nid for nid, d in G.nodes(data=True)
@@ -752,8 +775,16 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
             f"SIMILAR REJECTIONS across other areas ({len(similar)}):\n\n"
             + "\n\n".join(sim_lines))
 
+    routing = _load_config().get("model_routing", {})
+    routing_line = ("MODEL ROUTING: "
+                    + " | ".join(f"{phase}={model}" for phase, model in routing.items())
+                    ) if routing else ""
+
     if not sections:
-        return f"No past failures in '{area}'. Proceed with: {action_description}"
+        base = f"No past failures in '{area}'. Proceed with: {action_description}"
+        return f"{base}\n\n{routing_line}" if routing_line else base
+    if routing_line:
+        sections.append(routing_line)
 
     if level == "strict":
         scorecard = _compute_scorecard(G, agent)
@@ -771,11 +802,14 @@ def log_decision(
     agent: str, repo: str, area: str, action: str, reasoning: str,
     files_touched: Optional[list[str]] = None,
     code_symbols: Optional[list[str]] = None,
+    plan_file: Optional[str] = None,
 ) -> str:
     """
     Log a decision. Call AFTER pre_check, BEFORE doing work — required before
     code edits. area e.g. "auth"; optional files_touched paths and
-    code_symbols qualified_names link the decision to code.
+    code_symbols qualified_names link the decision to code. plan_file: path to
+    a written plan/spec — pre_check surfaces it to later agents in this area
+    so cheap executors reuse expensive planning instead of re-deriving it.
     """
     # Cap stored text — unbounded fields produced 31KB decision nodes that
     # bloat the graph file and every query/pre_check response echoing them.
@@ -789,10 +823,13 @@ def log_decision(
         if files and not resolved_symbols:
             code_nodes = _resolve_files_to_code_nodes(repo, files)
             resolved_symbols = list(set(n["qualified_name"] for n in code_nodes))
-        G.add_node(node_id, type="decision", agent=agent, repo=repo, area=area,
-                    action=action, reasoning=reasoning, files=files,
-                    code_symbols=resolved_symbols,
-                    timestamp=datetime.now().isoformat(), outcome="pending")
+        node_attrs = dict(type="decision", agent=agent, repo=repo, area=area,
+                          action=action, reasoning=reasoning, files=files,
+                          code_symbols=resolved_symbols,
+                          timestamp=datetime.now().isoformat(), outcome="pending")
+        if plan_file:
+            node_attrs["plan_file"] = _cap_text(plan_file, 500)
+        G.add_node(node_id, **node_attrs)
         for sym in resolved_symbols:
             sym_node = f"code:{sym}"
             if sym_node not in G:

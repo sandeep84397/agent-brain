@@ -1,7 +1,7 @@
 ---
 name: project-manager
 description: "Project Manager. Coordinates sprints, tracks progress, removes blockers, ensures delivery."
-model: claude-sonnet-4-6
+model: claude-haiku-4-5-20251001
 # IMPORTANT: do NOT add a `tools:` field here.
 # Claude Code subagents inherit ALL tools (including MCP) from the parent session
 # only when `tools` is omitted. Setting `tools: [Read, Write, ...]` turns it into

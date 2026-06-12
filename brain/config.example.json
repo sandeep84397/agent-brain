@@ -19,5 +19,14 @@
       {"name": "marcus", "role": "principal-engineer"},
       {"name": "arjun", "role": "backend-engineer"}
     ]
+  },
+
+  "_comment_model_routing": "Optional: phase->model map shown in every pre_check so orchestrators spawn subagents on the right tier. 'escalate' is the tier named by the two-strikes escalation hint (2+ rejections by the same agent in the same area).",
+  "model_routing": {
+    "plan": "fable",
+    "implement": "sonnet",
+    "review": "opus",
+    "boilerplate": "haiku",
+    "escalate": "fable"
   }
 }
