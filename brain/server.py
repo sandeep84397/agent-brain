@@ -2289,7 +2289,10 @@ def _san_signatures(content: str) -> str:
         elif s.startswith(("src:", "deps:")):
             out.append(line)
         elif s.startswith("fn:"):
-            out.append(re.sub(r"\s*\[.*\]\s*$", "", line))
+            # Strip impl-step blocks (" [validate → ...]") but never type
+            # annotations ("list[User]") — impl blocks always have a space
+            # before the bracket, types never do.
+            out.append(re.sub(r"\s+\[.*\]\s*$", "", line))
     return "\n".join(out)
 
 
