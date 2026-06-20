@@ -16,7 +16,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
 - [SAN Protocol](#san-protocol) — code compression: is it worth it, measuring savings (`token_savings`)
 - [SAN Setup](#san-setup) — turning SAN on, model choice, other platforms
-- [Adaptive Warnings](#adaptive-warnings) · [Web Dashboard](#web-dashboard-live-visualization) — decisions browser (live feed) + pixel-art/3D office
+- [Adaptive Warnings](#adaptive-warnings) · [Web Dashboard](#web-dashboard-live-visualization) — 3D office, decisions browser (live feed), SAN search trace
 - [Verification](#verification) · [Requirements](#requirements) · [Configuration](#configuration) · [Customization](#customization)
 
 ## What This Does
@@ -54,6 +54,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **SAN as default read path** | A soft hook nudges raw `Read` of SAN-covered code toward `get_san`; `get_san` takes absolute paths so there's no friction. Same quality, ~5-11x fewer tokens. [Details](#making-san-the-default-read-path) |
 | **Records & pruning** | Browse every decision as dated markdown; prune old/resolved ones (dry-run first, archived not deleted). Keeps the brain lean without losing the lessons. [Details](#managing-what-the-brain-remembers) |
 | **Live decisions web view** | A `/decisions` browser that streams decisions in real time as agents log them — filter by repo/area/agent/outcome, search, color-coded. [Details](#decisions-view-decisions) |
+| **SAN search trace** | A `/san` view that shows how a query finds code through SAN — index → content → block → `src:` line range, live. [Details](#san-search-trace-san) |
 
 ## Quick Start
 
@@ -205,9 +206,9 @@ From any agent/MCP client you can also ask in plain language — *"show me the t
 │  ├── _index.json                                │
 │  └── src/**/*.san                               │
 │                                                 │
-│  dashboard/           ← pixel art office UI     │
-│  ├── server.py        (python, zero deps)       │
-│  └── static/          (HTML5 Canvas + SSE)      │
+│  dashboard/           ← 3D office + decisions   │
+│  ├── server.py        (python, zero deps)       │   + SAN search (web)
+│  └── static/          (Three.js + SSE)          │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -818,14 +819,14 @@ nothing is silently filtered or silently blocked.
 
 ## Web Dashboard (Live Visualization)
 
-One local server, three views — pixel-art office, 3D office, and a **decisions browser with a real-time feed**.
+One local server, three views — a **3D office**, a **decisions browser with a real-time feed**, and a **SAN search trace**.
 
 ```bash
 python dashboard/server.py
 # Opens http://localhost:3333 in your browser
-#   /            pixel-art office
-#   /3d          3D office
+#   /            3D office (live agent activity)
 #   /decisions   browse + live-stream decisions as they're logged
+#   /san         trace how a query finds data through SAN
 ```
 
 ### Decisions view (`/decisions`)
@@ -839,23 +840,32 @@ A searchable, filterable view of every decision the brain holds — and it **upd
 
 It reads the decision graph the same way the MCP server persists it (snapshot + journal replay), as a standalone process — no extra setup, just open the page while agents work.
 
-### Pixel-art / 3D office
+### SAN search trace (`/san`)
 
-A pixel art virtual office that shows your agents working in real-time. Agents move between desks and the meeting table, show speech bubbles during discussions, and display status indicators.
+See **how the AI finds code through SAN** — type a symbol or keyword and watch the same traversal `get_san`/`query_san` runs:
+
+1. **resolve** — the repo's `.san` directory
+2. **index** — qualified-name lookup over `_index.json` (N symbols → name matches)
+3. **content** — scan of `.san` bodies for matches the name didn't catch
+4. **block** — each landing point shown with its kind, file, and `src:` line range (where to jump in the raw source)
+
+Pick a repo, type, and the pipeline + result tree update live. It's the read-only view of the index → file → block → source-line path that makes SAN ~5-11x cheaper than raw reads.
+
+### 3D office
+
+A 3D virtual office that shows your agents working in real-time. Agents sit at desks, gather at the meeting table, show speech bubbles during discussions, and display status pips.
 
 **Features:**
-- Pixel art office with desks, meeting table, whiteboard, coffee machine
-- Agents animate: idle bob, working (typing), walking, discussing (gestures)
-- Status dots: 🟢 working, 🟡 planning, 🟠 reviewing, 🔵 discussing, 🔴 blocked, ⚫ offline
+- Orbitable 3D office (drag to orbit, scroll to zoom)
+- Status pips: 🟢 working, 🟡 planning, 🟠 reviewing, 🔵 discussing, 🔴 blocked, ⚫ offline
 - Speech bubbles with actual message content
-- Chat log sidebar with all agent interactions
-- Team status panel with live agent list
+- Activity feed sidebar — **messages auto-expire after 12h** so stale chatter clears itself (run `python brain/server.py clear-activity` to wipe it now)
+- Team panel with live agent list
 
 **How it works:**
 1. Brain tools (`pre_check`, `log_decision`, etc.) auto-update agent status — **zero changes to your agents needed**
 2. For richer state (idle, messages, discussing), agents can call `heartbeat()` explicitly
 3. Dashboard reads `~/.agent-brain/office-state.json` via SSE (polls every 500ms)
-4. Canvas renders pixel art at 60fps with smooth agent movement
 
 **Auto-heartbeat** (free, no agent changes):
 | Brain Tool | Dashboard Status |

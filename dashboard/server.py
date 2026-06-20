@@ -117,6 +117,158 @@ def _load_decisions():
     return out
 
 
+import re
+from urllib.parse import urlparse, parse_qs
+
+CONFIG_FILE = BRAIN_DIR / "config.json"
+_SAN_HEADER_RE = re.compile(r"^(\S+)\s+@(\w+)\s*\{")
+_SAN_SRC_RE = re.compile(r"^\s*src:\s*(\d+)\s*-\s*(\d+)")
+
+
+def _san_repos():
+    """{repo_name: repo_path} from config.json that actually have a .san dir."""
+    out = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        for name, p in (cfg.get("repos") or {}).items():
+            if isinstance(p, str) and (Path(p) / ".san").is_dir():
+                out[name] = Path(p)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return out
+
+
+def _load_san_repos():
+    """Repo list + index size, for the SAN view's repo picker."""
+    repos = []
+    for name, root in _san_repos().items():
+        idx_file = root / ".san" / "_index.json"
+        n_symbols = n_files = 0
+        try:
+            idx = json.loads(idx_file.read_text())
+            n_symbols = len(idx)
+            n_files = len({v.get("file") for v in idx.values()
+                           if isinstance(v, dict) and v.get("file")})
+        except (json.JSONDecodeError, OSError):
+            pass
+        repos.append({"repo": name, "symbols": n_symbols, "files": n_files})
+    return {"repos": sorted(repos, key=lambda r: r["repo"])}
+
+
+def _san_block_for(san_path, keyword):
+    """Parse a .san file's blocks; return blocks whose header/body matches
+    keyword, each with its src: line range. Mirrors how get_san resolves a hit."""
+    blocks = []
+    try:
+        lines = san_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return blocks
+    cur = None
+    for ln in lines:
+        m = _SAN_HEADER_RE.match(ln)
+        if m:
+            if cur:
+                blocks.append(cur)
+            cur = {"name": m.group(1), "kind": m.group(2),
+                   "src": "", "snippet": [ln]}
+        elif cur is not None:
+            if len(cur["snippet"]) < 8:
+                cur["snippet"].append(ln)
+            sm = _SAN_SRC_RE.match(ln)
+            if sm and not cur["src"]:
+                cur["src"] = f"{sm.group(1)}-{sm.group(2)}"
+            if ln.strip() == "}":
+                blocks.append(cur)
+                cur = None
+    if cur:
+        blocks.append(cur)
+    kw = keyword.lower()
+    hits = [b for b in blocks
+            if kw in b["name"].lower() or kw in "\n".join(b["snippet"]).lower()]
+    return hits
+
+
+def _san_search(raw_path):
+    """Trace a SAN query the way query_san does: index lookup (phase 1) then
+    content scan (phase 2). Returns a structured trace for the view to render."""
+    qs = parse_qs(urlparse(raw_path).query)
+    repo = (qs.get("repo") or [""])[0]
+    keyword = (qs.get("q") or [""])[0].strip()
+    trace = {"repo": repo, "keyword": keyword, "steps": [], "results": []}
+    if not keyword:
+        return trace
+    repos = _san_repos()
+    root = repos.get(repo)
+    if not root and repos:  # fuzzy: pick first whose name contains the arg
+        for n, p in repos.items():
+            if repo.lower() in n.lower():
+                root, repo = p, n
+                break
+    if not root:
+        trace["steps"].append({"stage": "resolve", "ok": False,
+                               "detail": f"no .san for repo '{repo}'"})
+        return trace
+    san_dir = root / ".san"
+    trace["repo"] = repo
+    trace["steps"].append({"stage": "resolve", "ok": True,
+                           "detail": f"{repo} → {san_dir}"})
+
+    # Phase 1: index lookup (qualified-name match)
+    idx = {}
+    try:
+        idx = json.loads((san_dir / "_index.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    kw = keyword.lower()
+    index_hits = []
+    for qname, meta in idx.items():
+        if kw in qname.lower() and isinstance(meta, dict):
+            index_hits.append({"qname": qname, "kind": meta.get("kind", "?"),
+                               "file": meta.get("file", "?"),
+                               "tokens_san": meta.get("tokens_san", 0)})
+    trace["steps"].append({"stage": "index", "ok": True,
+                           "detail": f"{len(idx)} symbols indexed → "
+                           f"{len(index_hits)} name match(es)",
+                           "hits": index_hits[:25]})
+
+    # Phase 2: content scan of .san files (for matches the name didn't catch)
+    content_hits = []
+    seen_files = {h["file"] for h in index_hits}
+    try:
+        for sf in sorted(san_dir.rglob("*.san")):
+            if sf.name.startswith("_"):
+                continue
+            rel = str(sf.relative_to(san_dir))
+            src_rel = rel[:-4] if rel.endswith(".san") else rel
+            if src_rel in seen_files:
+                continue
+            for b in _san_block_for(sf, keyword):
+                content_hits.append({
+                    "qname": b["name"], "kind": b["kind"], "src": b["src"],
+                    "file": src_rel, "snippet": "\n".join(b["snippet"])})
+    except OSError:
+        pass
+    trace["steps"].append({"stage": "content", "ok": True,
+                           "detail": f"scanned .san bodies → "
+                           f"{len(content_hits)} extra block match(es)",
+                           "hits": content_hits[:25]})
+
+    # Final landing points: file → block → src: line range
+    for h in index_hits[:25]:
+        # enrich index hits with their src: range by reading the block
+        sp = san_dir / (h["file"] + ".san")
+        src = ""
+        if sp.exists():
+            for b in _san_block_for(sp, h["qname"]):
+                if b["name"] == h["qname"]:
+                    src = b["src"]
+                    break
+        trace["results"].append({**h, "src": src, "via": "index"})
+    for h in content_hits[:25]:
+        trace["results"].append({**h, "via": "content"})
+    return trace
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     """Serves static files + SSE endpoint for real-time updates."""
 
@@ -133,11 +285,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(load_state())
         elif path == "/api/decisions":
             self._send_json({"decisions": _load_decisions()})
+        elif path == "/api/san":
+            self._send_json(_load_san_repos())
+        elif path == "/api/san/search":
+            self._send_json(_san_search(self.path))
         elif path in ("/decisions", "/decisions/"):
             self.path = "/decisions.html"
             super().do_GET()
-        elif path in ("/3d", "/3d/"):
-            # Internal redirect to the 3D dashboard HTML
+        elif path in ("/san", "/san/"):
+            self.path = "/san.html"
+            super().do_GET()
+        elif path in ("/", "/3d", "/3d/", "/index.html"):
+            # The 3D office is the only office view now.
             self.path = "/office3d.html"
             super().do_GET()
         else:
@@ -212,9 +371,9 @@ def main():
 
     server = ThreadingHTTPServer(("", PORT), DashboardHandler)
     print(f"\n\U0001f3e2 Agent Brain Dashboard")
-    print(f"   Pixel-art view: http://localhost:{PORT}")
-    print(f"   3D view:        http://localhost:{PORT}/3d")
+    print(f"   3D office:      http://localhost:{PORT}")
     print(f"   Decisions view: http://localhost:{PORT}/decisions  (live feed)")
+    print(f"   SAN search:     http://localhost:{PORT}/san         (search trace)")
     print(f"   State file:     {STATE_FILE}")
     print(f"   Ctrl+C to stop\n")
 

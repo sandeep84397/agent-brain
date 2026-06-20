@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Brain — SAN search trace</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1d212a; --border: #272c37;
+    --text: #e6e8ec; --muted: #9aa3b0; --accent: #5b9dff; --teal: #2dd4bf;
+    --amber: #d29922; --green: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10; background: var(--panel);
+    border-bottom: 1px solid var(--border); padding: 14px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .nav { margin-left: auto; display: flex; gap: 10px; }
+  .nav a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 6px; }
+  .nav a:hover { background: var(--panel-2); color: var(--text); }
+  .nav a.active { color: var(--text); background: var(--panel-2); }
+  .controls {
+    padding: 14px 20px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  input, select {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  #q { min-width: 280px; flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .wrap { display: grid; grid-template-columns: 1fr; gap: 0; max-width: 1100px; padding: 16px 20px 60px; }
+  /* trace pipeline */
+  .pipe { display: flex; flex-direction: column; gap: 0; margin-bottom: 18px; }
+  .stage {
+    display: flex; align-items: flex-start; gap: 12px; padding: 10px 0;
+  }
+  .stage .dot {
+    width: 26px; height: 26px; flex: none; border-radius: 50%; margin-top: 1px;
+    display: grid; place-items: center; font-size: 12px; font-weight: 700;
+    background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+  }
+  .stage.ok .dot { background: rgba(45,212,191,.15); color: var(--teal); border-color: rgba(45,212,191,.4); }
+  .stage.fail .dot { background: rgba(248,81,73,.15); color: #f85149; border-color: rgba(248,81,73,.4); }
+  .stage .body { flex: 1; }
+  .stage .label { font-weight: 600; font-size: 13px; }
+  .stage .detail { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+  .connector { width: 26px; display: flex; justify-content: center; }
+  .connector .line { width: 2px; height: 14px; background: var(--border); }
+  /* result tree */
+  .results { display: flex; flex-direction: column; gap: 8px; }
+  .node {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--teal);
+    border-radius: 9px; padding: 11px 13px;
+  }
+  .node.content { border-left-color: var(--amber); }
+  .node .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .kind {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+    background: rgba(91,157,255,.15); color: var(--accent); padding: 1px 7px; border-radius: 5px;
+  }
+  .qname { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .via { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .filepath { color: var(--muted); font-size: 12px; margin-top: 3px; font-family: ui-monospace, Menlo, monospace; }
+  .src { color: var(--teal); font-size: 12px; }
+  .snippet {
+    margin-top: 7px; background: #0c0e12; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+    color: #c9d1d9; white-space: pre; overflow-x: auto;
+  }
+  .empty { padding: 50px 0; text-align: center; color: var(--muted); }
+  .legend { color: var(--muted); font-size: 12px; margin: 4px 0 14px; }
+  .legend b { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔎 SAN search trace</h1>
+  <nav class="nav">
+    <a href="/">Office</a>
+    <a href="/decisions">Decisions</a>
+    <a href="/san" class="active">SAN search</a>
+  </nav>
+</header>
+
+<div class="controls">
+  <select id="repo"><option value="">Loading repos…</option></select>
+  <input id="q" type="search" placeholder="Search a symbol or keyword (e.g. AuthService, login, repository)…" autocomplete="off">
+  <span class="hint" id="hint"></span>
+</div>
+
+<div class="wrap">
+  <div class="legend">
+    Watch how a query finds data the way <b>get_san</b> / <b>query_san</b> do:
+    <b>resolve</b> the repo's <code>.san</code> dir → <b>index</b> lookup on qualified names →
+    <b>content</b> scan of SAN bodies → land on the <b>block</b> and its <code>src:</code> line range.
+  </div>
+  <div class="pipe" id="pipe"></div>
+  <div class="results" id="results"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let DEBOUNCE = null;
+
+async function loadRepos() {
+  try {
+    const d = await (await fetch("/api/san")).json();
+    const sel = $("repo");
+    if (!d.repos.length) { sel.innerHTML = '<option value="">No .san repos found</option>'; return; }
+    sel.innerHTML = d.repos.map(r =>
+      `<option value="${esc(r.repo)}">${esc(r.repo)} — ${r.files} files, ${r.symbols} symbols</option>`).join("");
+  } catch (_) { $("repo").innerHTML = '<option value="">config error</option>'; }
+}
+
+function renderTrace(t) {
+  const pipe = $("pipe"), results = $("results");
+  if (!t.keyword) {
+    pipe.innerHTML = ""; results.innerHTML = `<div class="empty">Type a query to trace how SAN finds it.</div>`;
+    return;
+  }
+  // pipeline stages
+  const stages = t.steps.map((s, i) => `
+    ${i ? '<div class="connector"><div class="line"></div></div>' : ''}
+    <div class="stage ${s.ok ? 'ok' : 'fail'}">
+      <div class="dot">${s.ok ? '✓' : '✕'}</div>
+      <div class="body">
+        <div class="label">${esc(s.stage)}</div>
+        <div class="detail">${esc(s.detail)}</div>
+      </div>
+    </div>`).join("");
+  pipe.innerHTML = stages;
+
+  // result tree (landing points)
+  if (!t.results.length) {
+    results.innerHTML = `<div class="empty">No SAN blocks match “${esc(t.keyword)}” in ${esc(t.repo || 'this repo')}.</div>`;
+    return;
+  }
+  results.innerHTML = t.results.map(r => `
+    <div class="node ${r.via === 'content' ? 'content' : ''}">
+      <div class="top">
+        <span class="kind">${esc(r.kind)}</span>
+        <span class="qname">${esc(r.qname)}</span>
+        <span class="via">via ${esc(r.via)} lookup</span>
+      </div>
+      <div class="filepath">${esc(r.file)}${r.src ? ` · <span class="src">src: ${esc(r.src)}</span>` : ''}</div>
+      ${r.snippet ? `<div class="snippet">${esc(r.snippet)}</div>` : ''}
+    </div>`).join("");
+}
+
+async function run() {
+  const repo = $("repo").value, q = $("q").value.trim();
+  if (!q) { renderTrace({ keyword: "", steps: [], results: [] }); $("hint").textContent = ""; return; }
+  $("hint").textContent = "searching…";
+  try {
+    const t = await (await fetch(`/api/san/search?repo=${encodeURIComponent(repo)}&q=${encodeURIComponent(q)}`)).json();
+    renderTrace(t);
+    $("hint").textContent = `${t.results.length} match(es)`;
+  } catch (_) { $("hint").textContent = "error"; }
+}
+
+$("q").addEventListener("input", () => { clearTimeout(DEBOUNCE); DEBOUNCE = setTimeout(run, 220); });
+$("repo").addEventListener("change", run);
+loadRepos().then(() => renderTrace({ keyword: "", steps: [], results: [] }));
+</script>
+</body>
+</html>

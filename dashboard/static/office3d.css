@@ -99,6 +99,24 @@ canvas#office3d:active { cursor: grabbing; }
     backdrop-filter: blur(8px);
 }
 
+#view-nav {
+    display: flex;
+    gap: 6px;
+    pointer-events: auto;
+    margin-top: 2px;
+}
+#view-nav a {
+    font-size: 12px;
+    color: var(--text-faint);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.35);
+    backdrop-filter: blur(8px);
+}
+#view-nav a:hover { color: #fff; background: rgba(255,255,255,0.12); }
+#view-nav a.active { color: #fff; background: rgba(76,194,255,0.22); }
+
 /* --- Floating name tag (3D-billboarded) --- */
 
 .name-tag {

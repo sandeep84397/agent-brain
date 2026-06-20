@@ -129,11 +129,13 @@ def _load_office_state() -> dict:
 
 
 _OFFICE_AGENT_TTL_H = 48
+_OFFICE_MSG_TTL_H = 12  # Activity-feed messages older than this drop off as stale.
 
 
 def _save_office_state(state: dict) -> None:
-    """Persist office state atomically. Evicts agents idle > 48h (one-off
-    subagent names otherwise accumulate forever)."""
+    """Persist office state atomically. Evicts agents idle > 48h and drops
+    Activity-feed messages older than 12h (otherwise one-off subagent names
+    and stale chatter accumulate forever)."""
     BRAIN_DIR.mkdir(parents=True, exist_ok=True)
     agents = state.get("agents")
     if isinstance(agents, dict):
@@ -145,6 +147,17 @@ def _save_office_state(state: dict) -> None:
                     del agents[name]
             except (ValueError, TypeError, AttributeError):
                 pass
+    msgs = state.get("messages")
+    if isinstance(msgs, list):
+        msg_cutoff = datetime.now().timestamp() - _OFFICE_MSG_TTL_H * 3600
+        fresh = []
+        for m in msgs:
+            try:
+                if datetime.fromisoformat(m.get("ts", "")).timestamp() >= msg_cutoff:
+                    fresh.append(m)
+            except (ValueError, TypeError, AttributeError):
+                pass  # undated/garbage message -> drop as stale
+        state["messages"] = fresh[-50:]
     tmp = OFFICE_STATE_FILE.with_suffix(f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
     tmp.rename(OFFICE_STATE_FILE)
@@ -4110,6 +4123,15 @@ if __name__ == "__main__":
         print(export_records.fn(_repo) if hasattr(export_records, "fn")
               else export_records(_repo))
         _sys.exit(0)
+    if cmd == "clear-activity":
+        # Wipe the Activity-feed messages (stale conversations). Agents kept.
+        with OFFICE_LOCK:
+            _st = _load_office_state()
+            _n = len(_st.get("messages", []))
+            _st["messages"] = []
+            _save_office_state(_st)
+        print(f"Cleared {_n} Activity-feed message(s). Agents left intact.")
+        _sys.exit(0)
     if cmd == "prune":
         # Forget old resolved decisions. DRY-RUN unless --apply is passed.
         _repo = next((a for a in _sys.argv[2:] if not a.startswith("--")), "")
@@ -4135,7 +4157,8 @@ if __name__ == "__main__":
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
               "stats|office [repo]|savings|roadmap [repo]|records [repo]|"
-              "prune [repo] [--before-days=N] [--apply]|resolve-stale [repo] [--apply]]")
+              "prune [repo] [--before-days=N] [--apply]|resolve-stale [repo] [--apply]|"
+              "clear-activity]")
         print("  (no args)        run the MCP server")
         _sys.exit(0)
 
