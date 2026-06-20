@@ -670,6 +670,8 @@ Use it to decide whether SAN is paying off: if "All time" savings stay near zero
 
 SAN (Structured Associative Notation) compresses source code to ~17-27% of its original tokens for LLM context. This is **optional** — the decision memory works without it.
 
+**Supported languages:** the brain-compiler is language-agnostic, and the server's housekeeping (freshness, indexing, orphan cleanup) recognizes these extensions: `.kt .java .py .ts .tsx .js .jsx .swift .go .rs .rb .c .cpp .h .cs .php .scala .m .mm`. Files in other languages can still be compiled by hand, but won't be tracked by the freshness sweep until their extension is added to `SOURCE_EXTS` in `brain/server.py`.
+
 1. **Create `.san/` in your repo:**
    ```bash
    mkdir -p your-repo/.san
@@ -680,7 +682,7 @@ SAN (Structured Associative Notation) compresses source code to ~17-27% of its o
    # In Claude Code, spawn the brain-compiler agent:
    # "Convert src/services/AuthService.kt to SAN"
    ```
-   The compiler writes `your-repo/.san/src/services/AuthService.san`.
+   The compiler writes `your-repo/.san/src/services/AuthService.kt.san` (the source path with `.san` appended — mirrors the source tree).
 
 3. **Build the index:**
    ```bash
@@ -701,7 +703,7 @@ SAN (Structured Associative Notation) compresses source code to ~17-27% of its o
 | `recompile_san("repo", dry_run=True)` | Report which SANs are stale, missing, or orphaned vs source (no changes) |
 | `recompile_san("repo")` | Refresh metadata: rebuild index, clean orphans, update hashes. Does NOT generate SAN content. |
 | `query_san("repo", "keyword")` | Search SAN index + file contents by keyword |
-| `get_san("repo", "src/path/File.kt")` | Get SAN-compressed content for a source file (`max_chars` caps output) |
+| `get_san("repo", "src/path/File.kt")` | Get SAN content for a source file. `file_path` may be **relative or absolute** (repo auto-detected); `detail="sig"` for the API surface only |
 | `python3 brain/server.py san-index <repo>` | (CLI) Rebuild `_index.json` from all `.san` files |
 | `python3 brain/server.py validate-san` | (CLI) 24 self-tests: hashing, orphan cleanup, staleness, index building. Isolated temp dir. |
 
@@ -730,7 +732,7 @@ Spend the savings where it matters: your engineering agents *consuming* SAN can 
 The **MCP server is platform-agnostic** — any MCP client can call `query_san`/`get_san`/`recompile_san`. Only the brain-compiler *agent template* is Claude Code specific. SAN files themselves are plain text, so any capable LLM can generate them:
 
 1. Give the model the SAN spec ([`san/README.md`](san/README.md)) + the source file
-2. Save its output to `<repo>/.san/<source-path>.san` (mirror the source tree, swap extension to `.san`)
+2. Save its output to `<repo>/.san/<source-path>.san` — mirror the source tree and **append** `.san` to the full filename (e.g. `src/Auth.kt` → `.san/src/Auth.kt.san`)
 3. Rebuild the index: `python3 brain/server.py san-index <repo>` (or call `recompile_san("<repo>")` from any MCP client)
 
 The server's hash-based staleness tracking works identically regardless of which model wrote the file. Cheap-tier models on other platforms (e.g. GPT-4o-mini class) generally handle the conversion; verify a few files against the spec before bulk-converting.
