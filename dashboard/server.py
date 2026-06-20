@@ -188,6 +188,213 @@ def _san_block_for(san_path, keyword):
     return hits
 
 
+def _parse_san_block(lines, start_idx):
+    """Parse one SAN block starting at its header line. Returns
+    (block_dict, end_idx). Mirrors the field structure agents read from SAN:
+    header (name/kind), src, purpose, impl, deps, fn:/-fn:, @state, @errors,
+    @constraint, @threading, patterns, risk."""
+    header = _SAN_HEADER_RE.match(lines[start_idx])
+    block = {"name": header.group(1), "kind": header.group(2), "src": "",
+             "purpose": "", "impl": "", "deps": [], "fns": [], "state": "",
+             "errors": "", "constraint": "", "threading": "", "patterns": "",
+             "risk": "", "raw": [lines[start_idx]]}
+    i = start_idx + 1
+    cur_fn = None
+    while i < len(lines):
+        ln = lines[i]
+        if _SAN_HEADER_RE.match(ln):  # next block started
+            break
+        block["raw"].append(ln)
+        s = ln.strip()
+        if s == "}":
+            i += 1
+            break
+        # continuation of a fn's impl notes ([...] on the next line)
+        if cur_fn is not None and (s.startswith("[") or (s and not s.endswith(":")
+                                   and not s.startswith(("fn:", "-fn:", "@"))
+                                   and ":" not in s.split(" ")[0])):
+            cur_fn["impl"] = (cur_fn.get("impl", "") + " " + s).strip()
+            i += 1
+            continue
+        cur_fn = None
+        sm = _SAN_SRC_RE.match(ln)
+        if sm:
+            block["src"] = f"{sm.group(1)}-{sm.group(2)}"
+        elif s.startswith("purpose:"):
+            block["purpose"] = s[len("purpose:"):].strip()
+        elif s.startswith("impl:"):
+            block["impl"] = s[len("impl:"):].strip()
+        elif s.startswith("deps:"):
+            block["deps"] = [d.strip() for d in
+                             s[len("deps:"):].replace("+", ",").split(",") if d.strip()]
+        elif s.startswith("fn:") or s.startswith("-fn:"):
+            priv = s.startswith("-fn:")
+            sig = s[(4 if priv else 3):].strip()
+            cur_fn = {"sig": sig, "private": priv, "impl": ""}
+            block["fns"].append(cur_fn)
+        elif s.startswith("@state:"):
+            block["state"] = s[len("@state:"):].strip()
+        elif s.startswith("@errors:"):
+            block["errors"] = s[len("@errors:"):].strip()
+        elif s.startswith("@constraint:"):
+            block["constraint"] = s[len("@constraint:"):].strip()
+        elif s.startswith("@threading:"):
+            block["threading"] = s[len("@threading:"):].strip()
+        elif s.startswith("patterns:"):
+            block["patterns"] = s[len("patterns:"):].strip()
+        elif s.startswith("risk:"):
+            block["risk"] = s[len("risk:"):].strip()
+        i += 1
+    return block, i
+
+
+def _all_blocks(san_dir):
+    """Map every SAN block by qualified name across the repo: {name: block}."""
+    blocks = {}
+    try:
+        for sf in san_dir.rglob("*.san"):
+            if sf.name.startswith("_"):
+                continue
+            rel = str(sf.relative_to(san_dir))
+            src_rel = rel[:-4] if rel.endswith(".san") else rel
+            try:
+                lines = sf.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            i = 0
+            while i < len(lines):
+                if _SAN_HEADER_RE.match(lines[i]):
+                    b, i = _parse_san_block(lines, i)
+                    b["file"] = src_rel
+                    blocks[b["name"]] = b
+                else:
+                    i += 1
+    except OSError:
+        pass
+    return blocks
+
+
+def _short_name(qname):
+    """Last path segment of a qualified name, for matching deps to symbols."""
+    return qname.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+
+
+def _resolve_dep(dep, blocks, by_short):
+    """Resolve a dep/type token to a known SAN block name, if any. Strips
+    generics (List<User> -> User) and matches by short name."""
+    token = re.sub(r"[<>\[\](),?]", " ", dep).split()
+    for t in token:
+        t = t.strip()
+        if t in blocks:
+            return t
+        if t in by_short:
+            return by_short[t]
+    return None
+
+
+def _narrate(block, blocks):
+    """Deterministic reasoning narrative from a SAN block's own fields —
+    the same facts an agent reads. No LLM; this is SAN made explicit."""
+    name = _short_name(block["name"])
+    parts = []
+    kind_word = {"svc": "service", "repo": "repository", "iface": "interface",
+                 "model": "data model", "route": "route handler", "vm": "view-model",
+                 "usecase": "use case", "util": "utility", "config": "configuration",
+                 "fragment": "UI fragment", "activity": "activity", "module": "module",
+                 "test": "test", "fn": "function"}.get(block["kind"], block["kind"])
+    lead = f"**{name}** is a `@{block['kind']}` ({kind_word})"
+    if block["purpose"]:
+        lead += f" — {block['purpose']}"
+    parts.append(lead + ".")
+    if block["impl"]:
+        parts.append(f"Implementation: {block['impl']}.")
+    if block["deps"]:
+        named = ", ".join(f"`{d}`" for d in block["deps"])
+        parts.append(f"It depends on {named} — the collaborators it needs to do its job.")
+    pub = [f for f in block["fns"] if not f["private"]]
+    if pub:
+        parts.append(f"It exposes {len(pub)} public function(s):")
+        for f in pub[:12]:
+            line = f"  • `{f['sig']}`"
+            if f["impl"]:
+                line += f" — {f['impl'].strip('[]')}"
+            parts.append(line)
+    priv = [f for f in block["fns"] if f["private"]]
+    if priv:
+        parts.append(f"Plus {len(priv)} private helper(s): "
+                     + ", ".join(f"`{_short_name(f['sig'].split('(')[0])}`" for f in priv[:8]) + ".")
+    if block["state"]:
+        parts.append(f"State it holds: {block['state']}.")
+    if block["errors"]:
+        parts.append(f"Failure behavior: {block['errors']}.")
+    if block["constraint"]:
+        parts.append(f"Constraint: {block['constraint']}.")
+    if block["threading"]:
+        parts.append(f"Threading: {block['threading']}.")
+    if block["patterns"]:
+        parts.append(f"Patterns: {block['patterns']}.")
+    if block["risk"]:
+        parts.append(f"Risk: {block['risk']}.")
+    parts.append(f"All of the above comes straight from the SAN block (`src: {block['src']}` "
+                 f"in `{block.get('file','?')}`) — this is what the agent reads instead of the raw file.")
+    return "\n".join(parts)
+
+
+def _symbol_tree(qname, blocks, by_short, depth=0, seen=None):
+    """Build the expandable understanding tree for a symbol, following deps
+    across files up to a small depth. Each node IS the SAN-derived view."""
+    if seen is None:
+        seen = set()
+    block = blocks.get(qname)
+    if not block or qname in seen or depth > 2:
+        return None
+    seen.add(qname)
+    node = {
+        "name": qname, "short": _short_name(qname), "kind": block["kind"],
+        "file": block.get("file", ""), "src": block["src"],
+        "purpose": block["purpose"],
+        "fns": [{"sig": f["sig"], "private": f["private"], "impl": f["impl"]}
+                for f in block["fns"]],
+        "state": block["state"], "errors": block["errors"],
+        "constraint": block["constraint"], "deps": [],
+    }
+    for dep in block["deps"]:
+        resolved = _resolve_dep(dep, blocks, by_short)
+        child = _symbol_tree(resolved, blocks, by_short, depth + 1, seen) if resolved else None
+        node["deps"].append({"label": dep, "resolved": bool(child), "child": child})
+    return node
+
+
+def _san_symbol(raw_path):
+    """Full understanding view for one symbol: SAN-derived tree + narrative."""
+    qs = parse_qs(urlparse(raw_path).query)
+    repo = (qs.get("repo") or [""])[0]
+    name = (qs.get("name") or [""])[0]
+    out = {"repo": repo, "name": name, "tree": None, "narrative": "", "raw": ""}
+    repos = _san_repos()
+    root = repos.get(repo)
+    if not root and repos:
+        for n, p in repos.items():
+            if repo.lower() in n.lower():
+                root, repo = p, n
+                break
+    if not root:
+        return out
+    blocks = _all_blocks(root / ".san")
+    by_short = {}
+    for qn in blocks:
+        by_short.setdefault(_short_name(qn), qn)
+    # resolve name -> qualified name (exact, then short-name)
+    qname = name if name in blocks else by_short.get(_short_name(name))
+    if not qname:
+        return out
+    out["name"] = qname
+    out["tree"] = _symbol_tree(qname, blocks, by_short)
+    out["narrative"] = _narrate(blocks[qname], blocks)
+    out["raw"] = "\n".join(blocks[qname]["raw"])
+    return out
+
+
 def _san_search(raw_path):
     """Trace a SAN query the way query_san does: index lookup (phase 1) then
     content scan (phase 2). Returns a structured trace for the view to render."""
@@ -289,6 +496,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(_load_san_repos())
         elif path == "/api/san/search":
             self._send_json(_san_search(self.path))
+        elif path == "/api/san/symbol":
+            self._send_json(_san_symbol(self.path))
         elif path in ("/decisions", "/decisions/"):
             self.path = "/decisions.html"
             super().do_GET()
