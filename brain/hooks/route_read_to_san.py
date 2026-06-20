@@ -34,11 +34,12 @@ from pathlib import Path
 BRAIN_DIR = Path(os.environ.get("AGENT_BRAIN_DIR", str(Path.home() / ".agent-brain")))
 CONFIG_FILE = BRAIN_DIR / "config.json"
 
-# MUST match server.py's SOURCE_EXTS exactly (line ~1808). The SAN compiler
-# only indexes these — nudging toward an ext it doesn't compile would point at
-# a non-existent .san. Keep in sync by hand on any change there.
+# MUST match server.py's SOURCE_EXTS exactly (the single source of truth there).
+# The compiler is language-agnostic, so this is the full set. Keep in sync by
+# hand on any change — a drift only means a missed nudge, never a wrong block.
 SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
-               ".swift", ".go", ".rs")
+               ".swift", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
+               ".php", ".scala", ".m", ".mm")
 SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
 DEDUPE_TTL_S = 30 * 60       # fallback marker lifetime when session_id is absent
 MARKER_CLEANUP_AGE_S = 24 * 60 * 60

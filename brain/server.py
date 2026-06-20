@@ -943,10 +943,9 @@ def decisions_for(target: str, repo: str = "", outcome: str = "", limit: int = 1
     extension means file path, else qualified_name). Optional repo/outcome
     filters; limit caps results (default 10).
     """
-    _SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
-                    ".swift", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
-                    ".php", ".scala", ".m", ".mm")
-    looks_like_file = "/" in target or target.lower().endswith(_SOURCE_EXTS)
+    # Use the global SOURCE_EXTS (single source of truth) so file-path detection
+    # never drifts from generation/freshness/orphan logic.
+    looks_like_file = "/" in target or target.lower().endswith(SOURCE_EXTS)
     if looks_like_file:
         return _decisions_for_file(target, repo, limit)
     return _decisions_for_code(target, repo, outcome, limit)
@@ -1805,8 +1804,14 @@ _SAN_SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pod
 # One extension list for ALL SAN code paths (index build, freshness, orphan
 # cleanup). Divergent lists previously made non-JVM repos report wrong
 # stale/missing counts and risked deleting valid SAN files as "orphans".
+# The single source of truth for "what counts as a source file" across SAN
+# generation, freshness sweeps, orphan cleanup, and decisions_for path-detection.
+# The brain-compiler is language-agnostic, so this is the full set it handles —
+# keep it complete: a missing ext silently breaks stale-detection AND can delete
+# valid SANs for that language as orphans.
 SOURCE_EXTS = (".kt", ".java", ".py", ".ts", ".tsx", ".js", ".jsx",
-               ".swift", ".go", ".rs")
+               ".swift", ".go", ".rs", ".rb", ".c", ".cpp", ".h", ".cs",
+               ".php", ".scala", ".m", ".mm")
 
 # Freshness sweeps stat every indexed file + rglob the .san tree — too heavy
 # to repeat per get_san/query_san call. Debounce per repo.
@@ -3480,6 +3485,41 @@ def validate_brain() -> str:
               "instead of raw Read" in (get_san.__doc__ or "")[:200])
         _test("san8: query_san docstring leads with 'instead of grep'",
               "instead of grepping" in (query_san.__doc__ or "")[:120])
+
+        # --- SOURCE_EXTS single-source-of-truth (no drift -> no wrong orphan delete) ---
+        # decisions_for must use the SAME ext set the orphan/freshness sweep uses,
+        # else it accepts files those sweeps skip (silent staleness / deletion).
+        _test("exts: extended languages present in global SOURCE_EXTS",
+              all(e in SOURCE_EXTS for e in (".rb", ".cs", ".cpp", ".scala", ".php")),
+              f"got: {SOURCE_EXTS}")
+        # decisions_for now references the global set directly (no private copy).
+        import inspect as _inspect
+        _df_src = _inspect.getsource(decisions_for)
+        _test("exts: decisions_for uses global SOURCE_EXTS (no private _SOURCE_EXTS copy)",
+              "_SOURCE_EXTS = (" not in _df_src and "endswith(SOURCE_EXTS)" in _df_src)
+        # decisions_for path-detection treats an extended-language file as a path
+        # (routes to _decisions_for_file, not _decisions_for_code).
+        _test("exts: .rb classified as file path",
+              "x/User.rb".lower().endswith(SOURCE_EXTS))
+        # Orphan-safety: a fresh legacy-form .san for an extended-language source
+        # whose source EXISTS must NOT be flagged orphan (was deletable before).
+        orphan_repo = tmp_root / "rb-proj"
+        (orphan_repo / ".san").mkdir(parents=True)
+        (orphan_repo / "user.rb").write_text("class User; end")
+        (orphan_repo / ".san" / "user.san").write_text("User @model {\n  src: 1-1\n}")
+        _orphans = []
+        for _sf in (orphan_repo / ".san").rglob("*.san"):
+            _rel = str(_sf.relative_to(orphan_repo / ".san"))
+            _srel = str(Path(_rel).with_suffix(""))
+            for _e in SOURCE_EXTS:
+                _cand = (orphan_repo / (_srel + _e)) if not _srel.endswith(_e) else (orphan_repo / _srel)
+                if _cand.exists():
+                    break
+            else:
+                if not (orphan_repo / _srel).exists():
+                    _orphans.append(_sf)
+        _test("exts: legacy .san for existing .rb source not flagged orphan",
+              len(_orphans) == 0, f"wrongly orphaned: {_orphans}")
 
      except Exception as e:
         import traceback
