@@ -280,10 +280,11 @@ SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOKS_DIR="$SCRIPT_DIR/brain/hooks"
 PYBIN="$BRAIN_DIR/.venv/bin/python"
 
-# Idempotent JSON merge — adds three hooks without clobbering existing ones:
+# Idempotent JSON merge — adds four hooks without clobbering existing ones:
 #   PreToolUse  Edit|Write  -> enforce_brain_protocol.py   (gate code edits)
 #   SessionStart startup|resume|compact -> inject_brain_context.py  (amnesia fix)
 #   PreToolUse  Workflow    -> remind_brain_before_research.py (soft research nudge)
+#   PreToolUse  Read        -> route_read_to_san.py        (soft Read->SAN nudge)
 "$PYBIN" - "$SETTINGS_FILE" "$HOOKS_DIR" "$PYBIN" <<'PYEOF'
 import json, sys
 from pathlib import Path
@@ -320,6 +321,7 @@ def add(event, matcher, script, timeout):
 add("PreToolUse", "Edit|Write", "enforce_brain_protocol.py", 5000)
 add("SessionStart", "startup|resume|compact", "inject_brain_context.py", 15000)
 add("PreToolUse", "Workflow", "remind_brain_before_research.py", 10000)
+add("PreToolUse", "Read", "route_read_to_san.py", 5000)
 
 if settings_path.exists():
     settings_path.with_suffix(".json.bak").write_text(settings_path.read_text())

@@ -46,8 +46,10 @@ Canonical agent names and roles for this repo. Names should match `~/.agent-brai
 
 ## Code Exploration
 
-- Use `code-review-graph` MCP tools (`query_graph`, `semantic_search_nodes`, `get_impact_radius`) before falling back to `Grep`/`Glob`/`Read`.
-- The graph is auto-rebuilt on file changes via project hooks (see `.claude/settings.local.json`).
+- Use `code-review-graph` MCP tools (`query_graph`, `semantic_search_nodes`, `get_impact_radius`) before falling back to `Grep`/`Glob`/`Read`. (Graph = structure/relationships.)
+- To **READ/EXPLORE** existing code, use `get_san` (`detail="sig"` for "what exists", `"full"` for impl) BEFORE raw `Read`. SAN gives the same structure — signatures, deps, error handling — at ~5-11x fewer tokens. Raw `Read` only for files you're about to **EDIT** (need exact bytes), non-code files, or when no `.san` exists. (SAN = reading file contents; complements the graph, doesn't replace it.)
+- `get_san` accepts an absolute path, so you can pass the same path you got from a grep/glob hit — no repo-name lookup needed.
+- The graph and `.san` briefs are auto-maintained on file changes via project hooks (see `.claude/settings.local.json`).
 
 ## Workflow
 

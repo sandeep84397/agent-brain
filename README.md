@@ -51,6 +51,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Enforcement Hook** | Code edits are blocked until the agent logs a decision — memory actually gets populated. |
 | **Survives compaction** | SessionStart hook re-injects the pending roadmap after `/compact` so the agent resumes instead of re-researching. [Details](#surviving-compaction-the-amnesia-fix) |
 | **Relevance search** | `query_decisions(query="…")` ranks by topic relevance, not just recency; `get_roadmap` returns open work in one call. |
+| **SAN as default read path** | A soft hook nudges raw `Read` of SAN-covered code toward `get_san`; `get_san` takes absolute paths so there's no friction. Same quality, ~5-11x fewer tokens. [Details](#making-san-the-default-read-path) |
 
 ## Quick Start
 
@@ -227,7 +228,7 @@ The brain is built to stay fast as the decision history grows into thousands of 
 ### Core (every agent uses these)
 | Tool | Purpose |
 |------|---------|
-| `pre_check` | Past failures before starting work + plan pointers, escalation hints, model routing |
+| `pre_check` | Past failures before starting work + plan pointers, escalation hints, model routing, SAN coverage (pass `repo=`) |
 | `log_decision` | Record what you decided and why; optional `plan_file` links a written plan |
 | `log_outcome` | Record accepted/rejected/failed after review |
 | `log_feedback` | Reviewers log feedback on decisions |
@@ -266,8 +267,8 @@ The brain is built to stay fast as the decision history grows into thousands of 
 | Tool | Purpose |
 |------|---------|
 | `recompile_san` | Refresh SAN metadata: rebuild index, clean orphans, update hashes. `dry_run=True` for a freshness report only. Does NOT generate content. |
-| `query_san` | Search SAN files by keyword (index + content) |
-| `get_san` | Get SAN-compressed content for a source file (`max_chars` caps output; `detail="sig"` returns just the public API surface — ~2x cheaper than full, ~11x cheaper than raw) |
+| `query_san` | **Find code instead of grepping raw source** — keyword search over index + content, far fewer tokens |
+| `get_san` | **Read code instead of raw `Read`** — same structure, ~5x fewer tokens (`detail="full"`) / ~11x (`detail="sig"`). `file_path` may be **relative or absolute** (repo auto-detected); `max_chars` caps output |
 | `token_savings` | Tokens saved by SAN this session / today / all-time — number + % |
 
 ### Admin (CLI only — not exposed via MCP)
@@ -535,6 +536,21 @@ This is the same digest `get_roadmap` returns, so push (hook) and pull (tool) ne
   }
 }
 ```
+
+### Making SAN the default read path
+
+SAN is far cheaper for reading code (see [Is SAN worth it?](#is-san-worth-it-measured-numbers)) — but agents kept defaulting to raw `Read` because nothing routed them to it. The same discoverability gap as the amnesia problem. Four ergonomic changes fix it (none touch the SAN format or quality):
+
+| Change | Effect |
+|--------|--------|
+| **`get_san` accepts absolute paths** | Pass the exact path you got from a grep/glob hit — no repo-name + relative-path lookup. The repo is auto-detected (`repo` arg becomes optional). This was the decisive friction tax. |
+| **`route_read_to_san.py` (PreToolUse `Read`)** | Soft, non-blocking: a raw `Read` of a code file that has a **fresh** `.san` gets a one-line nudge to use `get_san` instead — then the Read proceeds. One nudge per session (deduped). Stays silent for non-code, stale/missing `.san`, or files outside any configured repo. **Never blocks** — raw `Read` is correct for files you're about to edit. |
+| **`pre_check(repo=...)` surfaces coverage** | When given a repo, `pre_check` appends `SAN AVAILABLE: repo 'X' has N files compiled. Read code with get_san…` so the read path is in view at "check before work" time. |
+| **Standing directive** | The [project context template](agents/PROJECT_CONTEXT_TEMPLATE.md) and the SessionStart digest both carry: *"To READ/EXPLORE existing code, use `get_san` BEFORE raw `Read`."* Co-located with the code-review-graph "graph-first" rule that agents already honor. |
+
+**When raw `Read` stays correct** (the hook stays silent for all of these): files you're about to **edit** (need exact bytes), non-code files, files with no or stale `.san`, and anything outside a configured repo. SAN is for *exploring*; raw Read is for *editing*.
+
+Wire-up: `setup.sh` registers the `Read` hook alongside the others. Existing projects need the standing-directive bullet re-copied into their `CLAUDE.md` (or hand-added) since the template only seeds new projects.
 
 ## SAN Protocol
 

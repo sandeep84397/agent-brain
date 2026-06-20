@@ -1,6 +1,8 @@
-# Agent-Brain Amnesia Fix — Design Brief
+# Agent-Brain Amnesia + SAN-Adoption Fix — Design Brief
 
 > **Purpose:** Hand-off context for a separate work session to implement the fix. This document is DESIGN + GROUNDING ONLY — no code was changed in the session that produced it. Read this, then brainstorm→spec→plan→build the fix in the implementing window.
+>
+> **Two related problems, same root cause** (a capability exists but nothing makes the AI default to it): (1) **post-compaction amnesia / brain-not-consulted** (§1–§6), and (2) **SAN goes unused even though it's far cheaper** (§8). Both are discoverability/routing/ergonomics gaps, NOT quality gaps. The user's priority is QUALITY, not token-minimisation — but SAN delivers the SAME quality for code-reading at a fraction of the tokens, so not using it is pure waste with no quality upside.
 
 > **Author context:** Written by Claude (Opus 4.8) after personally hitting the failure this fixes — in a OneOnOneArena session, I jumped to an expensive fan-out research workflow to re-derive a pending roadmap that the brain already held, because (a) I didn't query the brain first, and (b) when I *did* query, `query_decisions` returned the wrong (recency-ordered) results. The brain's whole purpose — "have all context ready so you don't re-research" — failed at both the behavioral and structural level.
 
@@ -107,6 +109,40 @@ The exact decision that should have been surfaced (and wasn't): **`dec_20260620_
 ---
 
 ## 7. Out of scope (explicitly)
-- No changes to the code-review-graph / SAN subsystem.
+- No changes to the SAN *compiler / format* itself (the .san generation is fine). §8 changes only how SAN is SURFACED/ROUTED to the AI — descriptions, hooks, guidance. The code-review-graph subsystem is untouched.
 - No changes to OneOnOneArena (this is an agent-brain fix).
 - The OneOnOneArena KMP foundation work is PAUSED, roadmap safely logged at `dec_20260620_110850_abede5`; resume after the brain fix.
+
+---
+
+## 8. SAN Adoption — why SAN goes unused, and how to fix it
+
+**The problem (user-reported, confirmed):** SAN (`get_san`/`query_san`) produces high-quality, far-cheaper code briefs (`detail="sig"` is "~2x cheaper than full, ~11x cheaper than raw" per the get_san docstring), yet the AI keeps using raw `Read`/`Grep`. The user is explicit: **quality over tokens — but where SAN gives the SAME quality cheaper, choosing raw Read is pure waste.** This is the SAME root cause as the brain miss: the capability exists, nothing makes it the default path.
+
+### Why the AI doesn't choose SAN (4 verified causes)
+
+1. **The cost advantage is buried, not headlined.** `get_san`'s tool description (`server.py:2419`) mentions cheapness only as a sub-clause of the `detail="sig"` arg. There is **no "use `get_san` INSTEAD OF Read to explore code"** directive anywhere the AI sees by default. Contrast: the code-review-graph CLAUDE.md says "ALWAYS use graph tools BEFORE Grep/Read" — and the AI *does* follow that one. SAN has no equivalent standing directive.
+2. **Higher call-site friction than Read.** `get_san(repo, file_path)` requires knowing the brain repo *name* + a *relative* path. `Read` takes the absolute path the AI already has from a grep/glob result. Under any pressure the AI defaults to the lower-friction tool. This ergonomic tax is decisive.
+3. **No Read→SAN routing.** A PreToolUse hook gates Edit/Write (forcing log_decision), but **nothing intercepts `Read`** to say "a SAN brief exists for this file — prefer it." The brain knows SAN coverage; it never tells the AI at the moment of a raw Read.
+4. **The "instead of read" intent lives in one internal string** (`server.py:1789`) — never surfaced as consumable guidance.
+
+### Fix — make SAN the default path for code-READING (not editing)
+
+(Mirror the brain fix: reduce friction + add routing + headline the guidance. SAN is for *reading/exploring*; raw Read stays correct for files you're about to edit or for non-code.)
+
+1. **Headline the directive where the AI reads it.** Add to the project CLAUDE.md (and the SessionStart digest from §3a) a standing rule, phrased like the graph one: *"To READ/EXPLORE existing code, use `get_san` (sig for 'what exists', full for impl) BEFORE raw Read. Raw Read only for files you're about to EDIT, non-code files, or when no .san exists."* The graph precedent proves the AI honors this phrasing.
+2. **Cut call-site friction.** Options (pick in design):
+   - Accept an **absolute path** in `get_san` and resolve repo+relative internally (so the AI can pass the same path it got from grep, no repo-name lookup). Biggest friction win.
+   - Add a **`san_read(path)`** convenience tool that takes just an absolute path and auto-resolves repo + relative + freshness.
+3. **Read→SAN routing hook (PreToolUse on `Read`).** Soft, non-blocking: when the AI calls raw `Read` on a code file that HAS a fresh `.san`, the hook emits a stderr nudge — *"A SAN brief exists for this file (~Nx cheaper, same structure). Prefer `get_san`/`san_read`. Proceeding with raw Read."* Fail-open, allow the Read (don't block — sometimes raw is genuinely needed). Same marker/skip-glob discipline as `enforce_brain_protocol.py`. Consider a per-session "already nudged for this file" dedupe to avoid spam.
+4. **Surface SAN coverage in `pre_check`.** When `pre_check(agent, area, ...)` runs, include a line: *"SAN available for repo X (N files compiled). Use get_san to read code."* So at "check before doing work" time, the AI is reminded SAN is the read path.
+5. **Make the decision rule explicit in tool descriptions.** Rewrite `get_san`/`query_san` docstrings to LEAD with "Use this to read/explore code instead of raw Read — same quality, ~Nx fewer tokens" rather than burying it.
+
+### What stays raw-Read (don't over-route)
+- Files about to be Edited (need exact bytes for the edit).
+- Non-code files (md/json/yaml/config).
+- Files with no/stale `.san`.
+- When the AI explicitly needs literal formatting/whitespace SAN abstracts away.
+
+### Acceptance test
+In a OneOnOneArena session, exploring a Kotlin file the AI hasn't seen (e.g. `HomeViewModel.kt`) should go through `get_san`/`san_read` by default; a raw `Read` of a SAN-covered code file should trigger the soft nudge. `token_savings` should show SAN serving the bulk of code-reads. Quality of the resulting understanding must match raw-read (SAN sig/full carries signatures, deps, structure — verify on a real review task).

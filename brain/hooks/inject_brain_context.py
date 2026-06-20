@@ -75,9 +75,20 @@ def main() -> None:
     except (subprocess.TimeoutExpired, OSError):
         sys.exit(0)
 
+    # Standing directive — injected EVERY session/compact, even with no open
+    # work, so the SAN read-path default is always in view.
+    san_directive = (
+        "[agent-brain] To READ/EXPLORE existing code, use get_san "
+        "(detail='sig' for what exists, 'full' for impl) BEFORE raw Read — "
+        "same structure, ~5-11x fewer tokens. Raw Read only for files you're "
+        "about to EDIT, non-code files, or when no .san exists."
+    )
+
     digest = (proc.stdout or "").strip()
-    if not digest or digest.startswith("No open work"):
-        sys.exit(0)  # nothing pending — don't add noise
+    has_work = bool(digest) and not digest.startswith("No open work")
+
+    if not has_work:
+        _emit(san_directive)  # no roadmap, but still steer reads through SAN
 
     # Trim to `limit` body lines (header + N items). The server already caps
     # at 15; this lets non-compact sessions stay lighter.
@@ -101,7 +112,7 @@ def main() -> None:
             "before starting; use get_roadmap / query_decisions for detail."
         )
 
-    _emit(f"{preamble}\n\n{body}")
+    _emit(f"{preamble}\n\n{body}\n\n{san_directive}")
 
 
 if __name__ == "__main__":

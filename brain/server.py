@@ -730,16 +730,21 @@ def _adaptive_warning_level(G: nx.DiGraph, agent: str, area: str) -> str:
 
 
 @mcp.tool()
-def pre_check(agent: str, area: str, action_description: str) -> str:
+def pre_check(agent: str, area: str, action_description: str,
+              repo: str = "") -> str:
     """
     CHECK BEFORE DOING WORK. Returns past failures in this area, similar
     rejections elsewhere, and adaptive warnings from this agent's history.
+
+    repo: optional repo name; when given, also surfaces SAN coverage so you
+        read code with get_san (sig/full) instead of raw Read.
     """
     _auto_heartbeat(agent, "planning", action_description)
     _write_query_marker()
     with LOCK:
         G = _load_graph()
     sections = []
+    san_line = _san_coverage_line(repo) if repo else ""
     level = _adaptive_warning_level(G, agent, area)
     if level == "strict":
         sections.append(
@@ -813,7 +818,10 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
 
     if not sections:
         base = f"No past failures in '{area}'. Proceed with: {action_description}"
-        return f"{base}\n\n{routing_line}" if routing_line else base
+        tail = "\n\n".join(x for x in (san_line, routing_line) if x)
+        return f"{base}\n\n{tail}" if tail else base
+    if san_line:
+        sections.append(san_line)
     if routing_line:
         sections.append(routing_line)
 
@@ -1824,6 +1832,31 @@ def _resolve_repo_path(repo: str) -> Optional[Path]:
     return repo_path
 
 
+def _resolve_absolute_path(abs_path: str) -> tuple[Optional[str], Optional[Path]]:
+    """Inverse of _resolve_repo_path: given an absolute source path, find which
+    configured repo contains it. Returns (repo_name, repo_root) or (None, None).
+
+    Longest-root match so a nested repo wins over its parent; realpath-normalized
+    so symlinks don't cause a valid path to silently miss.
+    """
+    try:
+        target = os.path.realpath(abs_path)
+    except (OSError, ValueError):
+        return (None, None)
+    best: tuple[Optional[str], Optional[Path]] = (None, None)
+    best_len = -1
+    for name, root in _get_repo_paths().items():
+        try:
+            root_real = os.path.realpath(str(root))
+        except (OSError, ValueError):
+            continue
+        if target == root_real or target.startswith(root_real + os.sep):
+            if len(root_real) > best_len:
+                best_len = len(root_real)
+                best = (name, root)
+    return best
+
+
 def _load_san_hashes(san_dir: Path) -> dict:
     """Load source content hashes from .san_hashes.json."""
     hash_file = san_dir / ".san_hashes.json"
@@ -2117,6 +2150,29 @@ def _load_san_index(san_dir: Path) -> dict:
     return {}
 
 
+def _san_coverage_line(repo: str) -> str:
+    """One-line SAN coverage nudge for pre_check. Empty string if no coverage.
+
+    Counts UNIQUE source files (the index maps many symbols per file), so the
+    number means 'files you can read via SAN', not raw entry count.
+    """
+    try:
+        san_dir = _get_san_dir(repo)
+        if not san_dir:
+            return ""
+        index = _load_san_index(san_dir)
+        files = {e.get("file") for e in index.values()
+                 if isinstance(e, dict) and e.get("file")}
+        n = len(files)
+        if n <= 0:
+            return ""
+        return (f"SAN AVAILABLE: repo '{repo}' has {n} files compiled. "
+                f"Read code with get_san (detail='sig' for what exists, 'full' "
+                f"for impl) instead of raw Read — same structure, far fewer tokens.")
+    except Exception:
+        return ""  # coverage hint must never break pre_check
+
+
 def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
     """
     Convert a source file relative path to its .san counterpart.
@@ -2296,7 +2352,9 @@ def recompile_san(repo: str, dry_run: bool = False) -> str:
 @mcp.tool()
 def query_san(repo: str, keyword: str, max_results: int = 10) -> str:
     """
-    Search SAN files by keyword. Searches both the index and .san file contents.
+    Find code via SAN instead of grepping raw source — same hits, far fewer
+    tokens. Use BEFORE Grep/Glob over a configured repo. Searches both the
+    index and .san file contents by keyword (function/class name, pattern).
 
     Args:
         repo: Repository name from config.json
@@ -2420,17 +2478,43 @@ def _san_signatures(content: str) -> str:
 def get_san(repo: str, file_path: str, max_chars: int = 4000,
             detail: str = "full") -> str:
     """
-    Get the SAN-compressed content for a source file.
+    READ existing code via SAN instead of raw Read — same structure (signatures,
+    deps, error handling, constraints), far fewer tokens: ~5x cheaper than raw
+    for the full brief, ~11x cheaper with detail="sig". Use this BEFORE Read for
+    any code file you are EXPLORING. Raw Read stays correct for files you're
+    about to EDIT (need exact bytes), non-code files, or when no .san exists.
 
     Args:
-        repo: Repository name from config.json
-        file_path: Source file path relative to repo root (e.g. "src/.../Auth.kt")
+        repo: Repository name from config.json. Optional when file_path is
+            absolute — the repo is auto-detected from the path (and this arg is
+            then ignored).
+        file_path: Source file path — either repo-relative (e.g. "src/.../Auth.kt")
+            OR an absolute path (e.g. the one you got from grep/glob); when
+            absolute, repo + relative are resolved for you.
         max_chars: Truncate content above this size (default 4000; raise to read more)
         detail: "full" (default) for the complete SAN brief, or "sig" for the
             public API surface only — block headers, src ranges, deps, and
             public function signatures with impl detail stripped (~2x cheaper
             than full, ~11x cheaper than raw; use for "what exists here?")
     """
+    # Absolute path: auto-detect repo + relative remainder (cuts call-site
+    # friction — the agent passes the same path it got from grep/glob).
+    if os.path.isabs(file_path):
+        resolved_name, resolved_root = _resolve_absolute_path(file_path)
+        if not resolved_name:
+            return (f"'{file_path}' is not under any repo in config.json. "
+                    f"Add the repo, or pass repo + a relative path.")
+        repo = resolved_name
+        try:
+            file_path = os.path.relpath(os.path.realpath(file_path),
+                                        os.path.realpath(str(resolved_root)))
+        except (OSError, ValueError):
+            return f"Could not resolve '{file_path}' within repo '{repo}'."
+        # Abs path == repo root -> relpath returns "." which is not a file.
+        if file_path == "." or file_path.startswith(".."):
+            return (f"'{repo}' resolves to the repo root, not a source file. "
+                    f"Pass a path to a specific code file.")
+
     # Check SAN freshness before reading
     _ensure_san_fresh(repo)
 
@@ -3334,6 +3418,68 @@ def validate_brain() -> str:
 
         # Query marker is written by read tools (satisfies optional hard gate).
         _test("amnesia: query marker written", QUERY_MARKER_FILE.exists())
+
+        # --- §8 SAN adoption: absolute-path get_san, coverage, lead docstrings ---
+        import os as _os
+        san_repo = tmp_root / "san-proj"
+        (san_repo / ".san" / "src").mkdir(parents=True)
+        (san_repo / "src").mkdir(exist_ok=True)
+        src_kt = san_repo / "src" / "Auth.kt"
+        san_kt = san_repo / ".san" / "src" / "Auth.kt.san"
+        src_kt.write_text("class Auth { fun login() {} }")
+        san_kt.write_text("com.app.Auth @svc {\n  src: 1-9\n  deps: UserRepo\n"
+                          "  fn:login(email) -> Result [validate -> issue]\n}")
+        # Index so coverage counts unique files.
+        (san_repo / ".san" / "_index.json").write_text(json.dumps({
+            "com.app.Auth": {"kind": "svc", "file": "src/Auth.kt", "tokens_san": 40},
+        }))
+        # Register the repo in temp config so resolution finds it.
+        CONFIG_FILE.write_text(json.dumps({"repos": {"san-proj": str(san_repo)},
+                                           "team": []}))
+        _GRAPH_CACHE  # (no-op ref; config read is uncached)
+
+        # _resolve_absolute_path: inside -> (name, root); outside -> (None, None)
+        name, root = _resolve_absolute_path(str(src_kt))
+        _test("san8: resolve_absolute finds repo", name == "san-proj" and root is not None)
+        n2, _ = _resolve_absolute_path("/tmp/definitely/outside/Foo.kt")
+        _test("san8: resolve_absolute returns None outside repos", n2 is None)
+
+        # get_san with an ABSOLUTE path (repo auto-detected, repo arg empty).
+        r = get_san(repo="", file_path=str(src_kt), detail="sig")
+        _test("san8: get_san accepts absolute path", "com.app.Auth @svc" in r,
+              f"got: {r[:150]}")
+        # sig strips impl block but keeps signature.
+        _test("san8: get_san sig strips impl, keeps fn",
+              "fn:login(email)" in r and "[validate" not in r, f"got: {r[:200]}")
+        # absolute path outside any repo -> clear message, no crash.
+        r = get_san(repo="", file_path="/tmp/nope/Foo.kt")
+        _test("san8: get_san abs outside repo -> clear msg",
+              "not under any repo" in r, f"got: {r[:120]}")
+        # absolute path == repo ROOT -> clear msg, not a crash/fuzzy-match storm.
+        r = get_san(repo="", file_path=str(san_repo))
+        _test("san8: get_san abs==repo root -> clear msg, no crash",
+              "repo root" in r and "Multiple SAN matches" not in r, f"got: {r[:140]}")
+        # relative-path path still works (regression).
+        r = get_san(repo="san-proj", file_path="src/Auth.kt")
+        _test("san8: get_san relative path unchanged", "com.app.Auth @svc" in r)
+
+        # _san_coverage_line counts UNIQUE files (1 here), not index entries.
+        cov = _san_coverage_line("san-proj")
+        _test("san8: coverage line counts unique files",
+              "SAN AVAILABLE" in cov and "1 files compiled" in cov, f"got: {cov}")
+        _test("san8: coverage empty for unknown repo", _san_coverage_line("nope") == "")
+
+        # pre_check with repo surfaces SAN coverage; without repo stays clean.
+        r = pre_check("dev", "auth", "explore auth code", repo="san-proj")
+        _test("san8: pre_check(repo) surfaces SAN coverage", "SAN AVAILABLE" in r)
+        r = pre_check("dev", "auth", "explore auth code")
+        _test("san8: pre_check() no-repo backward compat", "SAN AVAILABLE" not in r)
+
+        # Docstrings LEAD with the read-instead-of directive (fix #5).
+        _test("san8: get_san docstring leads with 'instead of Read'",
+              "instead of raw Read" in (get_san.__doc__ or "")[:200])
+        _test("san8: query_san docstring leads with 'instead of grep'",
+              "instead of grepping" in (query_san.__doc__ or "")[:120])
 
      except Exception as e:
         import traceback
