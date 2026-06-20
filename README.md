@@ -10,7 +10,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [Quick Start](#quick-start) — install in 2 minutes
 - [How To Use It](#how-to-use-it) — the agent loop, a worked example, what you get
 - [Architecture](#architecture) — what lives where, [performance & internals](#performance--internals)
-- [MCP Tools (18)](#mcp-tools-18) — the agent-facing API
+- [MCP Tools (21)](#mcp-tools-21) — the agent-facing API
 - [Agent Team](#agent-team) — bundled role templates
 - [Model Routing](#model-routing-quality-per-cost) — right model per phase, two-strikes escalation, plan handoff
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
@@ -52,6 +52,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Survives compaction** | SessionStart hook re-injects the pending roadmap after `/compact` so the agent resumes instead of re-researching. [Details](#surviving-compaction-the-amnesia-fix) |
 | **Relevance search** | `query_decisions(query="…")` ranks by topic relevance, not just recency; `get_roadmap` returns open work in one call. |
 | **SAN as default read path** | A soft hook nudges raw `Read` of SAN-covered code toward `get_san`; `get_san` takes absolute paths so there's no friction. Same quality, ~5-11x fewer tokens. [Details](#making-san-the-default-read-path) |
+| **Records & pruning** | Browse every decision as dated markdown; prune old/resolved ones (dry-run first, archived not deleted). Keeps the brain lean without losing the lessons. [Details](#managing-what-the-brain-remembers) |
 
 ## Quick Start
 
@@ -223,7 +224,7 @@ The brain is built to stay fast as the decision history grows into thousands of 
 
 > **Files in `~/.agent-brain/`:** `decisions.json` (snapshot) + `decisions.journal` (deltas) are the decision memory — both are needed; don't delete one without the other. `office-state.json` is live dashboard state (self-pruning), `san_savings.jsonl` is the token-savings log. All are per-machine and git-ignored.
 
-## MCP Tools (18)
+## MCP Tools (21)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -239,6 +240,13 @@ The brain is built to stay fast as the decision history grows into thousands of 
 | `query_decisions` | Filter by area/agent/repo/outcome **and** rank by free-text relevance (`query="..."`) — finds decisions about a topic without knowing the exact area |
 | `get_decision` | Full detail + feedback for one decision |
 | `get_roadmap` | What's left to do — pending + roadmap/blocker-tagged work, ranked. One call to resume context after a fresh session or compaction |
+
+### Records & pruning (keep the brain lean)
+| Tool | Purpose |
+|------|---------|
+| `export_records` | Write a human-readable audit trail to `~/.agent-brain/records/` — one markdown file per day, browsable via `INDEX.md` |
+| `prune_decisions` | Forget old, resolved decisions: archives to `decisions.archive.jsonl` (recoverable) **and** removes from the live graph. **Dry-run by default**; keeps rejections + roadmap (the learning) |
+| `resolve_stale_pending` | Mark long-abandoned `pending` decisions as `superseded` so they stop polluting `get_roadmap`. Dry-run by default |
 
 ### Code Bridge
 | Tool | Purpose |
@@ -274,13 +282,43 @@ The brain is built to stay fast as the decision history grows into thousands of 
 ### Admin (CLI only — not exposed via MCP)
 Run from the repo root. These live on the CLI (not MCP) to keep the agent-facing tool surface lean:
 ```bash
-python3 brain/server.py validate        # full brain self-tests (81 checks)
+python3 brain/server.py validate        # full brain self-tests (117 checks)
 python3 brain/server.py validate-san    # SAN subsystem self-tests
 python3 brain/server.py san-index <repo> # rebuild _index.json from .san/
 python3 brain/server.py stats           # overall brain health
 python3 brain/server.py office [repo]    # current office state (debug)
 python3 brain/server.py savings         # SAN token savings (last session / today / all-time)
+python3 brain/server.py roadmap [repo]   # open-work digest (same as get_roadmap)
+python3 brain/server.py records [repo]   # export the dated records dir
+python3 brain/server.py prune [repo] [--before-days=N] [--apply]  # forget old decisions (dry-run default)
+python3 brain/server.py resolve-stale [repo] [--apply]            # mark abandoned pending as superseded
 ```
+
+### Managing what the brain remembers
+
+The brain only grows — it learns, it never forgets on its own. That's good for the *valuable* memory (what failed and why) but old, resolved decisions eventually add noise to `pre_check` and inflate `get_roadmap`. Two safe ways to keep it lean:
+
+**1. Browse the records.** Every decision is exportable as dated, human-readable markdown:
+```bash
+python3 brain/server.py records          # writes ~/.agent-brain/records/YYYY-MM-DD.md + INDEX.md
+open ~/.agent-brain/records/INDEX.md     # browse by date
+```
+Each entry shows the date, repo, area, agent, action, and outcome. The records are **regenerated from the graph** — deleting a day file just re-renders on the next export, so the graph stays the source of truth. To *actually* forget something, prune it.
+
+**2. Prune (or let the AI do it).** `prune_decisions` is **dry-run by default** — it shows what *would* go without touching anything:
+```bash
+python3 brain/server.py prune --before-days=90          # preview: old, resolved decisions
+python3 brain/server.py prune --before-days=90 --apply  # archive + remove for real
+```
+What it does on `--apply`:
+- **Archives** each pruned decision to `~/.agent-brain/decisions.archive.jsonl` (recoverable — nothing is hard-deleted).
+- **Removes** it from the live graph, so `pre_check`/`get_roadmap` stop surfacing it.
+- **Keeps the learning**: rejections/failures and `roadmap`/`blocker`-tagged decisions are never pruned.
+- **Re-exports** the records dir to reflect the change.
+
+You can also just ask an agent: *"prune decisions older than 3 months, dry run first"* — it calls `prune_decisions(before_days=90, dry_run=True)`, shows you the list, and only applies after you confirm.
+
+> **Is unbounded growth a problem?** Disk is trivial (~28 MB/year) and reads stay sub-millisecond (mtime-cached). The real cost is *relevance noise* — a 2-year-old rejected approach surfacing as a "similar failure". Prune resolved/old decisions periodically; keep the rejections, which are the cheapest lesson you'll ever get.
 
 ## Agent Team
 
@@ -822,7 +860,7 @@ After setup, run the full validation from the repo root:
 
 ```bash
 python3 brain/server.py validate
-# Expected: "Agent Brain Validation: 81 passed, 0 failed ✓ ALL TESTS PASSED"
+# Expected: "Agent Brain Validation: 117 passed, 0 failed ✓ ALL TESTS PASSED"
 ```
 
 This tests every subsystem in isolation using a temp directory:

@@ -25,7 +25,7 @@ import time
 import re
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
 import uuid
@@ -1482,6 +1482,208 @@ def get_roadmap(repo: str = "", limit: int = 15) -> str:
     with LOCK:
         G = _load_graph()
     return _format_roadmap_digest(_roadmap_rows(G, repo), limit=limit)
+
+
+# ===========================================================================
+# Records lifecycle — human-readable export, prune, archive
+# ===========================================================================
+# The decision graph grows forever otherwise. These give the user a readable
+# audit trail (records/YYYY-MM-DD.md) and a safe way to forget: prune archives
+# to decisions.archive.jsonl (recoverable) AND removes from the live graph so
+# pre_check / get_roadmap stop surfacing pruned work. Dry-run by default.
+
+RECORDS_DIR = BRAIN_DIR / "records"
+ARCHIVE_FILE = BRAIN_DIR / "decisions.archive.jsonl"
+
+
+def _decision_one_liner(node_id: str, data: dict) -> str:
+    """Compact single-line record of a decision for the markdown export."""
+    ts = str(data.get("timestamp", ""))[:19].replace("T", " ")
+    outcome = data.get("outcome", "pending")
+    area = data.get("area", "?")
+    repo = data.get("repo", "?")
+    agent = data.get("agent", "?")
+    action = str(data.get("action", "?")).replace("\n", " ")[:200]
+    return (f"- `{node_id}` **{outcome}** · {ts} · {repo} / {area} · {agent}\n"
+            f"  {action}")
+
+
+def _export_records(repo: str = "") -> tuple[int, int]:
+    """Write records/YYYY-MM-DD.md, one file per day, newest decisions last.
+    Returns (days_written, decisions_written). Regenerates from the graph —
+    deleting a day file just re-renders on next export, so the graph stays the
+    source of truth; to actually forget, prune (which removes from the graph)."""
+    with LOCK:
+        G = _load_graph()
+    by_day: dict[str, list[tuple[str, str, dict]]] = defaultdict(list)
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") != "decision":
+            continue
+        if repo and data.get("repo") != repo:
+            continue
+        ts = str(data.get("timestamp", ""))
+        day = ts[:10] if len(ts) >= 10 else "undated"
+        by_day[day].append((ts, node_id, data))
+    RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for day, rows in by_day.items():
+        rows.sort(key=lambda r: r[0])
+        lines = [f"# Decisions — {day}", ""]
+        if repo:
+            lines.append(f"_repo: {repo}_\n")
+        for _, node_id, data in rows:
+            lines.append(_decision_one_liner(node_id, data))
+            total += 1
+        (RECORDS_DIR / f"{day}.md").write_text("\n".join(lines) + "\n")
+    # Index file listing all days.
+    if by_day:
+        idx = ["# Decision records", "",
+               "One file per day. To forget a decision permanently, prune it",
+               "(archives + removes from the brain) — deleting a file here only",
+               "re-renders on the next export.", ""]
+        for day in sorted(by_day, reverse=True):
+            idx.append(f"- [{day}]({day}.md) — {len(by_day[day])} decision(s)")
+        (RECORDS_DIR / "INDEX.md").write_text("\n".join(idx) + "\n")
+    return (len(by_day), total)
+
+
+def _archive_nodes(nodes: list[tuple[str, dict]]) -> None:
+    """Append pruned decision nodes to decisions.archive.jsonl (recoverable)."""
+    if not nodes:
+        return
+    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    with ARCHIVE_FILE.open("a") as f:
+        for node_id, data in nodes:
+            rec = dict(data)
+            rec["id"] = node_id
+            rec["archived_at"] = datetime.now().isoformat()
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def _prune_candidates(G: nx.DiGraph, repo: str, before_days: int,
+                      keep_rejections: bool) -> list[tuple[str, dict]]:
+    """Decisions eligible to prune: older than before_days, resolved (or stale
+    pending), in repo. Rejections/roadmap kept by default — they carry the
+    learning. Returns [(node_id, data)]."""
+    cutoff = datetime.now() - timedelta(days=before_days)
+    out = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") != "decision":
+            continue
+        if repo and data.get("repo") != repo:
+            continue
+        ts = data.get("timestamp", "")
+        try:
+            if datetime.fromisoformat(ts) > cutoff:
+                continue  # too recent
+        except (ValueError, TypeError):
+            continue  # undated -> never auto-prune
+        outcome = data.get("outcome", "pending")
+        area = str(data.get("area", "")).lower()
+        # Keep the learning-valuable: rejections/failures and roadmap markers.
+        if keep_rejections and outcome in ("rejected", "failed"):
+            continue
+        if "roadmap" in area or "blocker" in area:
+            continue
+        out.append((node_id, data))
+    return out
+
+
+@mcp.tool()
+def export_records(repo: str = "") -> str:
+    """
+    Write a human-readable audit trail to ~/.agent-brain/records/ —
+    one markdown file per day (YYYY-MM-DD.md) plus an INDEX.md, each
+    decision shown with its date, repo, area, agent, action, and outcome.
+    Scope to one repo with `repo`. Regenerated from the graph each call.
+    Use this to review what the brain remembers before pruning.
+    """
+    days, total = _export_records(repo)
+    scope = f" for '{repo}'" if repo else ""
+    return (f"Exported {total} decision(s) across {days} day(s){scope} to "
+            f"{RECORDS_DIR}\nOpen {RECORDS_DIR / 'INDEX.md'} to browse by date.")
+
+
+@mcp.tool()
+def prune_decisions(repo: str = "", before_days: int = 90,
+                    keep_rejections: bool = True, dry_run: bool = True) -> str:
+    """
+    Forget old, resolved decisions to keep the brain lean and relevant.
+    Archives to ~/.agent-brain/decisions.archive.jsonl (recoverable) AND
+    removes from the live graph so pre_check/get_roadmap stop surfacing them.
+
+    DRY-RUN BY DEFAULT: shows what would be pruned without changing anything;
+    pass dry_run=False to apply. Keeps learning-valuable decisions: rejections/
+    failures (when keep_rejections=True) and roadmap/blocker-tagged work are
+    never pruned. Only decisions older than before_days (default 90) qualify.
+
+    repo: scope to one repo (empty = all). before_days: age cutoff in days.
+    """
+    with LOCK:
+        G = _load_graph()
+        candidates = _prune_candidates(G, repo, before_days, keep_rejections)
+        if not candidates:
+            return (f"Nothing to prune: no resolved decisions older than "
+                    f"{before_days} days" + (f" in '{repo}'" if repo else "") + ".")
+        if dry_run:
+            from collections import Counter
+            by_outcome = Counter(d.get("outcome", "pending") for _, d in candidates)
+            preview = "\n".join(
+                f"  {_decision_one_liner(nid, d).splitlines()[0]}"
+                for nid, d in sorted(candidates, key=lambda c: c[1].get("timestamp", ""))[:15])
+            more = f"\n  … and {len(candidates) - 15} more" if len(candidates) > 15 else ""
+            return (f"DRY RUN — would prune {len(candidates)} decision(s) "
+                    f"(by outcome: {dict(by_outcome)}).\n"
+                    f"Kept: rejections/failures + roadmap/blocker.\n\n"
+                    f"{preview}{more}\n\n"
+                    f"Re-run with dry_run=False to archive + remove them.")
+        # Apply: archive, then remove from graph.
+        _archive_nodes(candidates)
+        for node_id, _ in candidates:
+            if node_id in G:
+                G.remove_node(node_id)
+        _save_graph(G)
+    # Refresh the readable export so it reflects the prune.
+    _export_records(repo)
+    return (f"Pruned {len(candidates)} decision(s) — archived to {ARCHIVE_FILE} "
+            f"and removed from the brain. Records re-exported to {RECORDS_DIR}.")
+
+
+@mcp.tool()
+def resolve_stale_pending(before_days: int = 30, repo: str = "",
+                          dry_run: bool = True) -> str:
+    """
+    Mark long-abandoned 'pending' decisions as 'superseded' so they stop
+    polluting get_roadmap. Pending decisions older than before_days (default
+    30) with no outcome are assumed done/abandoned. DRY-RUN BY DEFAULT.
+    Does NOT delete — only changes outcome (still archivable later via prune).
+    """
+    cutoff = datetime.now() - timedelta(days=before_days)
+    with LOCK:
+        G = _load_graph()
+        stale = []
+        for node_id, data in G.nodes(data=True):
+            if data.get("type") != "decision" or data.get("outcome") != "pending":
+                continue
+            if repo and data.get("repo") != repo:
+                continue
+            try:
+                if datetime.fromisoformat(data.get("timestamp", "")) <= cutoff:
+                    stale.append(node_id)
+            except (ValueError, TypeError):
+                continue
+        if not stale:
+            return f"No pending decisions older than {before_days} days."
+        if dry_run:
+            return (f"DRY RUN — would mark {len(stale)} stale pending decision(s) "
+                    f"as 'superseded'. Re-run with dry_run=False to apply.")
+        for node_id in stale:
+            G.nodes[node_id]["outcome"] = "superseded"
+            G.nodes[node_id]["outcome_reason"] = (
+                f"auto-superseded: pending >{before_days}d with no outcome")
+            G.nodes[node_id]["outcome_timestamp"] = datetime.now().isoformat()
+        _save_graph(G)
+    return f"Marked {len(stale)} stale pending decision(s) as 'superseded'."
 
 
 # ===========================================================================
@@ -2949,6 +3151,8 @@ def validate_brain() -> str:
     real_office_file = OFFICE_STATE_FILE
     real_marker_file = DECISION_MARKER_FILE
     real_query_marker_file = QUERY_MARKER_FILE
+    real_records_dir = RECORDS_DIR
+    real_archive_file = ARCHIVE_FILE
 
     def _test(name: str, condition: bool, detail: str = ""):
         nonlocal passed, failed
@@ -2970,6 +3174,8 @@ def validate_brain() -> str:
         globals()["OFFICE_STATE_FILE"] = tmp_root / "office-state.json"
         globals()["DECISION_MARKER_FILE"] = tmp_root / ".last_decision_marker"
         globals()["QUERY_MARKER_FILE"] = tmp_root / ".last_query_marker"
+        globals()["RECORDS_DIR"] = tmp_root / "records"
+        globals()["ARCHIVE_FILE"] = tmp_root / "decisions.archive.jsonl"
         # Drop any shadow/cache from the real brain so temp diffs start clean.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
 
@@ -3521,6 +3727,57 @@ def validate_brain() -> str:
         _test("exts: legacy .san for existing .rb source not flagged orphan",
               len(_orphans) == 0, f"wrongly orphaned: {_orphans}")
 
+        # --- Records lifecycle: export, prune (dry+apply), stale-pending ---
+        # Seed: an old accepted decision (prunable), an old rejection (kept),
+        # an old roadmap (kept), a recent one (too new), an old pending.
+        def _seed(area, action, outcome, age_days):
+            r = log_decision("dev", "rec-repo", area, action, "seed")
+            did = r.split("Decision logged: ")[1].split("\n")[0]
+            if outcome != "pending":
+                log_outcome(did, outcome, "pe", "seed outcome")
+            with LOCK:
+                g = _load_graph()
+                g.nodes[did]["timestamp"] = (datetime.now() - timedelta(days=age_days)).isoformat()
+                _save_graph(g)
+            return did
+        old_acc = _seed("billing", "old accepted thing", "accepted", 200)
+        old_rej = _seed("billing", "old rejected thing", "rejected", 200)
+        old_road = _seed("kmp/roadmap", "old roadmap thing", "pending", 200)
+        recent = _seed("billing", "recent thing", "accepted", 5)
+        old_pend = _seed("billing", "old pending thing", "pending", 60)
+
+        # export_records writes per-day markdown + INDEX.
+        r = export_records("rec-repo")
+        _test("records: export reports files written", "Exported" in r and "day" in r)
+        _test("records: INDEX.md created", (RECORDS_DIR / "INDEX.md").exists())
+        _test("records: a day file contains the decision id",
+              any(old_acc in p.read_text() for p in RECORDS_DIR.glob("*.md")))
+
+        # prune dry-run: lists old accepted, NOT rejection/roadmap/recent.
+        r = prune_decisions(repo="rec-repo", before_days=90, dry_run=True)
+        _test("records: prune dry-run finds old accepted", old_acc in r and "DRY RUN" in r)
+        _test("records: prune dry-run keeps rejection", old_rej not in r)
+        _test("records: prune dry-run keeps roadmap", old_road not in r)
+        _test("records: prune dry-run skips recent", recent not in r)
+        # Nothing actually removed yet.
+        _test("records: dry-run did not delete", old_acc in _load_graph())
+
+        # prune apply: archives + removes from graph.
+        r = prune_decisions(repo="rec-repo", before_days=90, dry_run=False)
+        _test("records: prune apply removes from graph", old_acc not in _load_graph())
+        _test("records: rejection survives prune", old_rej in _load_graph())
+        _test("records: archive file written", ARCHIVE_FILE.exists()
+              and old_acc in ARCHIVE_FILE.read_text())
+
+        # stale-pending: old pending -> superseded; roadmap pending kept as-is by intent.
+        r = resolve_stale_pending(before_days=30, repo="rec-repo", dry_run=True)
+        _test("records: stale-pending dry-run finds old pending", "would mark" in r)
+        r = resolve_stale_pending(before_days=30, repo="rec-repo", dry_run=False)
+        with LOCK:
+            _g = _load_graph()
+        _test("records: old pending now superseded",
+              _g.nodes.get(old_pend, {}).get("outcome") == "superseded")
+
      except Exception as e:
         import traceback
         failed += 1
@@ -3534,6 +3791,8 @@ def validate_brain() -> str:
         globals()["OFFICE_STATE_FILE"] = real_office_file
         globals()["DECISION_MARKER_FILE"] = real_marker_file
         globals()["QUERY_MARKER_FILE"] = real_query_marker_file
+        globals()["RECORDS_DIR"] = real_records_dir
+        globals()["ARCHIVE_FILE"] = real_archive_file
         # Drop temp shadow/cache; next real _load_graph re-reads from disk.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
         # Clean up
@@ -3845,9 +4104,38 @@ if __name__ == "__main__":
                                         datetime.now().strftime("%Y-%m-%d"))
         print(report.replace("This session", "Last recorded session", 1))
         _sys.exit(0)
+    if cmd == "records":
+        # Export the human-readable per-day decision records.
+        _repo = _sys.argv[2] if len(_sys.argv) > 2 else ""
+        print(export_records.fn(_repo) if hasattr(export_records, "fn")
+              else export_records(_repo))
+        _sys.exit(0)
+    if cmd == "prune":
+        # Forget old resolved decisions. DRY-RUN unless --apply is passed.
+        _repo = next((a for a in _sys.argv[2:] if not a.startswith("--")), "")
+        _apply = "--apply" in _sys.argv[2:]
+        _days = 90
+        for a in _sys.argv[2:]:
+            if a.startswith("--before-days="):
+                try:
+                    _days = int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+        fn = prune_decisions.fn if hasattr(prune_decisions, "fn") else prune_decisions
+        print(fn(repo=_repo, before_days=_days, dry_run=not _apply))
+        if not _apply:
+            print("\n(dry run — add --apply to archive + remove)")
+        _sys.exit(0)
+    if cmd == "resolve-stale":
+        _repo = next((a for a in _sys.argv[2:] if not a.startswith("--")), "")
+        _apply = "--apply" in _sys.argv[2:]
+        fn = resolve_stale_pending.fn if hasattr(resolve_stale_pending, "fn") else resolve_stale_pending
+        print(fn(before_days=30, repo=_repo, dry_run=not _apply))
+        _sys.exit(0)
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
-              "stats|office [repo]|savings|roadmap [repo]]")
+              "stats|office [repo]|savings|roadmap [repo]|records [repo]|"
+              "prune [repo] [--before-days=N] [--apply]|resolve-stale [repo] [--apply]]")
         print("  (no args)        run the MCP server")
         _sys.exit(0)
 
