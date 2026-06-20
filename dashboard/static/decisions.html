@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Brain — Decisions</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1d212a; --border: #272c37;
+    --text: #e6e8ec; --muted: #9aa3b0; --accent: #5b9dff;
+    --accepted: #3fb950; --rejected: #f85149; --pending: #d29922;
+    --revised: #a371f7; --failed: #f85149; --superseded: #6e7681;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10; background: var(--panel);
+    border-bottom: 1px solid var(--border); padding: 14px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accepted); animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .nav { margin-left: auto; display: flex; gap: 10px; }
+  .nav a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 6px; }
+  .nav a:hover { background: var(--panel-2); color: var(--text); }
+  .controls {
+    padding: 12px 20px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  input, select {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 10px; border-radius: 7px; font-size: 13px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  input[type=search] { min-width: 220px; flex: 1; }
+  .stats { padding: 10px 20px; color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .stats b { color: var(--text); font-weight: 600; }
+  .list { padding: 8px 20px 60px; display: flex; flex-direction: column; gap: 8px; max-width: 1100px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--superseded);
+    border-radius: 9px; padding: 12px 14px; animation: fadein .25s ease;
+  }
+  @keyframes fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
+  .card.flash { animation: flash 1.4s ease; }
+  @keyframes flash { 0% { background: #1f2b1f; } 100% { background: var(--panel); } }
+  .card.accepted { border-left-color: var(--accepted); }
+  .card.rejected, .card.failed { border-left-color: var(--rejected); }
+  .card.pending { border-left-color: var(--pending); }
+  .card.revised { border-left-color: var(--revised); }
+  .card.superseded { border-left-color: var(--superseded); }
+  .row1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; text-transform: uppercase;
+    letter-spacing: .03em;
+  }
+  .b-accepted { background: rgba(63,185,80,.15); color: var(--accepted); }
+  .b-rejected, .b-failed { background: rgba(248,81,73,.15); color: var(--rejected); }
+  .b-pending { background: rgba(210,153,34,.15); color: var(--pending); }
+  .b-revised { background: rgba(163,113,247,.15); color: var(--revised); }
+  .b-superseded { background: rgba(110,118,129,.15); color: var(--superseded); }
+  .meta { color: var(--muted); font-size: 12px; }
+  .meta .chip { background: var(--panel-2); padding: 1px 7px; border-radius: 5px; margin-right: 4px; }
+  .action { font-size: 13.5px; color: var(--text); margin: 2px 0; }
+  .reason { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .outcome-reason { margin-top: 6px; font-size: 12.5px; padding: 6px 9px; border-radius: 6px; background: var(--panel-2); }
+  .id { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted); }
+  .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
+  .roadmap-tag { background: rgba(91,157,255,.15); color: var(--accent); font-size: 11px; padding: 1px 7px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 Agent Brain — Decisions</h1>
+  <span class="live"><span class="dot" id="livedot"></span><span id="livetext">connecting…</span></span>
+  <nav class="nav">
+    <a href="/">Office</a>
+    <a href="/3d">3D</a>
+    <a href="/decisions">Decisions</a>
+  </nav>
+</header>
+
+<div class="controls">
+  <input type="search" id="q" placeholder="Search action, reasoning, area…" autocomplete="off">
+  <select id="repo"><option value="">All repos</option></select>
+  <select id="area"><option value="">All areas</option></select>
+  <select id="agent"><option value="">All agents</option></select>
+  <select id="outcome">
+    <option value="">All outcomes</option>
+    <option value="accepted">Accepted</option>
+    <option value="rejected">Rejected</option>
+    <option value="pending">Pending</option>
+    <option value="revised">Revised</option>
+    <option value="failed">Failed</option>
+    <option value="superseded">Superseded</option>
+  </select>
+</div>
+
+<div class="stats" id="stats"></div>
+<div class="list" id="list"></div>
+
+<script>
+let ALL = [];
+let seenIds = new Set();
+let firstLoad = true;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d)) return ts.slice(0, 19).replace("T", " ");
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function fillSelect(sel, values, current) {
+  const keep = current || sel.value;
+  const first = sel.options[0].outerHTML;
+  sel.innerHTML = first + values.sort().map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  if (values.includes(keep)) sel.value = keep;
+}
+
+function refreshFilters() {
+  fillSelect($("repo"), [...new Set(ALL.map(d => d.repo).filter(Boolean))]);
+  fillSelect($("area"), [...new Set(ALL.map(d => d.area).filter(Boolean))]);
+  fillSelect($("agent"), [...new Set(ALL.map(d => d.agent).filter(Boolean))]);
+}
+
+function filtered() {
+  const q = $("q").value.trim().toLowerCase();
+  const repo = $("repo").value, area = $("area").value, agent = $("agent").value, outcome = $("outcome").value;
+  return ALL.filter(d => {
+    if (repo && d.repo !== repo) return false;
+    if (area && d.area !== area) return false;
+    if (agent && d.agent !== agent) return false;
+    if (outcome && d.outcome !== outcome) return false;
+    if (q) {
+      const hay = (d.action + " " + d.reasoning + " " + d.area + " " + d.outcome_reason).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function render() {
+  const rows = filtered();
+  const counts = ALL.reduce((a, d) => (a[d.outcome] = (a[d.outcome] || 0) + 1, a), {});
+  $("stats").innerHTML =
+    `<span><b>${ALL.length}</b> total</span>` +
+    `<span><b>${counts.accepted || 0}</b> accepted</span>` +
+    `<span><b>${counts.rejected || 0}</b> rejected</span>` +
+    `<span><b>${counts.pending || 0}</b> pending</span>` +
+    `<span>showing <b>${rows.length}</b></span>`;
+
+  const list = $("list");
+  if (!rows.length) { list.innerHTML = `<div class="empty">No decisions match.</div>`; return; }
+  list.innerHTML = rows.slice(0, 500).map(d => {
+    const isNew = !firstLoad && !seenIds.has(d.id);
+    const isRoadmap = /roadmap|blocker/i.test(d.area);
+    return `<div class="card ${esc(d.outcome)} ${isNew ? 'flash' : ''}">
+      <div class="row1">
+        <span class="badge b-${esc(d.outcome)}">${esc(d.outcome)}</span>
+        <span class="meta">
+          <span class="chip">${esc(d.repo)}</span>
+          <span class="chip">${esc(d.area)}</span>${isRoadmap ? ' <span class="roadmap-tag">★ roadmap</span>' : ''}
+          · ${esc(d.agent)} · ${esc(fmtTime(d.timestamp))}
+        </span>
+      </div>
+      <div class="action">${esc(d.action)}</div>
+      ${d.reasoning ? `<div class="reason">${esc(d.reasoning)}</div>` : ''}
+      ${d.outcome_reason ? `<div class="outcome-reason"><b>${esc(d.outcome_by || 'reviewer')}:</b> ${esc(d.outcome_reason)}</div>` : ''}
+      <div style="margin-top:6px"><span class="id">${esc(d.id)}</span></div>
+    </div>`;
+  }).join("");
+  rows.forEach(d => seenIds.add(d.id));
+  firstLoad = false;
+}
+
+function apply(data) {
+  ALL = data.decisions || [];
+  refreshFilters();
+  render();
+}
+
+["q", "repo", "area", "agent", "outcome"].forEach(id => {
+  $(id).addEventListener("input", render);
+  $(id).addEventListener("change", render);
+});
+
+// Live stream
+function connect() {
+  const es = new EventSource("/decision-events");
+  es.onopen = () => { $("livedot").style.background = "var(--accepted)"; $("livetext").textContent = "live"; };
+  es.onmessage = (e) => { try { apply(JSON.parse(e.data)); } catch (_) {} };
+  es.onerror = () => {
+    $("livedot").style.background = "var(--rejected)"; $("livetext").textContent = "reconnecting…";
+    es.close(); setTimeout(connect, 2000);
+  };
+}
+// initial fetch (so it shows instantly even before first SSE tick), then stream
+fetch("/api/decisions").then(r => r.json()).then(apply).catch(() => {});
+connect();
+</script>
+</body>
+</html>

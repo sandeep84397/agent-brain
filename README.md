@@ -16,7 +16,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
 - [SAN Protocol](#san-protocol) — code compression: is it worth it, measuring savings (`token_savings`)
 - [SAN Setup](#san-setup) — turning SAN on, model choice, other platforms
-- [Adaptive Warnings](#adaptive-warnings) · [Office Dashboard](#office-dashboard-live-visualization) — live pixel-art team view
+- [Adaptive Warnings](#adaptive-warnings) · [Web Dashboard](#web-dashboard-live-visualization) — decisions browser (live feed) + pixel-art/3D office
 - [Verification](#verification) · [Requirements](#requirements) · [Configuration](#configuration) · [Customization](#customization)
 
 ## What This Does
@@ -53,6 +53,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Relevance search** | `query_decisions(query="…")` ranks by topic relevance, not just recency; `get_roadmap` returns open work in one call. |
 | **SAN as default read path** | A soft hook nudges raw `Read` of SAN-covered code toward `get_san`; `get_san` takes absolute paths so there's no friction. Same quality, ~5-11x fewer tokens. [Details](#making-san-the-default-read-path) |
 | **Records & pruning** | Browse every decision as dated markdown; prune old/resolved ones (dry-run first, archived not deleted). Keeps the brain lean without losing the lessons. [Details](#managing-what-the-brain-remembers) |
+| **Live decisions web view** | A `/decisions` browser that streams decisions in real time as agents log them — filter by repo/area/agent/outcome, search, color-coded. [Details](#decisions-view-decisions) |
 
 ## Quick Start
 
@@ -815,14 +816,32 @@ since the rejection, so the agent is told to re-check the reasoning instead of
 treating it as current. The reason is always shown so the agent judges applicability;
 nothing is silently filtered or silently blocked.
 
-## Office Dashboard (Live Visualization)
+## Web Dashboard (Live Visualization)
 
-A pixel art virtual office that shows your agents working in real-time. Agents move between desks and the meeting table, show speech bubbles during discussions, and display status indicators.
+One local server, three views — pixel-art office, 3D office, and a **decisions browser with a real-time feed**.
 
 ```bash
 python dashboard/server.py
 # Opens http://localhost:3333 in your browser
+#   /            pixel-art office
+#   /3d          3D office
+#   /decisions   browse + live-stream decisions as they're logged
 ```
+
+### Decisions view (`/decisions`)
+
+A searchable, filterable view of every decision the brain holds — and it **updates in real time** as agents log decisions, with no refresh:
+
+- **Live feed** — a Server-Sent Events stream watches `decisions.json`/`decisions.journal`; the moment a `log_decision` / `log_outcome` lands, the new card appears (with a brief highlight pulse). A "live" indicator shows the connection.
+- **Filter** by repo, area, agent, and outcome; **search** across action, reasoning, and outcome reason.
+- **Color-coded outcomes** — green accepted, red rejected/failed, amber pending, purple revised, grey superseded — with at-a-glance counts (total / accepted / rejected / pending).
+- **Roadmap markers** (`★`) on decisions tagged `roadmap`/`blocker`, so durable work stands out.
+
+It reads the decision graph the same way the MCP server persists it (snapshot + journal replay), as a standalone process — no extra setup, just open the page while agents work.
+
+### Pixel-art / 3D office
+
+A pixel art virtual office that shows your agents working in real-time. Agents move between desks and the meeting table, show speech bubbles during discussions, and display status indicators.
 
 **Features:**
 - Pixel art office with desks, meeting table, whiteboard, coffee machine
