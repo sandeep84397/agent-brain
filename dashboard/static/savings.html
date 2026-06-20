@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Brain — Token savings</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1d212a; --border: #272c37;
+    --text: #e6e8ec; --muted: #9aa3b0; --accent: #5b9dff; --teal: #2dd4bf;
+    --green: #3fb950; --amber: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10; background: var(--panel);
+    border-bottom: 1px solid var(--border); padding: 14px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .nav { margin-left: auto; display: flex; gap: 10px; }
+  .nav a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 6px; }
+  .nav a:hover { background: var(--panel-2); color: var(--text); }
+  .nav a.active { color: var(--text); background: var(--panel-2); }
+  .wrap { max-width: 1000px; padding: 22px 20px 60px; }
+  .hero {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 26px 28px; margin-bottom: 16px; text-align: center;
+  }
+  .hero .big { font-size: 52px; font-weight: 600; letter-spacing: -0.02em; color: var(--teal); line-height: 1.1; transition: color .3s; }
+  .hero .big.flash { color: var(--green); }
+  .hero .sub { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .hero .pct { color: var(--green); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 11px; padding: 16px 18px; }
+  .card .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .val { font-size: 26px; font-weight: 600; margin: 4px 0 2px; }
+  .card .meta { color: var(--muted); font-size: 12px; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 20px 0 10px; }
+  .repo { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+  .repo .name { width: 200px; font-size: 13px; font-family: ui-monospace, Menlo, monospace; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { flex: 1; height: 8px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--teal); border-radius: 5px; }
+  .repo .num { width: 130px; text-align: right; font-size: 13px; color: var(--muted); flex: none; }
+  .feed { display: flex; flex-direction: column; gap: 6px; }
+  .ev {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--teal);
+    border-radius: 8px; padding: 8px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    animation: fadein .25s ease;
+  }
+  @keyframes fadein { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; } }
+  .ev .file { font-family: ui-monospace, Menlo, monospace; font-size: 12px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .repo-chip { background: var(--panel-2); padding: 1px 7px; border-radius: 5px; font-size: 11px; color: var(--muted); }
+  .ev .calc { font-size: 12px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+  .ev .saved { font-size: 12px; color: var(--green); font-weight: 600; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.6; }
+  .note code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+  .empty { padding: 40px 0; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>💰 Token savings</h1>
+  <span class="live"><span class="dot" id="dot"></span><span id="livetext">connecting…</span></span>
+  <nav class="nav">
+    <a href="/">Office</a>
+    <a href="/decisions">Decisions</a>
+    <a href="/san">SAN search</a>
+    <a href="/savings" class="active">Savings</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div class="hero">
+    <div class="big" id="bigSaved">—</div>
+    <div class="sub">tokens saved all-time by reading code via SAN · <span class="pct" id="bigPct"></span></div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="lbl">Today</div>
+      <div class="val" id="todaySaved">—</div>
+      <div class="meta" id="todayMeta"></div>
+    </div>
+    <div class="card">
+      <div class="lbl">All-time reads</div>
+      <div class="val" id="allReads">—</div>
+      <div class="meta" id="allMeta"></div>
+    </div>
+    <div class="card">
+      <div class="lbl">Raw avoided → SAN served</div>
+      <div class="val" id="ratio">—</div>
+      <div class="meta">tokens (the cost SAN replaced)</div>
+    </div>
+  </div>
+
+  <h2>Saved by repo</h2>
+  <div id="repos"><div class="empty">No SAN reads recorded yet.</div></div>
+
+  <h2>Recent reads (live)</h2>
+  <div class="feed" id="feed"><div class="empty">A get_san call will appear here the moment an agent reads code.</div></div>
+
+  <div class="note">
+    Counts <b>only reads that went through <code>get_san</code></b> — the raw <code>Read</code> calls SAN replaced.
+    Each event records what the raw source <i>would</i> have cost vs the SAN tokens actually served.
+    New events are tokenizer-measured (tiktoken); older ones may use a ~4 chars/token estimate.
+    This is the same data the <code>token_savings</code> tool reports.
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = (n) => (n || 0).toLocaleString();
+let lastSaved = null, seenKeys = new Set(), first = true;
+
+function apply(d) {
+  const a = d.allTime, t = d.today;
+  // hero with flash on increase
+  const big = $("bigSaved");
+  big.textContent = fmt(a.saved);
+  if (lastSaved !== null && a.saved > lastSaved) {
+    big.classList.add("flash"); setTimeout(() => big.classList.remove("flash"), 900);
+  }
+  lastSaved = a.saved;
+  $("bigPct").textContent = a.raw ? `${a.pct}% smaller` : "";
+
+  $("todaySaved").textContent = fmt(t.saved);
+  $("todayMeta").textContent = t.reads ? `${t.reads} read(s) · ${t.pct}% saved` : "no reads today";
+  $("allReads").textContent = fmt(a.reads);
+  $("allMeta").textContent = `${fmt(a.saved)} tokens saved`;
+  $("ratio").textContent = `${fmt(a.raw)} → ${fmt(a.san)}`;
+
+  // per-repo bars
+  const maxSaved = Math.max(1, ...d.byRepo.map(r => r.saved));
+  $("repos").innerHTML = d.byRepo.length ? d.byRepo.map(r => `
+    <div class="repo">
+      <div class="name" title="${esc(r.repo)}">${esc(r.repo)}</div>
+      <div class="bar"><div style="width:${Math.round(r.saved / maxSaved * 100)}%"></div></div>
+      <div class="num">${fmt(r.saved)} · ${r.reads}×</div>
+    </div>`).join("") : `<div class="empty">No SAN reads recorded yet.</div>`;
+
+  // recent feed (flash new)
+  $("feed").innerHTML = d.recent.length ? d.recent.map(e => {
+    const key = e.ts + e.file;
+    const isNew = !first && !seenKeys.has(key);
+    return `<div class="ev" ${isNew ? 'style="border-left-color:var(--green)"' : ''}>
+      <span class="repo-chip">${esc(e.repo)}</span>
+      <span class="file" title="${esc(e.file)}">${esc(e.file)}</span>
+      <span class="calc">${fmt(e.raw)} → ${fmt(e.san)}</span>
+      <span class="saved">−${fmt(e.saved)}</span>
+    </div>`;
+  }).join("") : `<div class="empty">A get_san call will appear here the moment an agent reads code.</div>`;
+  d.recent.forEach(e => seenKeys.add(e.ts + e.file));
+  first = false;
+}
+
+function connect() {
+  const es = new EventSource("/savings-events");
+  es.onopen = () => { $("dot").style.background = "var(--green)"; $("livetext").textContent = "live"; };
+  es.onmessage = (e) => { try { apply(JSON.parse(e.data)); } catch (_) {} };
+  es.onerror = () => {
+    $("dot").style.background = "#f85149"; $("livetext").textContent = "reconnecting…";
+    es.close(); setTimeout(connect, 2000);
+  };
+}
+fetch("/api/savings").then(r => r.json()).then(apply).catch(() => {});
+connect();
+</script>
+</body>
+</html>

@@ -25,6 +25,7 @@ BRAIN_DIR = Path(os.environ.get("AGENT_BRAIN_DIR", str(Path.home() / ".agent-bra
 STATE_FILE = BRAIN_DIR / "office-state.json"
 GRAPH_FILE = BRAIN_DIR / "decisions.json"
 JOURNAL_FILE = BRAIN_DIR / "decisions.journal"
+SAVINGS_FILE = BRAIN_DIR / "san_savings.jsonl"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Parse --port flag or env var
@@ -115,6 +116,77 @@ def _load_decisions():
         })
     out.sort(key=lambda r: r["timestamp"], reverse=True)
     return out
+
+
+def _savings_sig():
+    """mtime+size of the savings log, so SSE pushes when a get_san read lands."""
+    try:
+        st = SAVINGS_FILE.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def _load_savings():
+    """Aggregate ~/.agent-brain/san_savings.jsonl the same way the MCP
+    token_savings tool does: all-time, today, per-repo, recent reads. Each
+    event is {ts, session, repo, file, raw_tokens, san_tokens}."""
+    events = []
+    if SAVINGS_FILE.exists():
+        try:
+            for line in SAVINGS_FILE.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
+
+    def agg(evs):
+        raw = sum(e.get("raw_tokens", 0) for e in evs)
+        san = sum(e.get("san_tokens", 0) for e in evs)
+        saved = raw - san
+        return {"reads": len(evs), "raw": raw, "san": san, "saved": saved,
+                "pct": round(saved / raw * 100) if raw else 0}
+
+    # today: compare ISO date prefix (the dashboard process has no _SESSION_ID,
+    # so "session" is omitted — all-time + today + per-repo cover the live view).
+    today = ""
+    if events:
+        # derive 'today' from the most recent event's date, falling back to none
+        try:
+            from datetime import datetime as _dt
+            today = max(e.get("ts", "") for e in events)[:10]
+        except (ValueError, TypeError):
+            today = ""
+    # NOTE: use the real wall-clock day, not the latest event, so an idle day
+    # correctly shows 0. The dashboard can't call datetime.now() reliably in
+    # tests, but at runtime it's fine.
+    import datetime as _d
+    today = _d.date.today().isoformat()
+    today_evs = [e for e in events if str(e.get("ts", ""))[:10] == today]
+
+    by_repo = {}
+    for e in events:
+        r = e.get("repo", "?")
+        b = by_repo.setdefault(r, [])
+        b.append(e)
+    repos = sorted(
+        ({"repo": r, **agg(evs)} for r, evs in by_repo.items()),
+        key=lambda x: -x["saved"])
+
+    recent = []
+    for e in events[-20:][::-1]:
+        raw, san = e.get("raw_tokens", 0), e.get("san_tokens", 0)
+        recent.append({"ts": e.get("ts", ""), "repo": e.get("repo", "?"),
+                       "file": e.get("file", "?"), "raw": raw, "san": san,
+                       "saved": raw - san})
+
+    return {"allTime": agg(events), "today": agg(today_evs),
+            "byRepo": repos, "recent": recent}
 
 
 import re
@@ -500,6 +572,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(load_state())
         elif path == "/api/decisions":
             self._send_json({"decisions": _load_decisions()})
+        elif path == "/api/savings":
+            self._send_json(_load_savings())
+        elif path == "/savings-events":
+            self._handle_savings_sse()
         elif path == "/api/san":
             self._send_json(_load_san_repos())
         elif path == "/api/san/search":
@@ -511,6 +587,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             super().do_GET()
         elif path in ("/san", "/san/"):
             self.path = "/san.html"
+            super().do_GET()
+        elif path in ("/savings", "/savings/"):
+            self.path = "/savings.html"
             super().do_GET()
         elif path in ("/", "/3d", "/3d/", "/index.html"):
             # The 3D office is the only office view now.
@@ -576,6 +655,28 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionError, OSError):
             pass
 
+    def _handle_savings_sse(self):
+        """SSE: push the savings aggregate whenever a get_san read records a
+        new event (detected by san_savings.jsonl mtime/size change)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        last_sig = None
+        try:
+            while True:
+                sig = _savings_sig()
+                if sig != last_sig:
+                    last_sig = sig
+                    payload = json.dumps(_load_savings(), separators=(",", ":"))
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                    self.wfile.flush()
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass
+
     def log_message(self, format, *args):
         pass  # Suppress access logs
 
@@ -591,6 +692,7 @@ def main():
     print(f"   3D office:      http://localhost:{PORT}")
     print(f"   Decisions view: http://localhost:{PORT}/decisions  (live feed)")
     print(f"   SAN search:     http://localhost:{PORT}/san         (search trace)")
+    print(f"   Token savings:  http://localhost:{PORT}/savings     (live counter)")
     print(f"   State file:     {STATE_FILE}")
     print(f"   Ctrl+C to stop\n")
 
