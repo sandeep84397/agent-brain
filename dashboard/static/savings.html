@@ -64,12 +64,16 @@
   .note { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.6; }
   .note code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
   .empty { padding: 40px 0; text-align: center; color: var(--muted); }
+  .demo { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+  .demo input { accent-color: var(--teal); cursor: pointer; }
+  .demo-hint { color: #6e7681; }
 </style>
 </head>
 <body>
 <header>
   <h1>💰 Token savings</h1>
   <span class="live"><span class="dot" id="dot"></span><span id="livetext">connecting…</span></span>
+  <label class="demo"><input type="checkbox" id="demo"> Demo mode <span class="demo-hint">(hide project names)</span></label>
   <nav class="nav">
     <a href="/">Office</a>
     <a href="/decisions">Decisions</a>
@@ -121,8 +125,31 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = (n) => (n || 0).toLocaleString();
 let lastSaved = null, seenKeys = new Set(), first = true;
+let LAST = null;  // last payload, so toggling demo mode re-renders without waiting for SSE
+
+// Demo mode: anonymize project identity (real numbers untouched). Repo names
+// become repo-1/2/… ordered by savings; file paths keep only the extension.
+const demoOn = () => $("demo").checked;
+const repoMap = new Map();
+function anonRepo(name) {
+  if (!demoOn()) return name;
+  if (!repoMap.has(name)) repoMap.set(name, `repo-${repoMap.size + 1}`);
+  return repoMap.get(name);
+}
+function anonFile(path) {
+  if (!demoOn()) return path;
+  const ext = (path.match(/\.[a-z0-9]+$/i) || [""])[0];
+  return `src/…/file${ext}`;
+}
+function buildRepoMap(byRepo) {
+  // stable, biggest-first numbering so demo labels don't shuffle between renders
+  repoMap.clear();
+  [...byRepo].sort((a, b) => b.saved - a.saved).forEach((r, i) => repoMap.set(r.repo, `repo-${i + 1}`));
+}
 
 function apply(d) {
+  LAST = d;
+  if (demoOn()) buildRepoMap(d.byRepo);
   const a = d.allTime, t = d.today;
   // hero with flash on increase
   const big = $("bigSaved");
@@ -141,20 +168,23 @@ function apply(d) {
 
   // per-repo bars
   const maxSaved = Math.max(1, ...d.byRepo.map(r => r.saved));
-  $("repos").innerHTML = d.byRepo.length ? d.byRepo.map(r => `
-    <div class="repo">
-      <div class="name" title="${esc(r.repo)}">${esc(r.repo)}</div>
+  $("repos").innerHTML = d.byRepo.length ? d.byRepo.map(r => {
+    const label = anonRepo(r.repo);
+    return `<div class="repo">
+      <div class="name" title="${esc(label)}">${esc(label)}</div>
       <div class="bar"><div style="width:${Math.round(r.saved / maxSaved * 100)}%"></div></div>
       <div class="num">${fmt(r.saved)} · ${r.reads}×</div>
-    </div>`).join("") : `<div class="empty">No SAN reads recorded yet.</div>`;
+    </div>`;
+  }).join("") : `<div class="empty">No SAN reads recorded yet.</div>`;
 
   // recent feed (flash new)
   $("feed").innerHTML = d.recent.length ? d.recent.map(e => {
     const key = e.ts + e.file;
     const isNew = !first && !seenKeys.has(key);
+    const repoL = anonRepo(e.repo), fileL = anonFile(e.file);
     return `<div class="ev" ${isNew ? 'style="border-left-color:var(--green)"' : ''}>
-      <span class="repo-chip">${esc(e.repo)}</span>
-      <span class="file" title="${esc(e.file)}">${esc(e.file)}</span>
+      <span class="repo-chip">${esc(repoL)}</span>
+      <span class="file" title="${esc(fileL)}">${esc(fileL)}</span>
       <span class="calc">${fmt(e.raw)} → ${fmt(e.san)}</span>
       <span class="saved">−${fmt(e.saved)}</span>
     </div>`;
@@ -162,6 +192,13 @@ function apply(d) {
   d.recent.forEach(e => seenKeys.add(e.ts + e.file));
   first = false;
 }
+
+// re-render instantly when demo mode is toggled (persist choice across reloads)
+$("demo").addEventListener("change", () => {
+  localStorage.setItem("savings-demo", $("demo").checked ? "1" : "0");
+  if (LAST) apply(LAST);
+});
+$("demo").checked = localStorage.getItem("savings-demo") === "1";
 
 function connect() {
   const es = new EventSource("/savings-events");
