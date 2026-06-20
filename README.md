@@ -10,7 +10,7 @@ Persistent decision memory for AI code agent teams. Agents learn from mistakes, 
 - [Quick Start](#quick-start) — install in 2 minutes
 - [How To Use It](#how-to-use-it) — the agent loop, a worked example, what you get
 - [Architecture](#architecture) — what lives where, [performance & internals](#performance--internals)
-- [MCP Tools (17)](#mcp-tools-17) — the agent-facing API
+- [MCP Tools (18)](#mcp-tools-18) — the agent-facing API
 - [Agent Team](#agent-team) — bundled role templates
 - [Model Routing](#model-routing-quality-per-cost) — right model per phase, two-strikes escalation, plan handoff
 - [Brain Protocol](#brain-protocol) — the enforced decision loop
@@ -49,6 +49,8 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **SAN Protocol** | Compress code to ~20% of original tokens (81% saved, measured). Full codebase fits in context. |
 | **Token Savings Tracker** | [`token_savings`](#measuring-your-savings-token_savings) reports tokens saved this session / today / all-time, with %. |
 | **Enforcement Hook** | Code edits are blocked until the agent logs a decision — memory actually gets populated. |
+| **Survives compaction** | SessionStart hook re-injects the pending roadmap after `/compact` so the agent resumes instead of re-researching. [Details](#surviving-compaction-the-amnesia-fix) |
+| **Relevance search** | `query_decisions(query="…")` ranks by topic relevance, not just recency; `get_roadmap` returns open work in one call. |
 
 ## Quick Start
 
@@ -220,7 +222,7 @@ The brain is built to stay fast as the decision history grows into thousands of 
 
 > **Files in `~/.agent-brain/`:** `decisions.json` (snapshot) + `decisions.journal` (deltas) are the decision memory — both are needed; don't delete one without the other. `office-state.json` is live dashboard state (self-pruning), `san_savings.jsonl` is the token-savings log. All are per-machine and git-ignored.
 
-## MCP Tools (17)
+## MCP Tools (18)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
@@ -233,8 +235,9 @@ The brain is built to stay fast as the decision history grows into thousands of 
 ### Query
 | Tool | Purpose |
 |------|---------|
-| `query_decisions` | Filter decisions by area/agent/repo/outcome |
+| `query_decisions` | Filter by area/agent/repo/outcome **and** rank by free-text relevance (`query="..."`) — finds decisions about a topic without knowing the exact area |
 | `get_decision` | Full detail + feedback for one decision |
+| `get_roadmap` | What's left to do — pending + roadmap/blocker-tagged work, ranked. One call to resume context after a fresh session or compaction |
 
 ### Code Bridge
 | Tool | Purpose |
@@ -496,6 +499,42 @@ Patterns are matched against the absolute file path. The hook fails open: an inv
 > { "env": { "BRAIN_SKIP_ENFORCE": "1" } }
 > ```
 > Agents spawned via the team system won't inherit this, so enforcement stays active for them.
+
+### Surviving compaction (the amnesia fix)
+
+A long session eventually hits `/compact`, and the summarizer can drop the pending work and roadmap you discussed earlier — the agent then re-researches things the brain already knows. Two hooks close that gap by **pushing** the brain's open-work digest back into context at the exact moments memory is born or lost:
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `inject_brain_context.py` | `SessionStart` (`startup`/`resume`/**`compact`**) | Injects the ranked open-work digest (pending + roadmap-tagged decisions) via `additionalContext`. **`source=compact` is the post-compaction re-entry** — it injects a fuller digest so the roadmap survives the summary. |
+| `remind_brain_before_research.py` | `PreToolUse` matcher `Workflow` | Soft, non-blocking nudge to check `get_roadmap`/`query_decisions` before a fan-out research workflow. Doesn't block — the push digest already put the answer in context. |
+
+This is the same digest `get_roadmap` returns, so push (hook) and pull (tool) never diverge. The digest is token-budgeted (top ~15 items, action truncated) — ~1k tokens once per compaction.
+
+**Tagging durable work:** put `roadmap` or `blocker` in a decision's `area` (e.g. `area="kmp-foundation/roadmap"`) and it floats to the top of the digest above transient pending edits. Untagged `pending` decisions still appear, newest first — so the fix works on an existing brain with no migration.
+
+**Optional hard research gate:** the reminder is soft by default. To *block* `Workflow` until a brain read happened this session, set `"research_gate": "hard"` in `~/.agent-brain/config.json`. A `pre_check`/`query_decisions`/`get_roadmap` call satisfies the gate (it writes `~/.agent-brain/.last_query_marker`); `BRAIN_SKIP_ENFORCE=1` bypasses it. Soft is recommended — a hard gate can false-positive when the brain genuinely has nothing on the topic.
+
+**Install** (setup.sh wires all three hooks idempotently, backing up `settings.json.bak`):
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume|compact",
+        "hooks": [{ "type": "command",
+          "command": "~/.agent-brain/.venv/bin/python /path/to/agent-brain/brain/hooks/inject_brain_context.py",
+          "timeout": 15000 }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Workflow",
+        "hooks": [{ "type": "command",
+          "command": "~/.agent-brain/.venv/bin/python /path/to/agent-brain/brain/hooks/remind_brain_before_research.py",
+          "timeout": 10000 }] }
+    ]
+  }
+}
+```
 
 ## SAN Protocol
 

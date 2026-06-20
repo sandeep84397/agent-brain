@@ -173,6 +173,21 @@ def _write_decision_marker(agent: str, decision_id: str) -> None:
         pass
 
 
+QUERY_MARKER_FILE = BRAIN_DIR / ".last_query_marker"
+
+
+def _write_query_marker() -> None:
+    """Mark that a brain read happened — satisfies the optional hard research
+    gate (remind_brain_before_research.py). Never raises."""
+    try:
+        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        QUERY_MARKER_FILE.write_text(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+        }))
+    except OSError:
+        pass
+
+
 def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", repo: str = "") -> None:
     """Silently update office state from brain tool calls. Never raises."""
     try:
@@ -721,6 +736,7 @@ def pre_check(agent: str, area: str, action_description: str) -> str:
     rejections elsewhere, and adaptive warnings from this agent's history.
     """
     _auto_heartbeat(agent, "planning", action_description)
+    _write_query_marker()
     with LOCK:
         G = _load_graph()
     sections = []
@@ -1281,14 +1297,27 @@ def brain_stats() -> str:
 
 @mcp.tool()
 def query_decisions(area: str = "", agent: str = "", repo: str = "",
-                    outcome: str = "", limit: int = 10) -> str:
+                    outcome: str = "", limit: int = 10,
+                    query: str = "", sort: str = "") -> str:
     """
     Query past decisions, filtered by area/agent/repo/outcome
     (pending|accepted|rejected|failed|revised). limit defaults to 10.
+
+    query: free-text — ranks matches by relevance over action+reasoning+area
+        (not just recency). Use this to find decisions about a topic/symbol
+        when you don't know the exact area, e.g. "AppStorage pending roadmap".
+    sort: "relevance" (default when query is set) or "recency" (default
+        otherwise). Relevance uses token + domain-term similarity; recency
+        returns newest-first.
     """
+    _write_query_marker()
     with LOCK:
         G = _load_graph()
-    results = []
+    if not sort:
+        sort = "relevance" if query else "recency"
+    q_tokens = _tokenize(query) if query else set()
+
+    rows = []
     for node_id, data in G.nodes(data=True):
         if data.get("type") != "decision":
             continue
@@ -1300,12 +1329,36 @@ def query_decisions(area: str = "", agent: str = "", repo: str = "",
             continue
         if outcome and data.get("outcome") != outcome:
             continue
-        results.append(f"[{node_id}] {data.get('agent','?')} @ {data.get('repo','?')} | "
-                        f"area={data.get('area','?')} | {str(data.get('action','?'))[:150]} "
-                        f"-> {data.get('outcome','pending')}")
-    if not results:
+        ts = data.get("timestamp", "")
+        score = 0.0
+        if q_tokens:
+            haystack = _tokenize(
+                f"{data.get('action','')} {data.get('reasoning','')} "
+                f"{data.get('area','')}")
+            score = _similarity_sets(q_tokens, haystack)
+            if score == 0.0:
+                continue  # text query given but no overlap — drop
+        rows.append((score, ts, node_id, data))
+
+    if not rows:
         return "No matching decisions."
-    return f"{len(results)} decision(s):\n\n" + "\n".join(results[-limit:])
+
+    if sort == "relevance" and q_tokens:
+        rows.sort(key=lambda r: (r[0], r[1]), reverse=True)  # score, then recency
+    else:
+        rows.sort(key=lambda r: r[1], reverse=True)  # recency
+
+    shown = rows[:limit]
+    lines = []
+    for score, ts, node_id, data in shown:
+        prefix = f"({int(score*100)}%) " if (q_tokens and sort == "relevance") else ""
+        lines.append(
+            f"[{node_id}] {prefix}{data.get('agent','?')} @ {data.get('repo','?')} | "
+            f"area={data.get('area','?')} | {str(data.get('action','?'))[:150]} "
+            f"-> {data.get('outcome','pending')}")
+    header = (f"{len(rows)} decision(s), top {len(shown)} by {sort}:"
+              if len(rows) > len(shown) else f"{len(rows)} decision(s):")
+    return f"{header}\n\n" + "\n".join(lines)
 
 
 @mcp.tool()
@@ -1355,6 +1408,73 @@ def get_decision(decision_id: str) -> str:
         if len(code_syms) > 30:
             lines.append(f"  ... and {len(code_syms) - 30} more")
     return "\n".join(lines)
+
+
+def _roadmap_rows(G: nx.DiGraph, repo: str = "") -> list[dict]:
+    """Open work to resume: pending decisions + roadmap/blocker-tagged ones.
+
+    Ranked so durable roadmap markers float above transient pending edits:
+    roadmap/blocker areas first, then newest. Used by both get_roadmap (pull)
+    and the SessionStart digest hook (push), so they never diverge.
+    """
+    rows = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") != "decision":
+            continue
+        outcome = data.get("outcome", "pending")
+        area = str(data.get("area", ""))
+        is_roadmap = "roadmap" in area.lower() or "blocker" in area.lower()
+        # Resume-worthy = still open, or explicitly tagged roadmap/blocker.
+        if outcome not in ("pending", "revised") and not is_roadmap:
+            continue
+        if repo and data.get("repo") != repo:
+            continue
+        rows.append({
+            "id": node_id,
+            "repo": data.get("repo", "?"),
+            "area": area or "?",
+            "action": str(data.get("action", "?")),
+            "outcome": outcome,
+            "timestamp": data.get("timestamp", ""),
+            "is_roadmap": is_roadmap,
+        })
+    # roadmap-tagged first, then most recent
+    rows.sort(key=lambda r: (r["is_roadmap"], r["timestamp"]), reverse=True)
+    return rows
+
+
+def _format_roadmap_digest(rows: list[dict], limit: int = 15,
+                           action_chars: int = 150) -> str:
+    """Compact, token-budgeted digest of open work. Shared push/pull format."""
+    if not rows:
+        return "No open work. Brain has no pending or roadmap decisions."
+    shown = rows[:limit]
+    lines = []
+    for r in shown:
+        tag = "★ROADMAP " if r["is_roadmap"] else ""
+        lines.append(
+            f"[{r['id']}] {tag}{r['repo']} | {r['area']} | "
+            f"{r['action'][:action_chars]} -> {r['outcome']}")
+    header = f"OPEN WORK ({len(rows)} item(s)"
+    if len(rows) > len(shown):
+        header += f", top {len(shown)} shown — query_decisions for more"
+    header += "):"
+    return header + "\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def get_roadmap(repo: str = "", limit: int = 15) -> str:
+    """
+    What's left to do — pending decisions + roadmap/blocker-tagged work,
+    ranked (roadmap markers first, then newest). One call to resume context
+    after a fresh session or compaction without guessing query terms.
+    Scope to one repo with `repo`. Tag durable work by putting "roadmap" or
+    "blocker" in a decision's `area` (e.g. area="kmp-foundation/roadmap").
+    """
+    _write_query_marker()
+    with LOCK:
+        G = _load_graph()
+    return _format_roadmap_digest(_roadmap_rows(G, repo), limit=limit)
 
 
 # ===========================================================================
@@ -2739,6 +2859,7 @@ def validate_brain() -> str:
     real_config_file = CONFIG_FILE
     real_office_file = OFFICE_STATE_FILE
     real_marker_file = DECISION_MARKER_FILE
+    real_query_marker_file = QUERY_MARKER_FILE
 
     def _test(name: str, condition: bool, detail: str = ""):
         nonlocal passed, failed
@@ -2759,6 +2880,7 @@ def validate_brain() -> str:
         globals()["CONFIG_FILE"] = tmp_root / "config.json"
         globals()["OFFICE_STATE_FILE"] = tmp_root / "office-state.json"
         globals()["DECISION_MARKER_FILE"] = tmp_root / ".last_decision_marker"
+        globals()["QUERY_MARKER_FILE"] = tmp_root / ".last_query_marker"
         # Drop any shadow/cache from the real brain so temp diffs start clean.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
 
@@ -3177,6 +3299,42 @@ def validate_brain() -> str:
               "similar past failure" in r.lower() or "payment" in r.lower(),
               f"got: {r[:200]}")
 
+        # --- Amnesia fix: relevance search + roadmap digest ---
+        # Seed: a roadmap-tagged decision + a noisy recent one in another area.
+        rm = log_decision("dev", "test-repo", "kmp-foundation/roadmap",
+                          "Foundation-first: shared models then SharedDB then AppStorage",
+                          "user directive: fix platform blockers before screens")
+        rm_id = rm.split("Decision logged: ")[1].split("\n")[0]
+        for i in range(3):
+            log_decision("dev", "test-repo", "ui/buttons", f"tweak button color {i}", "polish")
+
+        # Relevance: a topical query must rank the roadmap decision above the
+        # noisier-but-more-recent button decisions (the old recency bug).
+        r = query_decisions(repo="test-repo", query="foundation AppStorage roadmap", limit=3)
+        _test("amnesia: relevance ranks roadmap over recency", rm_id in r,
+              f"got: {r[:300]}")
+
+        # Recency mode still works (no query).
+        r = query_decisions(repo="test-repo", sort="recency", limit=2)
+        _test("amnesia: recency sort returns newest", "button color 2" in r,
+              f"got: {r[:200]}")
+
+        # get_roadmap surfaces pending + roadmap, roadmap-tagged FIRST.
+        r = get_roadmap("test-repo", limit=10)
+        first_line = r.split("\n")[1] if len(r.split("\n")) > 1 else ""
+        _test("amnesia: get_roadmap lists roadmap decision first",
+              rm_id in first_line and "ROADMAP" in first_line, f"got: {first_line[:200]}")
+        _test("amnesia: get_roadmap includes pending Stripe decision",
+              wf_dec_id in r or "OPEN WORK" in r)
+
+        # Roadmap digest is non-empty and token-budgeted (header + items).
+        from_rows = _roadmap_rows(_load_graph(), "test-repo")
+        digest = _format_roadmap_digest(from_rows, limit=15)
+        _test("amnesia: digest non-empty", "OPEN WORK" in digest and rm_id in digest)
+
+        # Query marker is written by read tools (satisfies optional hard gate).
+        _test("amnesia: query marker written", QUERY_MARKER_FILE.exists())
+
      except Exception as e:
         import traceback
         failed += 1
@@ -3189,6 +3347,7 @@ def validate_brain() -> str:
         globals()["CONFIG_FILE"] = real_config_file
         globals()["OFFICE_STATE_FILE"] = real_office_file
         globals()["DECISION_MARKER_FILE"] = real_marker_file
+        globals()["QUERY_MARKER_FILE"] = real_query_marker_file
         # Drop temp shadow/cache; next real _load_graph re-reads from disk.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
         # Clean up
@@ -3478,6 +3637,13 @@ if __name__ == "__main__":
     if cmd == "office":
         print(office_state(_sys.argv[2] if len(_sys.argv) > 2 else ""))
         _sys.exit(0)
+    if cmd == "roadmap":
+        # Open-work digest for the SessionStart/compact hook (and humans).
+        _repo = _sys.argv[2] if len(_sys.argv) > 2 else ""
+        with LOCK:
+            _G = _load_graph()
+        print(_format_roadmap_digest(_roadmap_rows(_G, _repo)))
+        _sys.exit(0)
     if cmd == "savings":
         # CLI runs in its own process: "this session" counters are empty here,
         # so report the most recent recorded session instead.
@@ -3495,7 +3661,7 @@ if __name__ == "__main__":
         _sys.exit(0)
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
-              "stats|office [repo]|savings]")
+              "stats|office [repo]|savings|roadmap [repo]]")
         print("  (no args)        run the MCP server")
         _sys.exit(0)
 

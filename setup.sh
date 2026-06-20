@@ -271,31 +271,63 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4b: Install enforcement hook
+# Step 4b: Install brain hooks (enforce + amnesia-fix injection + research nudge)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4b] Installing brain protocol enforcement hook..."
+echo "[4b] Installing brain hooks..."
 
 SETTINGS_FILE="$HOME/.claude/settings.json"
-HOOK_SCRIPT="$SCRIPT_DIR/brain/hooks/enforce_brain_protocol.py"
+HOOKS_DIR="$SCRIPT_DIR/brain/hooks"
+PYBIN="$BRAIN_DIR/.venv/bin/python"
 
-if [ -f "$HOOK_SCRIPT" ]; then
-    if [ -f "$SETTINGS_FILE" ]; then
-        # Check if hook already installed
-        if grep -q "enforce_brain_protocol" "$SETTINGS_FILE" 2>/dev/null; then
-            echo "  Enforcement hook already installed. Skipping."
-        else
-            echo "  NOTE: Add this PreToolUse hook to $SETTINGS_FILE to enforce brain protocol:"
-            echo "  {\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Edit|Write\", \"hooks\": [{\"type\": \"command\", \"command\": \"python3 $HOOK_SCRIPT\", \"timeout\": 5000}]}]}}"
-            echo "  This blocks code edits unless log_decision was called first."
-            echo "  Set BRAIN_SKIP_ENFORCE=1 in env to bypass for your own direct edits."
-        fi
-    else
-        echo "  WARNING: $SETTINGS_FILE not found. Create it and add the hook manually."
-    fi
-else
-    echo "  WARNING: Hook script not found at $HOOK_SCRIPT"
-fi
+# Idempotent JSON merge — adds three hooks without clobbering existing ones:
+#   PreToolUse  Edit|Write  -> enforce_brain_protocol.py   (gate code edits)
+#   SessionStart startup|resume|compact -> inject_brain_context.py  (amnesia fix)
+#   PreToolUse  Workflow    -> remind_brain_before_research.py (soft research nudge)
+"$PYBIN" - "$SETTINGS_FILE" "$HOOKS_DIR" "$PYBIN" <<'PYEOF'
+import json, sys
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+hooks_dir = sys.argv[2]
+pybin = sys.argv[3]
+
+settings = {}
+if settings_path.exists():
+    try:
+        settings = json.loads(settings_path.read_text())
+    except json.JSONDecodeError:
+        print(f"  WARN: {settings_path} is not valid JSON — skipping hook install.")
+        sys.exit(0)
+
+hooks = settings.setdefault("hooks", {})
+
+def has_cmd(event, substr):
+    return any(substr in h.get("command", "")
+              for blk in hooks.get(event, []) for h in blk.get("hooks", []))
+
+def add(event, matcher, script, timeout):
+    cmd = f"{pybin} {hooks_dir}/{script}"
+    if has_cmd(event, script):
+        print(f"  = {event}/{script} already installed")
+        return
+    hooks.setdefault(event, []).append({
+        "matcher": matcher,
+        "hooks": [{"type": "command", "command": cmd, "timeout": timeout}],
+    })
+    print(f"  + {event}/{script}")
+
+add("PreToolUse", "Edit|Write", "enforce_brain_protocol.py", 5000)
+add("SessionStart", "startup|resume|compact", "inject_brain_context.py", 15000)
+add("PreToolUse", "Workflow", "remind_brain_before_research.py", 10000)
+
+if settings_path.exists():
+    settings_path.with_suffix(".json.bak").write_text(settings_path.read_text())
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+print(f"  Wrote {settings_path} (backup at settings.json.bak)")
+PYEOF
+echo "  Set BRAIN_SKIP_ENFORCE=1 to bypass all gates for your own direct edits."
 
 # ---------------------------------------------------------------------------
 # Step 5: Install agent templates
