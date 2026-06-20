@@ -78,10 +78,12 @@ def main() -> None:
     # Standing directive — injected EVERY session/compact, even with no open
     # work, so the SAN read-path default is always in view.
     san_directive = (
-        "[agent-brain] To READ/EXPLORE existing code, use get_san "
-        "(detail='sig' for what exists, 'full' for impl) BEFORE raw Read — "
-        "same structure, ~5-11x fewer tokens. Raw Read only for files you're "
-        "about to EDIT, non-code files, or when no .san exists."
+        "[agent-brain] ALWAYS use get_san to READ/EXPLORE existing code BEFORE "
+        "raw Read — get_san(file_path=\"<path>\") takes the absolute path you "
+        "already have; detail='sig' for structure, 'full' for impl. Same "
+        "structure, ~5-11x fewer tokens. Use raw Read ONLY for files you're "
+        "about to EDIT (need exact bytes), non-code files, or when no .san exists. "
+        "This is a standing rule, like graph-first exploration."
     )
 
     digest = (proc.stdout or "").strip()

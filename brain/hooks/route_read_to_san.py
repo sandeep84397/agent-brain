@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-Read -> SAN Routing Hook (PreToolUse, soft / non-blocking)
+Read -> SAN Routing Hook (PreToolUse)
 
 When the agent calls raw Read on a code file that HAS a fresh .san brief, this
-nudges it toward get_san (same structure, far fewer tokens) — then ALLOWS the
-Read anyway. SAN is for exploring; raw Read stays correct for editing, non-code
-files, or files with no/stale .san, so this NEVER blocks.
+steers it toward get_san (same structure, far fewer tokens). SAN is for
+exploring; raw Read stays correct for editing, non-code files, or files with
+no/stale .san — so the FIRST read of any file is always allowed.
+
+Escalation (per file, per session):
+- 1st raw read of a fresh-SAN file -> soft nudge, ALLOW. (Exploration / edit-prep
+  is the legitimate first-read case; never blocked.)
+- 2nd+ raw read of the SAME fresh-SAN file -> rarely edit-prep, usually waste:
+    * read_enforcement="soft" (default): a STRONGER nudge, still ALLOW.
+    * read_enforcement="hard"  (opt-in, config.json): BLOCK (exit 2) with an
+      actionable message. Escape with BRAIN_SKIP_READ_BLOCK=1 when you truly
+      need exact bytes (about to Edit).
+
+Per-FILE dedupe (was per-session): the cheaper path stays visible on every
+file's first read, not just the first read of the whole session — that
+session-scoped silence was why agents kept raw-reading files #2..#N.
 
 Self-contained on purpose: server.py hard-imports FastMCP, so a hook that
 imported it would crash (violating fail-open). The repo map + path mapping +
 mtime freshness check are all stdlib, read straight from config.json — the same
 read-config-directly pattern as enforce_brain_protocol.py.
 
-Dedupe: one nudge per file per session (keyed on the hook's session_id). Without
-it, every Read of a covered file would nag. A TTL fallback covers the rare case
-where session_id is absent; day-old markers are best-effort cleaned.
-
-Output contract (PreToolUse): JSON additionalContext + exit 0 (ALLOW). Never
-permissionDecision=deny.
-
-Discipline: fail-open on ANY error. Respect BRAIN_SKIP_ENFORCE=1.
+Discipline: fail-open on ANY error. Respect BRAIN_SKIP_ENFORCE=1 (disables the
+hook entirely) and BRAIN_SKIP_READ_BLOCK=1 (bypasses only the hard block).
 
 Install: register in ~/.claude/settings.json under hooks.PreToolUse, matcher "Read".
 """
@@ -54,6 +61,16 @@ def _repos() -> dict:
             if isinstance(repos, dict) else {}
     except Exception:
         return {}
+
+
+def _read_enforcement() -> str:
+    """'soft' (default) | 'hard'. 'hard' BLOCKS a 2nd+ raw read of a fresh-SAN
+    file (first read always allowed). Read from config.json read_enforcement."""
+    try:
+        mode = json.loads(CONFIG_FILE.read_text()).get("read_enforcement", "soft")
+        return mode if mode in ("soft", "hard") else "soft"
+    except Exception:
+        return "soft"
 
 
 def _match_repo(abs_path: str, repos: dict):
@@ -95,31 +112,39 @@ def _is_fresh(source: Path, san: Path) -> bool:
         return False
 
 
-def _marker(session_id: str) -> Path:
-    # Hash so distinct session_ids never collide (lossy char-stripping could
-    # map "abc.123" and "abc/123" to the same marker, cross-session bleed).
-    if session_id:
-        digest = hashlib.md5(session_id.encode("utf-8", "replace")).hexdigest()[:16]
-        return BRAIN_DIR / f".read_san_nudged_{digest}"
-    return BRAIN_DIR / ".read_san_nudged"
+def _marker(session_id: str, file_real: str) -> Path:
+    # Per-(session, file): the cheaper path stays visible on EVERY file's first
+    # raw read, not just the first read of the whole session. Hash both so weird
+    # session_ids / long paths can't collide or overflow the filename.
+    key = f"{session_id}\x00{file_real}"
+    digest = hashlib.md5(key.encode("utf-8", "replace")).hexdigest()[:20]
+    return BRAIN_DIR / f".read_san_nudged_{digest}"
 
 
-def _already_nudged(session_id: str) -> bool:
-    m = _marker(session_id)
+def _read_count(session_id: str, file_real: str) -> int:
+    """How many raw reads of THIS file we've already seen this session."""
+    m = _marker(session_id, file_real)
     if not m.exists():
-        return False
-    if session_id:
-        return True  # session-scoped marker: presence = already nudged
+        return 0
+    # When session_id is absent, treat a marker older than the TTL as expired.
+    if not session_id:
+        try:
+            if (time.time() - m.stat().st_mtime) >= DEDUPE_TTL_S:
+                return 0
+        except OSError:
+            return 0
     try:
-        return (time.time() - m.stat().st_mtime) < DEDUPE_TTL_S
-    except OSError:
-        return False
+        return int(m.read_text().split(":")[0] or "0")
+    except (OSError, ValueError):
+        return 1  # marker exists but unreadable -> treat as already-seen
 
 
-def _mark_nudged(session_id: str) -> None:
+def _bump_read(session_id: str, file_real: str) -> None:
     try:
         BRAIN_DIR.mkdir(parents=True, exist_ok=True)
-        _marker(session_id).write_text(str(time.time()))
+        m = _marker(session_id, file_real)
+        n = _read_count(session_id, file_real) + 1
+        m.write_text(f"{n}:{time.time()}")
     except OSError:
         pass
 
@@ -138,20 +163,35 @@ def _cleanup_old_markers() -> None:
         pass
 
 
-def _emit_nudge(abs_path: str, san_path: Path) -> None:
+def _emit_nudge(abs_path: str, repeat: bool) -> None:
+    """Soft nudge (always exit 0 / ALLOW). Stronger wording on a repeat raw read
+    of the same fresh-SAN file, since that's rarely edit-prep."""
+    base = os.path.basename(abs_path)
+    if repeat:
+        msg = (f"[agent-brain] You're re-reading {base} raw — its SAN is fresh and "
+               f"~5-11x cheaper. Call get_san(file_path=\"{abs_path}\") now "
+               f"(detail='sig' for structure, 'full' for impl). Raw Read only if "
+               f"you're about to EDIT it.")
+    else:
+        msg = (f"[agent-brain] A fresh SAN brief exists for {base}. To EXPLORE this "
+               f"code, prefer get_san(file_path=\"{abs_path}\") (detail='sig' for "
+               f"what exists, 'full' for impl) — same structure, ~5-11x fewer tokens. "
+               f"Proceeding with raw Read; switch to get_san unless about to EDIT it.")
     print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": (
-                f"[agent-brain] A fresh SAN brief exists for {os.path.basename(abs_path)}. "
-                f"To EXPLORE this code, prefer get_san(file_path=\"{abs_path}\") "
-                f"(detail='sig' for what exists, 'full' for impl) — same structure, "
-                f"~5-11x fewer tokens. Proceeding with raw Read; switch to get_san "
-                f"unless you're about to EDIT this file."
-            ),
-        }
+        "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg}
     }))
     sys.exit(0)
+
+
+def _emit_block(abs_path: str) -> None:
+    """Hard block (exit 2) — only on a repeat raw read of a fresh-SAN file when
+    read_enforcement=hard. First read is never blocked. Escape: BRAIN_SKIP_READ_BLOCK=1."""
+    sys.stderr.write(
+        f"BRAIN: {os.path.basename(abs_path)} has a fresh SAN — re-reading it raw "
+        f"wastes ~5-11x tokens. Use get_san(file_path=\"{abs_path}\") "
+        f"(detail='sig' or 'full'). If you genuinely need exact bytes (about to "
+        f"Edit), set BRAIN_SKIP_READ_BLOCK=1 to bypass.\n")
+    sys.exit(2)
 
 
 def main() -> None:
@@ -193,12 +233,21 @@ def main() -> None:
         sys.exit(0)  # stale SAN -> don't route toward outdated data
 
     session_id = hook_input.get("session_id", "")
-    if _already_nudged(session_id):
-        sys.exit(0)  # one nudge per file/session is enough
-
+    file_real = os.path.realpath(file_path)
+    prior = _read_count(session_id, file_real)  # raw reads of THIS file so far
     _cleanup_old_markers()
-    _mark_nudged(session_id)
-    _emit_nudge(file_path, san_path)
+    _bump_read(session_id, file_real)
+
+    # FIRST raw read of this file: always allow, soft nudge. A first read is the
+    # legitimate case (exploration, edit-prep, "is this a stub?") — never block it.
+    if prior == 0:
+        _emit_nudge(file_path, repeat=False)
+
+    # REPEAT raw read of a fresh-SAN file — rarely edit-prep, usually waste.
+    # hard mode (opt-in) blocks it (with an escape); soft mode nudges harder.
+    if _read_enforcement() == "hard" and os.environ.get("BRAIN_SKIP_READ_BLOCK") != "1":
+        _emit_block(file_path)
+    _emit_nudge(file_path, repeat=True)
 
 
 if __name__ == "__main__":
