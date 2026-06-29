@@ -102,6 +102,12 @@ rm -rf ~/.agent-brain/
 rm ~/.claude/agents/{project-manager,product-owner,principal-engineer,backend-engineer,frontend-engineer,qa-engineer}.md
 ```
 
+Setup also adds an `agent-brain` block to `~/.claude/CLAUDE.md` (the SAN
+tool-ladder) and hooks to `~/.claude/settings.json`. To remove them, delete the
+block between `<!-- agent-brain:san-ladder -->` and `<!-- /agent-brain:san-ladder -->`
+in CLAUDE.md, and drop the `route_*`/`enforce_*`/`inject_*`/`remind_*` hook
+entries from `settings.json`.
+
 ## Troubleshooting
 
 ### MCP server not connecting

@@ -69,6 +69,8 @@ The setup wizard will:
 - Create a Python venv and install dependencies
 - Prompt for your repo paths (or use the template config)
 - Register the MCP server globally with Claude Code
+- Install the brain hooks (decision-gate, amnesia re-inject, Read/Bash→SAN routing)
+- Add the SAN tool-ladder to `~/.claude/CLAUDE.md` so agents read code the cheap way by default — no manual edit needed (idempotent; safe to re-run)
 - Offer to customize agent names interactively
 - Run verification checks
 

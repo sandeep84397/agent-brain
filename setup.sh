@@ -334,6 +334,52 @@ PYEOF
 echo "  Set BRAIN_SKIP_ENFORCE=1 to bypass all gates for your own direct edits."
 
 # ---------------------------------------------------------------------------
+# Step 4c: Install the SAN tool-ladder directive into the global CLAUDE.md
+# ---------------------------------------------------------------------------
+# So every install gets the "find->read->grep-literal->edit" habit without the
+# user having to remember to hand-edit CLAUDE.md. Idempotent: a marked block is
+# inserted once and skipped on re-run; the rest of CLAUDE.md is never touched.
+echo ""
+echo "[4c] Adding SAN tool-ladder to global CLAUDE.md..."
+
+GLOBAL_CLAUDE="$HOME/.claude/CLAUDE.md"
+"$PYBIN" - "$GLOBAL_CLAUDE" <<'PYEOF'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+MARKER = "<!-- agent-brain:san-ladder -->"
+BLOCK = f"""{MARKER}
+## Code Reading: SAN tool-ladder (agent-brain)
+
+When a `.san` brief exists for a source file, use the right tool per step —
+this is a standing rule, like graph-first exploration:
+
+| Step | Goal | Use | NOT |
+|------|------|-----|-----|
+| Find | which file/symbol has X | `query_san` / `semantic_search_nodes` | `grep -r` raw source |
+| Read/understand | what a file/class does | `get_san(file_path="<abs>")` (`detail="sig"`/`"full"`) | `cat`/`head`/`sed` the file |
+| Exact literal | find a precise string/line | `grep`/`rg` on the file | `get_san` (SAN drops literals) |
+| Edit | change exact bytes | raw `Read` then `Edit` | — |
+
+`get_san` is ~5-11x fewer tokens than reading the raw file and carries the same
+structure (signatures, deps, errors). Discovery `grep` across files and
+build/run/git/test in the shell are always fine.
+<!-- /agent-brain:san-ladder -->
+"""
+
+existing = path.read_text() if path.exists() else ""
+if MARKER in existing:
+    print(f"  ✓ SAN ladder already in {path}")
+else:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sep = "" if (not existing or existing.endswith("\n\n")) else \
+          ("\n" if existing.endswith("\n") else "\n\n")
+    path.write_text(existing + sep + BLOCK)
+    print(f"  ✓ Added SAN ladder to {path}")
+PYEOF
+
+# ---------------------------------------------------------------------------
 # Step 5: Install agent templates
 # ---------------------------------------------------------------------------
 echo ""
