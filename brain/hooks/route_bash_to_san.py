@@ -3,10 +3,18 @@
 Bash -> SAN Routing Hook (PreToolUse, matcher "Bash")
 
 Closes the blind spot in route_read_to_san.py: that hook only watches the Read
-TOOL, so code exploration via the BASH tool (cat/grep/sed/head/tail/awk on
-source files) bypasses SAN routing entirely. This hook watches Bash, parses the
-command, and applies the SAME escalation when a code-exploration command targets
-a source file that has a fresh .san:
+TOOL, so DUMPING a source file via the BASH tool (cat/head/sed/tail on a file)
+bypasses SAN routing entirely. This hook watches Bash, parses the command, and
+applies the SAME escalation when a file-DUMP command targets a source file that
+has a fresh .san.
+
+What it does NOT touch (by design):
+- grep/rg/awk on a file — these search for EXACT literals/strings, which SAN
+  abstracts away, so grep is the RIGHT tool there, not a bypass.
+- Discovery (grep -r / globs across files) — the legitimate "which file?" step.
+- The SAN-native discovery tool is query_san; the SAN-native read is get_san.
+
+Escalation when a DUMP command hits a fresh-SAN file:
 
 - 1st time -> soft nudge, ALLOW (legit one-off peek / about to edit).
 - 2nd+ time exploring a fresh-SAN file via Bash this session:
@@ -14,13 +22,11 @@ a source file that has a fresh .san:
     * read_enforcement="hard" (opt-in): BLOCK (exit 2). Escape:
       BRAIN_SKIP_READ_BLOCK=1 when you genuinely need the raw bytes.
 
-Discovery vs. reading: this fires ONLY when a command NAMES a specific source
-file (cat/head/sed/grep on Foo.kt). DISCOVERY — searching ACROSS files for a
-name/pattern (grep -r, grep src/*.kt, grep -R . ) — is the legitimate
-"which file do I need?" step and is NEVER touched; it has no specific-file
-argument so it doesn't match. So: grep to FIND, get_san to READ the file you
-found. Build/run/git/test/mkdir are never touched. A command with write/pipe
-intent (>, >>, tee, |, xargs) is left alone (could be a real pipeline).
+Fires ONLY when a file-DUMP command (cat/head/sed/tail/...) names a specific
+source file with a fresh .san. grep/rg/awk (literal search), discovery grep
+across files, build/run/git/test/mkdir, and write/pipe commands (>, >>, tee, |,
+xargs) are all left alone. Rule of thumb: query_san to FIND, get_san to READ,
+grep for an EXACT literal in a file, raw Read to EDIT.
 
 Self-contained (server.py imports FastMCP; importing it would crash the hook).
 Mirrors the dedupe/freshness logic of route_read_to_san.py — keep them in sync.
@@ -51,9 +57,15 @@ SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
 DEDUPE_TTL_S = 30 * 60
 MARKER_CLEANUP_AGE_S = 24 * 60 * 60
 
-# Commands that READ a file's contents for exploration (the SAN-replaceable ones).
-EXPLORE_CMDS = {"cat", "grep", "egrep", "fgrep", "rg", "ag", "sed", "awk",
-                "head", "tail", "less", "more", "bat", "view"}
+# Commands that DUMP a file's contents to READ/understand it — SAN replaces
+# these (it carries the structure at ~5-11x fewer tokens). These are the ones
+# we nudge toward get_san when they target a specific fresh-SAN source file.
+DUMP_CMDS = {"cat", "head", "tail", "sed", "less", "more", "bat", "view"}
+# Search/filter commands (grep/rg/awk/...) are NOT nudged even on a named file:
+# they look for EXACT literals/strings, which SAN deliberately abstracts away —
+# so grep-on-a-file is the right tool, not a SAN bypass. (Discovery grep across
+# files never matched anyway since it has no specific-file argument.)
+SEARCH_CMDS = {"grep", "egrep", "fgrep", "rg", "ag", "awk", "ack"}
 # If the command writes/edits/pipes-into-something, leave it alone — not a pure read.
 WRITE_HINTS = (">", ">>", "|", "tee", "xargs")
 
@@ -174,7 +186,9 @@ def _explored_source_files(command: str):
     if prog in ("sudo", "command", "time") and len(tokens) > 1:
         tokens = tokens[1:]
         prog = os.path.basename(tokens[0])
-    if prog not in EXPLORE_CMDS:
+    # Only nudge file-DUMPING commands (cat/head/sed...). grep/rg/awk search for
+    # exact literals SAN drops, so they're the right tool — never nudged.
+    if prog not in DUMP_CMDS:
         return []
     files = []
     for t in tokens[1:]:
@@ -190,17 +204,16 @@ def _emit_nudge(paths, repeat: bool) -> None:
     base = os.path.basename(shown)
     extra = f" (+{len(paths)-1} more)" if len(paths) > 1 else ""
     if repeat:
-        msg = (f"[agent-brain] You're dumping {base}{extra} again via shell — its "
-               f"SAN is fresh and ~5-11x cheaper. You've already found the file; "
-               f"READ it with get_san(file_path=\"{shown}\") (detail='sig' for "
-               f"structure, 'full' for impl). Shell-read the raw file only if "
-               f"you're about to EDIT it. (Discovery grep across files is fine.)")
+        msg = (f"[agent-brain] You're dumping {base}{extra} again — its SAN is "
+               f"fresh and ~5-11x cheaper. To UNDERSTAND it, use "
+               f"get_san(file_path=\"{shown}\") (detail='sig'/'full'). cat/sed the "
+               f"raw file only to EDIT it; grep it only for an exact literal SAN "
+               f"can't show.")
     else:
-        msg = (f"[agent-brain] {base}{extra} has a fresh SAN. You've located the "
-               f"file — now READ it with get_san(file_path=\"{shown}\") instead of "
-               f"cat/head/sed on it (same structure, ~5-11x fewer tokens). "
-               f"Searching ACROSS files with grep is fine; this is about dumping "
-               f"one specific file. Proceeding; prefer get_san unless about to EDIT.")
+        msg = (f"[agent-brain] {base}{extra} has a fresh SAN. To UNDERSTAND this "
+               f"file, read it with get_san(file_path=\"{shown}\") instead of "
+               f"cat/head/sed (same structure, ~5-11x fewer tokens). Proceeding; "
+               f"use the raw file only to EDIT it or grep an exact literal.")
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg}
     }))
