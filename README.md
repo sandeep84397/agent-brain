@@ -1,6 +1,6 @@
 # Agent Brain
 
-Persistent decision memory for AI code agent teams. Agents learn from mistakes, coordinate across sessions, and never repeat the same error twice — and read your codebase at ~20% of the usual token cost (tokenizer-measured: 81% saved).
+**Enforced, persistent decision memory for AI code agent teams — that survives context compaction.** Agents log decisions and outcomes, learn from past rejections, and resume their pending roadmap after a `/compact` instead of re-researching it. Hooks make it mandatory (not "stored and hoped for"). And code reads route through SAN compression (~80% fewer tokens, tokenizer-measured) so the context window fills slower in the first place.
 
 **Works with any [MCP](https://modelcontextprotocol.io) (Model Context Protocol)-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, etc. Agent templates (`.md` files) are Claude Code specific — the MCP server itself is universal.
 
@@ -51,7 +51,7 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 | **Enforcement Hook** | Code edits are blocked until the agent logs a decision — memory actually gets populated. |
 | **Survives compaction** | SessionStart hook re-injects the pending roadmap after `/compact` so the agent resumes instead of re-researching. [Details](#surviving-compaction-the-amnesia-fix) |
 | **Relevance search** | `query_decisions(query="…")` ranks by topic relevance, not just recency; `get_roadmap` returns open work in one call. |
-| **SAN as default read path** | A soft hook nudges raw `Read` of SAN-covered code toward `get_san`; `get_san` takes absolute paths so there's no friction. Same quality, ~5-11x fewer tokens. [Details](#making-san-the-default-read-path) |
+| **SAN as default read path** | Hooks on **both `Read` and `Bash`** route raw code reads/dumps to `get_san` (per-file nudge, optional hard-block), so agents actually use SAN instead of `cat`/`Read`. A tool ladder (find→read→grep-literal→edit) is auto-installed to CLAUDE.md. [Details](#making-san-the-default-read-path) |
 | **Records & pruning** | Browse every decision as dated markdown; prune old/resolved ones (dry-run first, archived not deleted). Keeps the brain lean without losing the lessons. [Details](#managing-what-the-brain-remembers) |
 | **Live decisions web view** | A `/decisions` browser that streams decisions in real time as agents log them — filter by repo/area/agent/outcome, search, color-coded. [Details](#decisions-view-decisions) |
 | **SAN search trace** | A `/san` view that shows how a query finds code through SAN — index → content → block → `src:` line range, live. [Details](#san-search-trace-san) |
@@ -487,6 +487,20 @@ Every agent must follow this before starting work:
 
 This is enforced in every agent's `.md` file as NON-NEGOTIABLE.
 
+### The hooks (5)
+
+Most "AI memory" tools are passive — they store things and hope the agent uses them. Agent Brain **enforces** via Claude Code hooks, so memory and SAN actually get used. `setup.sh` installs all five idempotently:
+
+| Hook | Event | Purpose |
+|------|-------|---------|
+| `enforce_brain_protocol.py` | PreToolUse `Edit\|Write` | **Blocks** a code edit unless a decision was logged first — so the brain actually gets populated |
+| `inject_brain_context.py` | SessionStart `startup/resume/compact` | Re-injects the open-work digest after compaction — **the amnesia fix** |
+| `remind_brain_before_research.py` | PreToolUse `Workflow` | Nudges a brain check before expensive fan-out research |
+| `route_read_to_san.py` | PreToolUse `Read` | Routes raw `Read` of SAN-covered code → `get_san` (per-file, escalating) |
+| `route_bash_to_san.py` | PreToolUse `Bash` | Closes the shell bypass: `cat`/`sed`-dumping a SAN-covered file → `get_san` (leaves discovery `grep` alone) |
+
+All fail-open (any error → allow, never break a session) and respect `BRAIN_SKIP_ENFORCE=1`.
+
 ### Enforcement Hook
 
 Text in `.md` files is advisory — agents can skip it. The enforcement hook makes it **mandatory**: any Edit/Write to code files is blocked if no `log_decision` was called in the last 30 minutes.
@@ -558,7 +572,7 @@ This is the same digest `get_roadmap` returns, so push (hook) and pull (tool) ne
 
 **Optional hard research gate:** the reminder is soft by default. To *block* `Workflow` until a brain read happened this session, set `"research_gate": "hard"` in `~/.agent-brain/config.json`. A `pre_check`/`query_decisions`/`get_roadmap` call satisfies the gate (it writes `~/.agent-brain/.last_query_marker`); `BRAIN_SKIP_ENFORCE=1` bypasses it. Soft is recommended — a hard gate can false-positive when the brain genuinely has nothing on the topic.
 
-**Install** (setup.sh wires all three hooks idempotently, backing up `settings.json.bak`):
+**Install** (setup.sh wires every brain hook idempotently, backing up `settings.json.bak`):
 ```json
 // ~/.claude/settings.json
 {
@@ -581,18 +595,32 @@ This is the same digest `get_roadmap` returns, so push (hook) and pull (tool) ne
 
 ### Making SAN the default read path
 
-SAN is far cheaper for reading code (see [Is SAN worth it?](#is-san-worth-it-measured-numbers)) — but agents kept defaulting to raw `Read` because nothing routed them to it. The same discoverability gap as the amnesia problem. Four ergonomic changes fix it (none touch the SAN format or quality):
+SAN is far cheaper for reading code (see [Is SAN worth it?](#is-san-worth-it-measured-numbers)) — but agents kept defaulting to raw reads because nothing routed them to SAN, and a tool ladder isn't obvious. These changes close the gap (none touch the SAN format or quality):
 
-| Change | Effect |
-|--------|--------|
-| **`get_san` accepts absolute paths** | Pass the exact path you got from a grep/glob hit — no repo-name + relative-path lookup. The repo is auto-detected (`repo` arg becomes optional). This was the decisive friction tax. |
-| **`route_read_to_san.py` (PreToolUse `Read`)** | Soft, non-blocking: a raw `Read` of a code file that has a **fresh** `.san` gets a one-line nudge to use `get_san` instead — then the Read proceeds. One nudge per session (deduped). Stays silent for non-code, stale/missing `.san`, or files outside any configured repo. **Never blocks** — raw `Read` is correct for files you're about to edit. |
-| **`pre_check(repo=...)` surfaces coverage** | When given a repo, `pre_check` appends `SAN AVAILABLE: repo 'X' has N files compiled. Read code with get_san…` so the read path is in view at "check before work" time. |
-| **Standing directive** | The [project context template](agents/PROJECT_CONTEXT_TEMPLATE.md) and the SessionStart digest both carry: *"To READ/EXPLORE existing code, use `get_san` BEFORE raw `Read`."* Co-located with the code-review-graph "graph-first" rule that agents already honor. |
+**The tool ladder** (the standing rule agents are taught + nudged toward):
 
-**When raw `Read` stays correct** (the hook stays silent for all of these): files you're about to **edit** (need exact bytes), non-code files, files with no or stale `.san`, and anything outside a configured repo. SAN is for *exploring*; raw Read is for *editing*.
+| Step | Goal | Use | Not |
+|------|------|-----|-----|
+| **Find** | which file/symbol has X | `query_san` / `semantic_search_nodes` | `grep -r` raw source |
+| **Read/understand** | what a file/class does | `get_san(file_path="<abs>")` (`sig`/`full`) | `cat`/`head`/`sed` the file |
+| **Exact literal** | a precise string/line | `grep`/`rg` on the file | `get_san` (SAN drops literals) |
+| **Edit** | change exact bytes | raw `Read` then `Edit` | — |
 
-Wire-up: `setup.sh` registers the `Read` hook alongside the others. Existing projects need the standing-directive bullet re-copied into their `CLAUDE.md` (or hand-added) since the template only seeds new projects.
+**How it's enforced:**
+
+| Mechanism | What it does |
+|-----------|--------------|
+| **`get_san` accepts absolute paths** | Pass the exact path you got from a discovery hit — repo auto-detected, no repo-name lookup. Removes the friction tax. |
+| **`route_read_to_san.py` (PreToolUse `Read`)** | Raw `Read` of a fresh-`.san` code file → nudge toward `get_san`. **Per-file** dedupe (every file's first read is nudged, not just the session's first). Escalates: 1st read soft-allow; a 2nd+ raw read of the same file gets a stronger nudge, or a **block** under hard mode. |
+| **`route_bash_to_san.py` (PreToolUse `Bash`)** | Closes the shell bypass: `cat`/`head`/`sed`/`tail` **dumping** a fresh-`.san` source file → same nudge/escalation. Leaves `grep`/`rg`/`awk` (literal search) and discovery-grep-across-files alone — those are the right tools, not bypasses. |
+| **`pre_check(repo=...)` surfaces coverage** | Appends `SAN AVAILABLE: repo 'X' has N files compiled…` so the read path is in view at check-before-work time. |
+| **Standing directive, auto-installed** | `setup.sh` writes the tool-ladder block into `~/.claude/CLAUDE.md` (idempotent, marked block) **and** the SessionStart digest re-injects it — so agents get the habit by default, no manual edit. |
+
+**Soft vs. hard** — set `read_enforcement` in `config.json`:
+- `"soft"` (default): all of the above *nudge*, never block. Raw reads always proceed.
+- `"hard"`: a **2nd+** raw read/dump of the *same* fresh-`.san` file is **blocked** (exit 2) with an actionable message — forcing real SAN use (real, not-ignorable savings). First reads are never blocked; escape any block with `BRAIN_SKIP_READ_BLOCK=1` when you genuinely need raw bytes.
+
+**When raw reads stay correct** (every mechanism stays silent for these): files you're about to **edit**, non-code files, files with no/stale `.san`, anything outside a configured repo, literal `grep` on a file, and discovery grep across files. SAN is for *understanding*; raw read is for *editing*; grep is for *exact literals*.
 
 ## SAN Protocol
 
