@@ -48,7 +48,7 @@ Canonical agent names and roles for this repo. Names should match `~/.agent-brai
 
 - Use `code-review-graph` MCP tools (`query_graph`, `semantic_search_nodes`, `get_impact_radius`) before falling back to `Grep`/`Glob`/`Read`. (Graph = structure/relationships.)
 - **ALWAYS** use `get_san` to **READ/EXPLORE** existing code BEFORE raw `Read` — this is a standing rule, same as graph-first. `get_san(file_path="<abs path>")` takes the absolute path you already have (`detail="sig"` for "what exists", `"full"` for impl). Same structure — signatures, deps, error handling — at ~5-11x fewer tokens. Use raw `Read` **only** for files you're about to **EDIT** (need exact bytes), non-code files, or when no `.san` exists. (SAN = reading file contents; complements the graph, doesn't replace it.)
-- **Exploring code = `get_san`; NEVER `cat`/`grep`/`sed`/`head`/`tail` a source file** to scope it. The shell is not a SAN bypass — read code through `get_san`, use Bash only for build/run/git/test, not for reading `.kt`/`.java`/`.ts`/etc. that have a `.san`.
+- **Grep to FIND, `get_san` to READ.** Searching *across* files for a name/pattern (`grep -r`, `query_san`, `semantic_search_nodes`) is the right discovery step — that's how you locate the file/symbol. But once you've found a specific file, **read it with `get_san(file_path=...)`, not `cat`/`head`/`sed` on that file.** The shell is fine for discovery and for build/run/git/test; it's not for dumping a specific source file's contents when a `.san` exists.
 - The graph and `.san` briefs are auto-maintained on file changes via project hooks (see `.claude/settings.local.json`).
 
 ## Workflow

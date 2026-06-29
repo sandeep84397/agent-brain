@@ -14,10 +14,13 @@ a source file that has a fresh .san:
     * read_enforcement="hard" (opt-in): BLOCK (exit 2). Escape:
       BRAIN_SKIP_READ_BLOCK=1 when you genuinely need the raw bytes.
 
-ONLY exploration commands (cat/grep/sed/head/tail/awk/less/more/bat/rg) trigger
-this. Build/run/git/test/mkdir/etc. are never touched — the goal is to stop
-cheap raw-reading of code, not to gate Bash. A command that mixes exploration
-with editing intent (>, >>, tee, |) is left alone (could be a real pipeline).
+Discovery vs. reading: this fires ONLY when a command NAMES a specific source
+file (cat/head/sed/grep on Foo.kt). DISCOVERY — searching ACROSS files for a
+name/pattern (grep -r, grep src/*.kt, grep -R . ) — is the legitimate
+"which file do I need?" step and is NEVER touched; it has no specific-file
+argument so it doesn't match. So: grep to FIND, get_san to READ the file you
+found. Build/run/git/test/mkdir are never touched. A command with write/pipe
+intent (>, >>, tee, |, xargs) is left alone (could be a real pipeline).
 
 Self-contained (server.py imports FastMCP; importing it would crash the hook).
 Mirrors the dedupe/freshness logic of route_read_to_san.py — keep them in sync.
@@ -187,16 +190,17 @@ def _emit_nudge(paths, repeat: bool) -> None:
     base = os.path.basename(shown)
     extra = f" (+{len(paths)-1} more)" if len(paths) > 1 else ""
     if repeat:
-        msg = (f"[agent-brain] You're re-exploring {base}{extra} with a shell "
-               f"command — its SAN is fresh and ~5-11x cheaper. Use "
-               f"get_san(file_path=\"{shown}\") (detail='sig' for structure, "
-               f"'full' for impl) instead of cat/grep. Shell-reading source only "
-               f"if you're about to EDIT it.")
+        msg = (f"[agent-brain] You're dumping {base}{extra} again via shell — its "
+               f"SAN is fresh and ~5-11x cheaper. You've already found the file; "
+               f"READ it with get_san(file_path=\"{shown}\") (detail='sig' for "
+               f"structure, 'full' for impl). Shell-read the raw file only if "
+               f"you're about to EDIT it. (Discovery grep across files is fine.)")
     else:
-        msg = (f"[agent-brain] A fresh SAN brief exists for {base}{extra}. To "
-               f"EXPLORE code, use get_san(file_path=\"{shown}\") instead of "
-               f"cat/grep/sed — same structure, ~5-11x fewer tokens. Proceeding "
-               f"with the shell command; prefer get_san unless about to EDIT.")
+        msg = (f"[agent-brain] {base}{extra} has a fresh SAN. You've located the "
+               f"file — now READ it with get_san(file_path=\"{shown}\") instead of "
+               f"cat/head/sed on it (same structure, ~5-11x fewer tokens). "
+               f"Searching ACROSS files with grep is fine; this is about dumping "
+               f"one specific file. Proceeding; prefer get_san unless about to EDIT.")
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg}
     }))
