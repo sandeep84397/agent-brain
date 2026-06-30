@@ -1056,10 +1056,46 @@ function setCharacterAnimation(agent, dt) {
 
 // ---------- Position assignment --------------------------------------
 
+// Normalize a role to its base form so suffixed/duplicate roles map to a desk:
+//   "frontend-engineer-2" -> "frontend-engineer", "backend-engineer-3" -> base.
+function baseRole(role) {
+    return String(role || "").replace(/-\d+$/, "");
+}
+
+// Stable per-NAME overflow slots for agents whose role has no fixed desk
+// (e.g. "lead", "unknown", or a 2nd person in a role whose desk is taken).
+// Placed along the back wall so they sit at a spot instead of floating.
+const OVERFLOW_SLOTS = [
+    { x: -3, z: -7.5, facing: 0 }, { x: 0, z: -7.5, facing: 0 },
+    { x: 3, z: -7.5, facing: 0 },  { x: -7.5, z: -3, facing: Math.PI / 2 },
+    { x: 7.5, z: -3, facing: -Math.PI / 2 }, { x: -7.5, z: 3, facing: Math.PI / 2 },
+];
+const overflowAssigned = new Map();  // name -> slot index
+const deskClaim = new Map();          // desk role -> agent name that holds it
+
+function overflowDesk(name) {
+    if (!overflowAssigned.has(name)) {
+        overflowAssigned.set(name, overflowAssigned.size % OVERFLOW_SLOTS.length);
+    }
+    return OVERFLOW_SLOTS[overflowAssigned.get(name)];
+}
+
 let nextMeetingSeat = 0;
-function getDeskPosition(role) {
-    const desk = DESK_LAYOUT.find(d => d.role === role);
-    if (!desk) return { x: 7, z: 7, facing: -Math.PI / 2 };  // overflow corner
+function getDeskPosition(role, name) {
+    // Try exact, then base-role (strip -2/-3 suffix). A desk is held by the
+    // FIRST agent to claim it; a 2nd agent of the same role overflows so they
+    // don't stack on one chair.
+    let desk = DESK_LAYOUT.find(d => d.role === role)
+            || DESK_LAYOUT.find(d => d.role === baseRole(role));
+    if (desk) {
+        const holder = deskClaim.get(desk.role);
+        if (holder && holder !== name) desk = null;       // taken by someone else
+        else deskClaim.set(desk.role, name);              // claim it
+    }
+    if (!desk) {
+        const slot = overflowDesk(name || role || "");
+        return { x: slot.x, z: slot.z, facing: slot.facing };
+    }
     // The desk's local layout: monitor at -z, chair at +z (~0.85). The
     // character stands AT the chair location and must face the monitor
     // (i.e. point toward the desk centre, which is the OPPOSITE of the
@@ -1088,7 +1124,7 @@ function getTargetPosition(agent) {
     if (agent.status === 'discussing' && agent.talkingTo) {
         return getMeetingPosition(agent.name, agent.talkingTo);
     }
-    return getDeskPosition(agent.role);
+    return getDeskPosition(agent.role, agent.name);
 }
 
 // ---------- Spawn / update agents ------------------------------------
