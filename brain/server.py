@@ -201,6 +201,136 @@ def _write_query_marker() -> None:
         pass
 
 
+# ===========================================================================
+# Metrics — is the brain actually earning its keep? (honest instrumentation)
+# ===========================================================================
+# Answers three questions we've been taking on faith:
+#   1. RECALL: of all decisions logged, how many are ever SURFACED by a query?
+#      (A decision never returned by any query is write-only dead weight.)
+#   2. NET TOKENS: brain COST (payload tokens returned to agents) vs the SAN
+#      SAVINGS already tracked — is net positive?
+#   3. USAGE: pre_check-before-log_decision ratio + events over time.
+# HONEST LIMIT: we log "surfaced" (a fact). We CANNOT observe "the agent then
+# changed its behavior" from the server — that gap is reported, not faked.
+
+METRICS_FILE = BRAIN_DIR / "brain_metrics.jsonl"
+
+
+def _log_metric(event: dict) -> None:
+    """Append one metric event as JSONL. Never raises, never blocks a tool."""
+    try:
+        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+        event = {"ts": datetime.now().isoformat(), "session": _SESSION_ID, **event}
+        with METRICS_FILE.open("a") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _record_query(tool: str, surfaced_ids: list, payload: str,
+                  repo: str = "", had_result: bool = True) -> None:
+    """Record that a query ran, WHICH decision IDs it surfaced, and the token
+    cost of the payload it returned to the agent. Drives recall + cost metrics."""
+    try:
+        _log_metric({
+            "kind": "query",
+            "tool": tool,
+            "repo": repo,
+            "surfaced": list(dict.fromkeys(x for x in surfaced_ids if x))[:50],
+            "n_surfaced": len({x for x in surfaced_ids if x}),
+            "payload_tokens": _tokens_text(payload) if payload else 0,
+            "had_result": bool(had_result),
+        })
+    except Exception:
+        pass
+
+
+def _load_metrics() -> list:
+    """Read all metric events. [] on any problem."""
+    if not METRICS_FILE.exists():
+        return []
+    out = []
+    try:
+        for line in METRICS_FILE.read_text().splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def _metrics_report() -> str:
+    """The honest scorecard: recall rate, net token math, usage over time.
+    Answers 'is the brain earning its keep?' with facts, and names what it
+    cannot measure rather than faking it."""
+    events = _load_metrics()
+    with LOCK:
+        G = _load_graph()
+    all_decisions = {n for n, d in G.nodes(data=True) if d.get("type") == "decision"}
+    n_decisions = len(all_decisions)
+
+    queries = [e for e in events if e.get("kind") == "query"]
+    decisions_ev = [e for e in events if e.get("kind") == "decision"]
+
+    # --- 1. RECALL: how many distinct decisions were ever surfaced by a query ---
+    surfaced = set()
+    for q in queries:
+        surfaced.update(q.get("surfaced", []))
+    surfaced_existing = surfaced & all_decisions  # ignore surfaced-then-pruned
+    recall_pct = (100.0 * len(surfaced_existing) / n_decisions) if n_decisions else 0.0
+    queries_with_hit = sum(1 for q in queries if q.get("had_result"))
+    hit_rate = (100.0 * queries_with_hit / len(queries)) if queries else 0.0
+
+    # --- 2. NET TOKENS: savings (from SAN log) vs cost (query payloads served) ---
+    sav = _load_savings_events()
+    saved = sum(e.get("raw_tokens", 0) - e.get("san_tokens", 0) for e in sav)
+    payload_cost = sum(q.get("payload_tokens", 0) for q in queries)
+    # honest note: payload_cost is only what we've measured since instrumentation;
+    # SAN savings is all-time. They're not the same window — reported separately.
+    net = saved - payload_cost
+
+    # --- 3. USAGE: checked-before-logging ratio + span ---
+    checked = sum(1 for d in decisions_ev if d.get("checked_first"))
+    checked_pct = (100.0 * checked / len(decisions_ev)) if decisions_ev else 0.0
+    span_days = 0
+    if events:
+        try:
+            ts = sorted(e.get("ts", "") for e in events if e.get("ts"))
+            span_days = max(1, (datetime.fromisoformat(ts[-1])
+                                - datetime.fromisoformat(ts[0])).days)
+        except Exception:
+            span_days = 1
+
+    L = ["=== BRAIN METRICS (is it earning its keep?) ===", ""]
+    L.append(f"Instrumented events: {len(events)} "
+             f"({len(queries)} queries, {len(decisions_ev)} decisions) over ~{span_days}d")
+    if not events:
+        L.append("\nNo metric events yet. Run some pre_check/log_decision calls, then re-check.")
+        return "\n".join(L)
+    L += ["", "1. RECALL — is it a write-only diary?",
+          f"   Decisions in brain: {n_decisions}",
+          f"   Ever surfaced by a query: {len(surfaced_existing)} ({recall_pct:.0f}%)",
+          f"   Queries that returned a hit: {queries_with_hit}/{len(queries)} ({hit_rate:.0f}%)",
+          f"   -> {'Healthy: decisions are being recalled.' if recall_pct >= 20 else 'WEAK: most decisions are never recalled — largely write-only.'}"]
+    L += ["", "2. NET TOKENS — does it cost more than it saves?",
+          f"   SAN tokens saved (all-time): {saved:,}",
+          f"   Query payload tokens served (since instrumentation): {payload_cost:,}",
+          f"   Net (rough, different windows): {net:+,}",
+          "   NOTE: excludes SAN (re)generation cost and hook overhead — true net is lower."]
+    L += ["", "3. USAGE — consulted before writing, or write-only?",
+          f"   Decisions preceded by a brain read (<30min): {checked}/{len(decisions_ev)} ({checked_pct:.0f}%)",
+          f"   -> {'Used as intended (check-then-decide).' if checked_pct >= 50 else 'Often write-only: decisions logged without consulting the brain first.'}"]
+    L += ["", "CANNOT MEASURE (reported honestly, not faked):",
+          "   - Whether a surfaced decision actually CHANGED the agent's action.",
+          "     'Surfaced' is observable; 'influenced behavior' is not, from the server.",
+          "   - SAN generation cost and per-call hook latency (not yet tracked)."]
+    return "\n".join(L)
+
+
 def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "", repo: str = "") -> None:
     """Silently update office state from brain tool calls. Never raises."""
     try:
@@ -769,6 +899,7 @@ def pre_check(agent: str, area: str, action_description: str,
             f"Pay close attention to past failures below.")
 
     exact_warnings = []
+    surfaced_ids = []  # decision IDs this pre_check actually shows the agent (recall metric)
     my_failures_here = 0
     plan_pointer = None
     for node_id, data in G.nodes(data=True):
@@ -777,6 +908,7 @@ def pre_check(agent: str, area: str, action_description: str,
         if data.get("outcome") in ("rejected", "failed"):
             if data.get("agent") == agent:
                 my_failures_here += 1
+            surfaced_ids.append(node_id)
             exact_warnings.append(
                 f"- [{data.get('timestamp', '?')[:10]}]"
                 f"{_age_note(data.get('timestamp', ''))} "
@@ -814,6 +946,7 @@ def pre_check(agent: str, area: str, action_description: str,
     if similar:
         sim_lines = []
         for s in similar[:5]:
+            surfaced_ids.append(s["id"])
             pct = int(s["similarity"] * 100)
             sim_lines.append(
                 f"- [{s['timestamp']}]{_age_note(s.get('timestamp_full', ''))} "
@@ -832,7 +965,9 @@ def pre_check(agent: str, area: str, action_description: str,
     if not sections:
         base = f"No past failures in '{area}'. Proceed with: {action_description}"
         tail = "\n\n".join(x for x in (san_line, routing_line) if x)
-        return f"{base}\n\n{tail}" if tail else base
+        out = f"{base}\n\n{tail}" if tail else base
+        _record_query("pre_check", surfaced_ids, out, repo=repo, had_result=False)
+        return out
     if san_line:
         sections.append(san_line)
     if routing_line:
@@ -846,7 +981,9 @@ def pre_check(agent: str, area: str, action_description: str,
                 top = "; ".join(f'"{c[0][:60]}" ({c[1]}x)' for c in cats[:2])
                 sections.append(f"YOUR TOP REJECTION PATTERNS: {top}")
 
-    return "\n\n---\n\n".join(sections)
+    out = "\n\n---\n\n".join(sections)
+    _record_query("pre_check", surfaced_ids, out, repo=repo, had_result=bool(surfaced_ids))
+    return out
 
 
 @mcp.tool()
@@ -891,6 +1028,17 @@ def log_decision(
     _auto_heartbeat(agent, "working", action, repo=repo)
     # Write marker for brain-protocol enforcement hook
     _write_decision_marker(agent, node_id)
+    # Usage metric: was this decision preceded by a brain READ (pre_check/query)
+    # within 30 min? If not, the brain is being written to but not consulted.
+    checked_first = False
+    try:
+        marker = json.loads(QUERY_MARKER_FILE.read_text())
+        age = (datetime.now() - datetime.fromisoformat(marker.get("timestamp", ""))).total_seconds()
+        checked_first = age <= 30 * 60
+    except Exception:
+        pass
+    _log_metric({"kind": "decision", "id": node_id, "repo": repo, "area": area,
+                 "agent": agent, "checked_first": checked_first})
     result = f"Decision logged: {node_id}"
     if resolved_symbols:
         result += f"\nLinked to {len(resolved_symbols)} code symbol(s)"
@@ -1361,6 +1509,7 @@ def query_decisions(area: str = "", agent: str = "", repo: str = "",
         rows.append((score, ts, node_id, data))
 
     if not rows:
+        _record_query("query_decisions", [], "", repo=repo, had_result=False)
         return "No matching decisions."
 
     if sort == "relevance" and q_tokens:
@@ -1378,7 +1527,9 @@ def query_decisions(area: str = "", agent: str = "", repo: str = "",
             f"-> {data.get('outcome','pending')}")
     header = (f"{len(rows)} decision(s), top {len(shown)} by {sort}:"
               if len(rows) > len(shown) else f"{len(rows)} decision(s):")
-    return f"{header}\n\n" + "\n".join(lines)
+    out = f"{header}\n\n" + "\n".join(lines)
+    _record_query("query_decisions", [r[2] for r in shown], out, repo=repo)
+    return out
 
 
 @mcp.tool()
@@ -1494,7 +1645,11 @@ def get_roadmap(repo: str = "", limit: int = 15) -> str:
     _write_query_marker()
     with LOCK:
         G = _load_graph()
-    return _format_roadmap_digest(_roadmap_rows(G, repo), limit=limit)
+    rows = _roadmap_rows(G, repo)
+    out = _format_roadmap_digest(rows, limit=limit)
+    _record_query("get_roadmap", [r.get("id") for r in rows[:limit] if r.get("id")],
+                  out, repo=repo, had_result=bool(rows))
+    return out
 
 
 # ===========================================================================
@@ -3166,6 +3321,7 @@ def validate_brain() -> str:
     real_query_marker_file = QUERY_MARKER_FILE
     real_records_dir = RECORDS_DIR
     real_archive_file = ARCHIVE_FILE
+    real_metrics_file = METRICS_FILE
 
     def _test(name: str, condition: bool, detail: str = ""):
         nonlocal passed, failed
@@ -3189,6 +3345,7 @@ def validate_brain() -> str:
         globals()["QUERY_MARKER_FILE"] = tmp_root / ".last_query_marker"
         globals()["RECORDS_DIR"] = tmp_root / "records"
         globals()["ARCHIVE_FILE"] = tmp_root / "decisions.archive.jsonl"
+        globals()["METRICS_FILE"] = tmp_root / "brain_metrics.jsonl"
         # Drop any shadow/cache from the real brain so temp diffs start clean.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
 
@@ -3806,6 +3963,7 @@ def validate_brain() -> str:
         globals()["QUERY_MARKER_FILE"] = real_query_marker_file
         globals()["RECORDS_DIR"] = real_records_dir
         globals()["ARCHIVE_FILE"] = real_archive_file
+        globals()["METRICS_FILE"] = real_metrics_file
         # Drop temp shadow/cache; next real _load_graph re-reads from disk.
         _GRAPH_CACHE.update({"key": None, "graph": None, "shadow": None})
         # Clean up
@@ -4117,6 +4275,10 @@ if __name__ == "__main__":
                                         datetime.now().strftime("%Y-%m-%d"))
         print(report.replace("This session", "Last recorded session", 1))
         _sys.exit(0)
+    if cmd == "metrics":
+        # The honest scorecard: recall, net tokens, usage.
+        print(_metrics_report())
+        _sys.exit(0)
     if cmd == "records":
         # Export the human-readable per-day decision records.
         _repo = _sys.argv[2] if len(_sys.argv) > 2 else ""
@@ -4156,7 +4318,7 @@ if __name__ == "__main__":
         _sys.exit(0)
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
-              "stats|office [repo]|savings|roadmap [repo]|records [repo]|"
+              "stats|office [repo]|savings|metrics|roadmap [repo]|records [repo]|"
               "prune [repo] [--before-days=N] [--apply]|resolve-stale [repo] [--apply]|"
               "clear-activity]")
         print("  (no args)        run the MCP server")
