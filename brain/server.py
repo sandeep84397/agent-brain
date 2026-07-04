@@ -285,13 +285,15 @@ def _metrics_report() -> str:
     queries_with_hit = sum(1 for q in queries if q.get("had_result"))
     hit_rate = (100.0 * queries_with_hit / len(queries)) if queries else 0.0
 
-    # --- 2. NET TOKENS: savings (from SAN log) vs cost (query payloads served) ---
+    # --- 2. NET TOKENS: savings vs ALL costs (query payloads + SAN generation) ---
     sav = _load_savings_events()
     saved = sum(e.get("raw_tokens", 0) - e.get("san_tokens", 0) for e in sav)
     payload_cost = sum(q.get("payload_tokens", 0) for q in queries)
-    # honest note: payload_cost is only what we've measured since instrumentation;
-    # SAN savings is all-time. They're not the same window — reported separately.
-    net = saved - payload_cost
+    gen_events = [e for e in events if e.get("kind") == "san_gen"]
+    gen_cost = sum(e.get("gen_cost", 0) for e in gen_events)
+    n_reads = len(sav)
+    n_gens = len(gen_events)
+    net = saved - payload_cost - gen_cost
 
     # --- 3. USAGE: checked-before-logging ratio + span ---
     checked = sum(1 for d in decisions_ev if d.get("checked_first"))
@@ -317,17 +319,61 @@ def _metrics_report() -> str:
           f"   Queries that returned a hit: {queries_with_hit}/{len(queries)} ({hit_rate:.0f}%)",
           f"   -> {'Healthy: decisions are being recalled.' if recall_pct >= 20 else 'WEAK: most decisions are never recalled — largely write-only.'}"]
     L += ["", "2. NET TOKENS — does it cost more than it saves?",
-          f"   SAN tokens saved (all-time): {saved:,}",
-          f"   Query payload tokens served (since instrumentation): {payload_cost:,}",
-          f"   Net (rough, different windows): {net:+,}",
-          "   NOTE: excludes SAN (re)generation cost and hook overhead — true net is lower."]
+          f"   SAN tokens saved on reads ({n_reads} reads):   +{saved:,}",
+          f"   SAN generation cost ({n_gens} files compiled):  -{gen_cost:,}",
+          f"   Query payload tokens served:                    -{payload_cost:,}",
+          f"   NET:                                            {net:+,}",
+          f"   -> {'POSITIVE: the brain saves more than it costs.' if net > 0 else 'NEGATIVE so far: costs exceed savings (early phase — needs more reads to amortize generation).'}"]
+    if n_gens:
+        avg_gen = gen_cost // max(n_gens, 1)
+        avg_save = (saved // n_reads) if n_reads else 0
+        breakeven = (avg_gen // avg_save) if avg_save else 0
+        L.append(f"   Break-even: each SAN costs ~{avg_gen:,} to make, saves ~{avg_save:,}/read "
+                 f"→ pays off after ~{breakeven} reads. (Fast-churning files that regen "
+                 f"before {breakeven} reads are a NET LOSS.)")
+    L.append("   HONEST: generation cost is a token proxy (real LLM output costs more); "
+             "hook latency still untracked. True net is somewhat lower.")
+
     L += ["", "3. USAGE — consulted before writing, or write-only?",
           f"   Decisions preceded by a brain read (<30min): {checked}/{len(decisions_ev)} ({checked_pct:.0f}%)",
           f"   -> {'Used as intended (check-then-decide).' if checked_pct >= 50 else 'Often write-only: decisions logged without consulting the brain first.'}"]
+
+    # --- 4. TREND: the real proof — do new decisions plateau while recall rises? ---
+    from collections import defaultdict as _dd
+    wk_dec = _dd(int)   # week -> decisions logged
+    wk_surf = _dd(set)  # week -> distinct decisions surfaced by queries
+    def _week(ts):
+        try:
+            d = datetime.fromisoformat(ts)
+            return d.strftime("%Y-W%W")
+        except Exception:
+            return None
+    for d in decisions_ev:
+        w = _week(d.get("ts", ""))
+        if w:
+            wk_dec[w] += 1
+    for q in queries:
+        w = _week(q.get("ts", ""))
+        if w:
+            wk_surf[w].update(q.get("surfaced", []))
+    weeks = sorted(set(wk_dec) | set(wk_surf))
+    L += ["", "4. TREND — the goal: new decisions plateau while recall rises",
+          "   (A useful brain writes less over time and recalls more. A write-only",
+          "    diary keeps writing and never recalls.)"]
+    if len(weeks) < 2:
+        L.append(f"   Only {len(weeks)} week(s) of data — need several weeks to see the trend.")
+    else:
+        L.append("   week      | decisions logged | distinct recalled")
+        for w in weeks[-8:]:
+            L.append(f"   {w} | {wk_dec[w]:>16} | {len(wk_surf[w]):>17}")
+        first_dec = wk_dec[weeks[0]]; last_dec = wk_dec[weeks[-1]]
+        trend = "FLATTENING ✓" if last_dec <= first_dec else "still rising (early phase)"
+        L.append(f"   -> decisions/week trend: {trend}")
+
     L += ["", "CANNOT MEASURE (reported honestly, not faked):",
           "   - Whether a surfaced decision actually CHANGED the agent's action.",
           "     'Surfaced' is observable; 'influenced behavior' is not, from the server.",
-          "   - SAN generation cost and per-call hook latency (not yet tracked)."]
+          "   - Per-call hook latency; exact LLM billing for SAN generation."]
     return "\n".join(L)
 
 
@@ -2118,6 +2164,31 @@ def _record_san_saving(repo: str, file_rel: str, raw_text: str, san_text: str) -
         pass  # savings tracking must never break get_san
 
 
+def _record_san_gen(repo: str, file_rel: str, source_path, san_path) -> None:
+    """Record the COST of (re)generating one SAN file, so net-token math is
+    honest. The brain-compiler (LLM) reads the raw source (~input tokens) and
+    writes the SAN (~output tokens). This is charged ONCE per (re)generation,
+    detected when a fresh SAN is first hash-registered. Never raises.
+
+    Honest note: this is a proxy — real LLM billing weights output higher and
+    includes prompt overhead. It's a floor on the true generation cost, so the
+    net-tokens number it produces is OPTIMISTIC, not inflated."""
+    try:
+        src = source_path.read_text(errors="replace")
+        san = san_path.read_text(errors="replace")
+        in_t, out_t = _tokens_text(src), _tokens_text(san)
+        _log_metric({
+            "kind": "san_gen",
+            "repo": repo,
+            "file": file_rel,
+            "input_tokens": in_t,    # raw source the compiler read
+            "output_tokens": out_t,  # SAN it wrote
+            "gen_cost": in_t + out_t,
+        })
+    except Exception:
+        pass  # cost tracking must never break the freshness sweep
+
+
 def _load_savings_events() -> list[dict]:
     """Read all persisted savings events. Returns [] on any problem."""
     if not SAVINGS_FILE.exists():
@@ -2414,8 +2485,12 @@ def _ensure_san_fresh(repo: str, force: bool = False) -> Optional[str]:
     # Register hashes for fresh SANs that aren't tracked yet.
     # Without this, hash-based false-positive detection won't work
     # for SANs generated by brain-compiler until recompile_san is called.
+    # A source appearing here for the FIRST time (not in hashes, fresh SAN on
+    # disk) means the brain-compiler just (re)generated it — so we can charge
+    # its generation cost: input ~= raw source tokens read, output ~= SAN tokens.
     hashes_backfilled = False
     if index:
+        seen_files = set()
         for qualified_name, meta in index.items():
             source_rel = meta.get("file", "")
             if not source_rel or source_rel in hashes:
@@ -2427,6 +2502,9 @@ def _ensure_san_fresh(repo: str, force: bool = False) -> Optional[str]:
                     try:
                         hashes[source_rel] = _hash_source(source_path)
                         hashes_backfilled = True
+                        if source_rel not in seen_files:
+                            seen_files.add(source_rel)
+                            _record_san_gen(repo, source_rel, source_path, san_path)
                     except OSError:
                         pass
     if hashes_backfilled:
@@ -2693,10 +2771,12 @@ def recompile_san(repo: str, dry_run: bool = False) -> str:
                     # Check if SAN is actually fresh (regenerated after source change)
                     san_is_fresh = san_path.stat().st_mtime >= source_path.stat().st_mtime
                     if san_is_fresh:
-                        # SAN was regenerated — safe to update hash
+                        # SAN was (re)generated by the compiler — safe to update
+                        # hash, and charge its generation cost for net-token math.
                         hashes[rel] = current_hash
                         hashes_changed = True
                         hash_updated += 1
+                        _record_san_gen(repo, rel, source_path, san_path)
                     else:
                         # SAN is stale — don't update hash, report it
                         stale_count += 1
