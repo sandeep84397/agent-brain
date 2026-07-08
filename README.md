@@ -2,7 +2,7 @@
 
 **Enforced, persistent decision memory for AI code agent teams — that survives context compaction.** Agents log decisions and outcomes, learn from past rejections, and resume their pending roadmap after a `/compact` instead of re-researching it. Hooks make it mandatory (not "stored and hoped for"). And code reads route through SAN compression (~80% fewer tokens, tokenizer-measured) so the context window fills slower in the first place.
 
-**Works with any [MCP](https://modelcontextprotocol.io) (Model Context Protocol)-compatible agent**: Claude Code, Cursor, Windsurf, Cline, Continue, etc. Agent templates (`.md` files) are Claude Code specific — the MCP server itself is universal.
+**Portable across agent runtimes — your knowledge isn't trapped in one tool.** Agent Brain is an [MCP](https://modelcontextprotocol.io) server, so **Claude Code** (fully hook-enforced) and **Codex** (MCP-native, advisory protocol) can both drive the *same* brain — switch agents for price or capability without resetting your project's accumulated decisions and SAN. Any MCP host works (Cursor, Cline, Continue, …). See [docs/adapters.md](docs/adapters.md); run `python3 brain/server.py adapter codex` for the Codex config.
 
 ## Contents
 

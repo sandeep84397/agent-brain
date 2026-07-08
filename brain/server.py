@@ -398,15 +398,29 @@ def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "
         pass  # Office state must never break brain functionality
 
 
+# The instructions field is the ONE lifecycle lever every MCP host reads
+# (Claude Code, Codex, Cursor, …). On Claude Code these behaviors are ALSO
+# hook-enforced; on runtimes without hooks (Codex) this string is the whole
+# enforcement, so it spells out the full protocol as standing directives.
 mcp = FastMCP(
     "agent-brain",
     instructions=(
-        "Agent Brain: persistent decision memory for agent teams. "
-        "Call pre_check BEFORE starting work. "
-        "Call log_decision when you decide on an approach. "
-        "Call log_outcome after review/result. "
-        "Use decisions_for to find past decisions touching a code symbol or file. "
-        "This is NON-NEGOTIABLE for all agents."
+        "Agent Brain — persistent, cross-session decision memory + cheap code "
+        "reading. This protocol is NON-NEGOTIABLE for all agents:\n"
+        "1. BEFORE starting any task: call get_roadmap (resume pending work) and "
+        "pre_check(agent, area, action) (see past failures). Do NOT re-research "
+        "what the brain already holds.\n"
+        "2. To READ/EXPLORE code: use get_san(file_path=...) BEFORE raw file "
+        "reads — same structure, ~5-11x fewer tokens. Raw-read only to EDIT, "
+        "for non-code, or when no .san exists. Use query_san to FIND, grep only "
+        "for exact literals SAN drops.\n"
+        "3. When you decide an approach: call log_decision(agent, repo, area, "
+        "action, reasoning) BEFORE editing code.\n"
+        "4. After review/result: call log_outcome(decision_id, outcome, "
+        "outcome_by, reason). Use decisions_for to find decisions touching a "
+        "symbol/file.\n"
+        "On hosts without enforcement hooks (e.g. Codex), following this "
+        "protocol is what makes the brain work — treat it as a hard rule."
     ),
 )
 
@@ -4359,6 +4373,45 @@ if __name__ == "__main__":
         # The honest scorecard: recall, net tokens, usage.
         print(_metrics_report())
         _sys.exit(0)
+    if cmd == "adapter":
+        # Emit host-specific setup so the SAME brain works across runtimes.
+        # Usage: server.py adapter [codex|claude|show]
+        target = _sys.argv[2] if len(_sys.argv) > 2 else "show"
+        _pybin = _sys.executable
+        _server = str(Path(__file__).resolve())
+        if target == "codex":
+            print("# Add this to ~/.codex/config.toml so Codex loads agent-brain")
+            print("# as an MCP server (Codex runs MCP natively over stdio):\n")
+            print("[mcp_servers.agent-brain]")
+            print(f'command = "{_pybin}"')
+            print(f'args = ["{_server}"]\n')
+            print("# Then: `codex mcp list` should show agent-brain.")
+            print("# All brain TOOLS work (pre_check/log_decision/get_san/…) and")
+            print("# Codex reads the MCP `instructions` field as its standing protocol.")
+            print("#")
+            print("# ENFORCED on Claude Code (via hooks), ADVISORY on Codex")
+            print("# (Codex has no hook lifecycle): the decision-gate, amnesia")
+            print("# re-injection, and Read/Bash->SAN routing become guidance the")
+            print("# agent should follow, not blocks. Set read_enforcement / the")
+            print("# protocol in the instructions do the steering.")
+        elif target == "claude":
+            print("# Claude Code: run ./setup.sh (registers MCP + all 5 hooks +")
+            print("# the CLAUDE.md tool-ladder). Or register the MCP server only:")
+            print(f'claude mcp add --transport stdio --scope user agent-brain -- '
+                  f'"{_pybin}" "{_server}"')
+        else:
+            print("agent-brain adapters — one brain, many runtimes:\n")
+            print("  claude  ->  hooks-enforced (setup.sh): decision-gate, amnesia")
+            print("              re-inject on compaction, Read/Bash->SAN routing.")
+            print("  codex   ->  MCP-native tools + instructions protocol (advisory,")
+            print("              no hooks). `server.py adapter codex` prints config.toml.")
+            print("\n  What travels across BOTH: the decision graph, SAN, all MCP tools,")
+            print("  and the standing protocol (the MCP `instructions` field).")
+            print("  What's runtime-specific: hard ENFORCEMENT (Claude hooks) vs")
+            print("  ADVISORY protocol (Codex). The knowledge is portable; only the")
+            print("  enforcement mechanism differs.")
+            print("\nUsage: server.py adapter [codex|claude|show]")
+        _sys.exit(0)
     if cmd == "records":
         # Export the human-readable per-day decision records.
         _repo = _sys.argv[2] if len(_sys.argv) > 2 else ""
@@ -4398,7 +4451,8 @@ if __name__ == "__main__":
         _sys.exit(0)
     if cmd in ("--help", "-h", "help"):
         print("Usage: server.py [diagnose|validate|validate-san|san-index <repo>|"
-              "stats|office [repo]|savings|metrics|roadmap [repo]|records [repo]|"
+              "stats|office [repo]|savings|metrics|adapter [codex|claude]|"
+              "roadmap [repo]|records [repo]|"
               "prune [repo] [--before-days=N] [--apply]|resolve-stale [repo] [--apply]|"
               "clear-activity]")
         print("  (no args)        run the MCP server")
