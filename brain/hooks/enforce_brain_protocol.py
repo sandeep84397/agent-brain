@@ -17,6 +17,7 @@ import json
 import sys
 import os
 import fnmatch
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -53,6 +54,52 @@ def _load_user_skip_patterns() -> list[str]:
     return []
 
 
+def _is_skipped_path(file_path: str) -> bool:
+    """True when this path should not require a logged decision."""
+    basename = os.path.basename(file_path)
+    skip_exts = (".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+                 ".lock", ".gitignore", ".env", ".san")
+    skip_name_prefixes = ("README", "LICENSE", "CHANGELOG", ".san_hashes", ".env")
+    if file_path.endswith(skip_exts) or basename.startswith(skip_name_prefixes):
+        return True
+
+    skip_dirs = ("/.claude/", "/.codex/", "/.git/", "/node_modules/", "/build/", "/.san/")
+    if any(d in file_path for d in skip_dirs):
+        return True
+
+    return any(fnmatch.fnmatch(file_path, pattern)
+               for pattern in _load_user_skip_patterns())
+
+
+def _apply_patch_paths(tool_input: dict) -> list[str]:
+    """Extract touched paths from a Codex/apply_patch payload when available."""
+    text_bits = []
+    for value in tool_input.values():
+        if isinstance(value, str):
+            text_bits.append(value)
+    patch_text = "\n".join(text_bits)
+    if not patch_text:
+        return []
+    paths = []
+    for pattern in (
+        r"^\*\*\* Add File: (.+)$",
+        r"^\*\*\* Update File: (.+)$",
+        r"^\*\*\* Delete File: (.+)$",
+        r"^\*\*\* Move to: (.+)$",
+    ):
+        paths.extend(re.findall(pattern, patch_text, flags=re.MULTILINE))
+    return [p.strip() for p in paths if p.strip()]
+
+
+def _requires_decision(tool_name: str, tool_input: dict) -> bool:
+    if tool_name in ("Edit", "Write"):
+        return not _is_skipped_path(tool_input.get("file_path", ""))
+    if tool_name == "apply_patch":
+        paths = _apply_patch_paths(tool_input)
+        return not paths or any(not _is_skipped_path(path) for path in paths)
+    return False
+
+
 def main():
     # Read hook input from stdin
     try:
@@ -68,32 +115,9 @@ def main():
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
 
-    # Only enforce on Edit/Write (code changes)
-    if tool_name not in ("Edit", "Write"):
+    # Only enforce on code-changing tools.
+    if not _requires_decision(tool_name, tool_input):
         sys.exit(0)
-
-    file_path = tool_input.get("file_path", "")
-
-    # Skip non-code files: docs, configs, generated files.
-    # Extensions match by suffix, names by basename prefix — substring
-    # matching previously skipped enforcement for any path containing
-    # e.g. "sandbox" (matched ".san") or "envoy" (matched ".env").
-    basename = os.path.basename(file_path)
-    skip_exts = (".md", ".txt", ".json", ".yaml", ".yml", ".toml",
-                 ".lock", ".gitignore", ".env", ".san")
-    skip_name_prefixes = ("README", "LICENSE", "CHANGELOG", ".san_hashes", ".env")
-    if file_path.endswith(skip_exts) or basename.startswith(skip_name_prefixes):
-        sys.exit(0)
-
-    # Skip if editing inside .claude/, .git/, node_modules/, build/
-    skip_dirs = ("/.claude/", "/.git/", "/node_modules/", "/build/", "/.san/")
-    if any(d in file_path for d in skip_dirs):
-        sys.exit(0)
-
-    # User-extensible: fnmatch globs from config.json hook_skip_paths
-    for pattern in _load_user_skip_patterns():
-        if fnmatch.fnmatch(file_path, pattern):
-            sys.exit(0)
 
     # Check for recent decision marker
     if not MARKER_FILE.exists():

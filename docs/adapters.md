@@ -5,26 +5,26 @@ it. The decision memory, SAN code briefs, and all tools are the same regardless
 of which agent drives them — **your accumulated knowledge is portable across
 tools, owned by you, not trapped inside one vendor's editor.**
 
-What differs between runtimes is only the **enforcement mechanism**:
+What differs between runtimes is only the **install surface** and hook trust UX:
 
 | | Tools (pre_check, log_decision, get_san, …) | Standing protocol | Hard enforcement |
 |---|---|---|---|
 | **Claude Code** | ✅ native MCP | ✅ MCP `instructions` + CLAUDE.md | ✅ **5 hooks** — decision-gate, amnesia re-inject on compaction, Read/Bash→SAN routing |
-| **Codex** | ✅ native MCP (stdio) | ✅ MCP `instructions` field | ⚠️ **advisory** — Codex has no hook lifecycle, so the protocol is followed as guidance, not blocked |
+| **Codex** | ✅ native MCP (stdio) | ✅ MCP `instructions` + AGENTS.md | ✅ **5 hooks** — decision-gate, roadmap injection, Read/Bash→SAN routing |
 | **Any MCP host** (Cursor, Cline, …) | ✅ if it speaks MCP | ✅ if it reads `instructions` | depends on the host's hook support |
 
-The knowledge (decisions, outcomes, SAN) is identical everywhere. Only *how
-strictly the protocol is enforced* changes — and that's a property of the host,
-not the brain.
+The knowledge (decisions, outcomes, SAN) is identical everywhere. Hooks make the
+protocol mechanical where the host supports them; MCP `instructions` remain the
+portable fallback.
 
 ## Claude Code (fully enforced)
 
 ```bash
 ./setup.sh
 ```
-Registers the MCP server, all five hooks, and the CLAUDE.md tool-ladder. This
-is the strictest experience: edits are blocked without a logged decision, the
-roadmap is re-injected after compaction, raw code reads are routed to SAN.
+When Claude Code is installed, this registers the MCP server, all five hooks,
+and the CLAUDE.md tool-ladder. Edits are blocked without a logged decision, the
+roadmap is re-injected after compaction, and raw code reads are routed to SAN.
 
 MCP-only (no hooks):
 ```bash
@@ -32,10 +32,34 @@ claude mcp add --transport stdio --scope user agent-brain -- \
   ~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py
 ```
 
-## Codex (MCP-native, advisory protocol)
+## Codex (MCP-native + hooks)
+
+Recommended:
+
+```bash
+./setup.sh
+```
+
+When Codex is installed, this installs the brain server and writes:
+
+- `~/.codex/config.toml` — adds `[mcp_servers.agent-brain]`
+- `~/.codex/hooks.json` — adds the decision gate, roadmap injection, brain-before-research nudge, and SAN read-routing hooks
+
+Restart Codex, then run `/mcp` to confirm `agent-brain` is enabled and `/hooks`
+to review and trust the new hooks. Codex requires hook trust before
+non-managed command hooks run.
+
+For a specific repository, add Codex-visible project guidance:
+
+```bash
+./setup.sh --link-project=/absolute/path/to/your/project
+```
+
+This appends an idempotent Agent Brain block to `<project>/AGENTS.md`. Restart
+Codex in that project so the instructions reload.
 
 Codex runs MCP servers natively over stdio and reads the server's `instructions`
-field as standing guidance. Print the exact config to paste:
+field as standing guidance. To print the MCP-only config manually:
 
 ```bash
 python3 brain/server.py adapter codex
@@ -49,16 +73,9 @@ command = "/path/to/.venv/bin/python"
 args = ["/path/to/server.py"]
 ```
 
-Then `codex mcp list` should show `agent-brain`. Every tool works
+Then `/mcp` or `codex mcp list` should show `agent-brain`. Every tool works
 (`pre_check`, `log_decision`, `get_san`, `get_roadmap`, …), and Codex reads the
 brain's protocol from the MCP `instructions` field.
-
-**What you get on Codex:** the full decision memory, SAN reads, cross-session
-recall, and the roadmap — the actual knowledge. **What you don't get:** hard
-hook-enforcement. On Codex the "always pre_check first / read via get_san / log
-before editing" protocol is *guidance the agent should follow*, because Codex
-has no PreToolUse/SessionStart hooks to enforce it. In practice a capable model
-follows a clearly-stated NON-NEGOTIABLE protocol well; it's just not blocked.
 
 ## Switching between runtimes (the point)
 

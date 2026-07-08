@@ -398,10 +398,9 @@ def _auto_heartbeat(agent: str, status: str, task: str = "", talking_to: str = "
         pass  # Office state must never break brain functionality
 
 
-# The instructions field is the ONE lifecycle lever every MCP host reads
-# (Claude Code, Codex, Cursor, …). On Claude Code these behaviors are ALSO
-# hook-enforced; on runtimes without hooks (Codex) this string is the whole
-# enforcement, so it spells out the full protocol as standing directives.
+# The instructions field is the universal lifecycle lever every MCP host reads
+# (Claude Code, Codex, Cursor, …). Hosts with hooks can also enforce the same
+# protocol mechanically; hosts without hooks still get the standing directive.
 mcp = FastMCP(
     "agent-brain",
     instructions=(
@@ -4082,14 +4081,14 @@ def _diagnose(project: str = "") -> int:
       2. config.json valid JSON (or absent — that's OK, server allows empty)
       3. ~/.agent-brain/ writable (decision marker round-trip)
       4. decisions.json readable if present (atomic-write safety)
-      5. MCP registration: claude.json + ~/.claude/settings.json mention agent-brain
+      5. MCP registration: Claude or Codex config mentions agent-brain
       6. Agent .md frontmatter is subagent-MCP-safe (omits `tools:` OR includes
          ToolSearch as fallback)
       7. Per-repo team scoping: report resolved team for each configured repo
 
     Verifies (when project=<path> is set):
-      8. <project>/.mcp.json exists with agent-brain entry
-      9. <project>/.claude/settings.local.json activates project MCP
+      8. Claude project MCP files when present
+      9. Codex AGENTS.md guidance when present
      10. <project>/.gitignore covers brain artifacts (warning, not fail)
 
     Exit code 0 if all checks pass, 1 otherwise.
@@ -4141,8 +4140,9 @@ def _diagnose(project: str = "") -> int:
         checks.append(("decisions.json readable", True,
                        "absent (fresh install — OK)"))
 
-    # 5. MCP registration in either config file
+    # 5. MCP registration in either Claude or Codex config file
     home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME", str(home / ".codex"))).expanduser()
     locations = [
         ("~/.claude.json", home / ".claude.json"),
         ("~/.claude/settings.json", home / ".claude" / "settings.json"),
@@ -4162,6 +4162,32 @@ def _diagnose(project: str = "") -> int:
                 location_report.append(f"{label}: not registered")
         except Exception as e:
             location_report.append(f"{label}: parse error ({e})")
+    codex_config = codex_home / "config.toml"
+    if codex_config.exists():
+        try:
+            if "[mcp_servers.agent-brain]" in codex_config.read_text():
+                location_report.append(f"{codex_config}: ✓")
+                found_anywhere = True
+            else:
+                location_report.append(f"{codex_config}: not registered")
+        except Exception as e:
+            location_report.append(f"{codex_config}: read error ({e})")
+    else:
+        location_report.append(f"{codex_config}: missing")
+
+    codex_hooks = codex_home / "hooks.json"
+    if codex_hooks.exists():
+        try:
+            if "enforce_brain_protocol.py" in codex_hooks.read_text():
+                checks.append(("Codex hooks configured", True, str(codex_hooks)))
+            else:
+                checks.append(("Codex hooks configured", True,
+                               f"{codex_hooks} exists, no agent-brain hooks"))
+        except Exception as e:
+            checks.append(("Codex hooks configured", False, f"read error: {e}"))
+    else:
+        checks.append(("Codex hooks configured", True,
+                       f"{codex_hooks} missing (OK unless using Codex)"))
     checks.append(("MCP registered (main session)", found_anywhere,
                    " | ".join(location_report)))
 
@@ -4233,29 +4259,31 @@ def _diagnose(project: str = "") -> int:
             checks.append((f"Project '{project}'", False,
                            "path is not a directory"))
         else:
-            # 8. .mcp.json
+            # 8. Claude project MCP files (informational unless malformed)
             mcp_path = proj / ".mcp.json"
+            claude_project_mcp = False
             if not mcp_path.exists():
-                checks.append((f"{mcp_path.name} (project MCP)", False,
-                               f"missing — run `setup.sh --link-project={proj}`"))
+                checks.append((f"{mcp_path.name} (Claude project MCP)", True,
+                               f"missing (OK unless using Claude subagents)"))
             else:
                 try:
                     pdata = json.loads(mcp_path.read_text())
                     if "agent-brain" in (pdata.get("mcpServers") or {}):
-                        checks.append((f"{mcp_path.name} (project MCP)", True,
+                        claude_project_mcp = True
+                        checks.append((f"{mcp_path.name} (Claude project MCP)", True,
                                        "agent-brain registered"))
                     else:
-                        checks.append((f"{mcp_path.name} (project MCP)", False,
+                        checks.append((f"{mcp_path.name} (Claude project MCP)", False,
                                        "exists but no agent-brain entry"))
                 except Exception as e:
-                    checks.append((f"{mcp_path.name} (project MCP)", False,
+                    checks.append((f"{mcp_path.name} (Claude project MCP)", False,
                                    f"parse error: {e}"))
 
             # 9. .claude/settings.local.json
             slp = proj / ".claude" / "settings.local.json"
             if not slp.exists():
-                checks.append(("Project settings.local.json", False,
-                               f"missing — run `setup.sh --link-project={proj}`"))
+                checks.append(("Project Claude settings.local.json", True,
+                               "missing (OK unless using Claude subagents)"))
             else:
                 try:
                     sdata = json.loads(slp.read_text())
@@ -4263,19 +4291,39 @@ def _diagnose(project: str = "") -> int:
                     allowlist = sdata.get("enabledMcpjsonServers") or []
                     in_allow = isinstance(allowlist, list) and "agent-brain" in allowlist
                     if enable_all and in_allow:
-                        checks.append(("Project settings.local.json", True,
+                        checks.append(("Project Claude settings.local.json", True,
                                        "MCP enabled + agent-brain allowed"))
+                    elif not claude_project_mcp:
+                        checks.append(("Project Claude settings.local.json", True,
+                                       "present but Claude project MCP is not linked"))
                     else:
                         problems = []
                         if not enable_all:
                             problems.append("enableAllProjectMcpServers != true")
                         if not in_allow:
                             problems.append("agent-brain not in enabledMcpjsonServers")
-                        checks.append(("Project settings.local.json", False,
+                        checks.append(("Project Claude settings.local.json", False,
                                        "; ".join(problems)))
                 except Exception as e:
-                    checks.append(("Project settings.local.json", False,
+                    checks.append(("Project Claude settings.local.json", False,
                                    f"parse error: {e}"))
+
+            agents_md = proj / "AGENTS.md"
+            if not agents_md.exists():
+                checks.append(("Project Codex AGENTS.md", True,
+                               f"missing (run `setup.sh --link-project={proj}` for project guidance)"))
+            else:
+                try:
+                    text = agents_md.read_text(errors="replace")
+                    if "agent-brain:codex-protocol" in text or "Agent Brain Protocol" in text:
+                        checks.append(("Project Codex AGENTS.md", True,
+                                       "agent-brain guidance present"))
+                    else:
+                        checks.append(("Project Codex AGENTS.md", True,
+                                       "exists without agent-brain block"))
+                except Exception as e:
+                    checks.append(("Project Codex AGENTS.md", False,
+                                   f"read error: {e}"))
 
             # 10. .gitignore (informational)
             gi = proj / ".gitignore"
@@ -4380,20 +4428,20 @@ if __name__ == "__main__":
         _pybin = _sys.executable
         _server = str(Path(__file__).resolve())
         if target == "codex":
-            print("# Add this to ~/.codex/config.toml so Codex loads agent-brain")
-            print("# as an MCP server (Codex runs MCP natively over stdio):\n")
+            print("# Easiest path:")
+            print("#   ./setup.sh")
+            print("#")
+            print("# Manual MCP-only config for ~/.codex/config.toml:\n")
             print("[mcp_servers.agent-brain]")
             print(f'command = "{_pybin}"')
             print(f'args = ["{_server}"]\n')
-            print("# Then: `codex mcp list` should show agent-brain.")
+            print("# Then restart Codex; /mcp should show agent-brain.")
             print("# All brain TOOLS work (pre_check/log_decision/get_san/…) and")
             print("# Codex reads the MCP `instructions` field as its standing protocol.")
             print("#")
-            print("# ENFORCED on Claude Code (via hooks), ADVISORY on Codex")
-            print("# (Codex has no hook lifecycle): the decision-gate, amnesia")
-            print("# re-injection, and Read/Bash->SAN routing become guidance the")
-            print("# agent should follow, not blocks. Set read_enforcement / the")
-            print("# protocol in the instructions do the steering.")
+            print("# For full Codex support, ./setup.sh also writes")
+            print("# ~/.codex/hooks.json for decision gating, roadmap injection,")
+            print("# and Read/Bash->SAN nudges. Review/trust hooks with /hooks.")
         elif target == "claude":
             print("# Claude Code: run ./setup.sh (registers MCP + all 5 hooks +")
             print("# the CLAUDE.md tool-ladder). Or register the MCP server only:")
@@ -4403,13 +4451,11 @@ if __name__ == "__main__":
             print("agent-brain adapters — one brain, many runtimes:\n")
             print("  claude  ->  hooks-enforced (setup.sh): decision-gate, amnesia")
             print("              re-inject on compaction, Read/Bash->SAN routing.")
-            print("  codex   ->  MCP-native tools + instructions protocol (advisory,")
-            print("              no hooks). `server.py adapter codex` prints config.toml.")
+            print("  codex   ->  MCP-native tools + Codex hooks via ./setup.sh.")
             print("\n  What travels across BOTH: the decision graph, SAN, all MCP tools,")
             print("  and the standing protocol (the MCP `instructions` field).")
-            print("  What's runtime-specific: hard ENFORCEMENT (Claude hooks) vs")
-            print("  ADVISORY protocol (Codex). The knowledge is portable; only the")
-            print("  enforcement mechanism differs.")
+            print("  What's runtime-specific: install files and hook trust UX. The")
+            print("  knowledge and protocol stay portable.")
             print("\nUsage: server.py adapter [codex|claude|show]")
         _sys.exit(0)
     if cmd == "records":

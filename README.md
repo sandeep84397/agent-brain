@@ -2,7 +2,7 @@
 
 **Enforced, persistent decision memory for AI code agent teams — that survives context compaction.** Agents log decisions and outcomes, learn from past rejections, and resume their pending roadmap after a `/compact` instead of re-researching it. Hooks make it mandatory (not "stored and hoped for"). And code reads route through SAN compression (~80% fewer tokens, tokenizer-measured) so the context window fills slower in the first place.
 
-**Portable across agent runtimes — your knowledge isn't trapped in one tool.** Agent Brain is an [MCP](https://modelcontextprotocol.io) server, so **Claude Code** (fully hook-enforced) and **Codex** (MCP-native, advisory protocol) can both drive the *same* brain — switch agents for price or capability without resetting your project's accumulated decisions and SAN. Any MCP host works (Cursor, Cline, Continue, …). See [docs/adapters.md](docs/adapters.md); run `python3 brain/server.py adapter codex` for the Codex config.
+**Portable across agent runtimes — your knowledge isn't trapped in one tool.** Agent Brain is an [MCP](https://modelcontextprotocol.io) server, so **Claude Code** and **Codex** can both drive the *same* brain with MCP tools, standing protocol, and lifecycle hooks — switch agents for price or capability without resetting your project's accumulated decisions and SAN. Any MCP host works (Cursor, Cline, Continue, …). See [docs/adapters.md](docs/adapters.md); run `./setup.sh` for the easiest install.
 
 ## Contents
 
@@ -58,6 +58,8 @@ Next time, any agent → pre_check() → sees that rejection → avoids the mist
 
 ## Quick Start
 
+Recommended:
+
 ```bash
 git clone https://github.com/sandeep84397/agent-brain.git
 cd agent-brain
@@ -65,12 +67,21 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
+`./setup.sh` installs Agent Brain for every supported runtime it detects on your
+machine: Claude Code, Codex, or both. If you want to force one runtime:
+
+```bash
+./setup.sh --claude
+./setup.sh --codex
+./setup.sh --all
+```
+
 The setup wizard will:
 - Create a Python venv and install dependencies
 - Prompt for your repo paths (or use the template config)
-- Register the MCP server globally with Claude Code
+- Register the MCP server globally with Claude Code and/or Codex
 - Install the brain hooks (decision-gate, amnesia re-inject, Read/Bash→SAN routing)
-- Add the SAN tool-ladder to `~/.claude/CLAUDE.md` so agents read code the cheap way by default — no manual edit needed (idempotent; safe to re-run)
+- Add the SAN tool-ladder to `~/.claude/CLAUDE.md` for Claude Code or `~/.codex/hooks.json` guidance for Codex — no manual edit needed (idempotent; safe to re-run)
 - Offer to customize agent names interactively
 - Run verification checks
 
@@ -80,11 +91,86 @@ The setup wizard will:
 > ```
 > The server gracefully handles a missing `config.json` — it starts with an empty brain.
 
-**Where things land:** `setup.sh` installs a copy of the server to `~/.agent-brain/` with its own venv — that copy is what Claude Code runs. The repo checkout keeps the source. CLI examples in this README use `python3 brain/server.py <cmd>` from the repo root; against the installed copy, the equivalent is `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py <cmd>`. If you edit the repo copy, re-copy it to `~/.agent-brain/server.py` (or re-run `setup.sh`) and restart Claude Code.
+**Where things land:** `setup.sh` installs a copy of the server and hooks to `~/.agent-brain/` with its own venv — that installed copy is what Claude Code and Codex run. The repo checkout keeps the source. CLI examples in this README use `python3 brain/server.py <cmd>` from the repo root after installing dependencies; against the installed copy, the equivalent is `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py <cmd>`. If you edit the repo copy, re-run `setup.sh` and restart your agent runtime.
+
+### Existing users: upgrade to Claude + Codex
+
+If you already installed Agent Brain before Codex support, update the checkout
+and re-run the same command:
+
+```bash
+git pull
+./setup.sh
+```
+
+The installer is idempotent. It preserves `~/.agent-brain/config.json`,
+`decisions.json`, `decisions.journal`, records, metrics, and existing Claude
+agent files unless you explicitly choose to overwrite templates. It refreshes
+the installed server and hooks under `~/.agent-brain/`, keeps Claude Code wired,
+and adds Codex config when Codex is detected.
+
+For each repo you want both runtimes to use:
+
+```bash
+./setup.sh --link-project=/absolute/path/to/your/project
+```
+
+Then restart Claude Code and Codex. In Codex, run `/mcp` and `/hooks`; trust the
+Agent Brain hooks when prompted. Verify with:
+
+```bash
+~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose --project=/absolute/path/to/your/project
+```
+
+### Let an AI agent upgrade it
+
+If an AI coding agent already has terminal access to your Agent Brain checkout,
+you can ask it to do the upgrade for you:
+
+```text
+Update Agent Brain for Claude and Codex compatibility in this repo, link this
+project, then run diagnose and validation.
+```
+
+The agent should run:
+
+```bash
+git pull
+./setup.sh
+./setup.sh --link-project="$(pwd)"
+~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose --project="$(pwd)"
+~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py validate
+```
+
+The only manual step Codex may still require is hook trust: after setup,
+restart Codex, run `/hooks`, and trust the Agent Brain hooks. That trust step is
+intentional Codex safety behavior for non-managed command hooks.
+
+### Codex setup
+
+When Codex is installed, `./setup.sh` writes:
+
+- `~/.codex/config.toml` — `[mcp_servers.agent-brain]` using the installed brain venv
+- `~/.codex/hooks.json` — decision gate, roadmap injection, brain-before-research nudge, and SAN Read/Bash routing
+
+After install, restart Codex. In Codex, run `/mcp` to confirm `agent-brain` is
+enabled, then run `/hooks` and trust the Agent Brain hooks when prompted. Codex
+requires explicit trust for non-managed command hooks.
+
+To link a project for all supported runtimes:
+
+```bash
+./setup.sh --link-project=/absolute/path/to/your/project
+```
+
+This writes Claude project MCP files and appends an idempotent Agent Brain
+protocol block to `<project>/AGENTS.md` for Codex. Restart your agent runtime in
+that project so the instructions and MCP config reload.
 
 ### Linking a project (so subagents can use brain)
 
-`./setup.sh` registers brain at the user level. That's enough for the **main Claude Code session**, but **subagents spawned inside a project** read MCP config from project-scoped files. Run:
+`./setup.sh` registers brain at the user level. For project-local guidance and
+subagent/project wiring, run:
 
 ```bash
 ./setup.sh --link-project=/absolute/path/to/your/project
@@ -94,9 +180,10 @@ This is **idempotent** and writes/merges:
 
 - `<project>/.mcp.json` — adds the `agent-brain` server entry alongside any existing entries
 - `<project>/.claude/settings.local.json` — sets `enableAllProjectMcpServers: true` and adds `agent-brain` to `enabledMcpjsonServers`
+- `<project>/AGENTS.md` — adds the Agent Brain protocol for Codex
 - `<project>/.gitignore` — appends `.mcp.json`, `.san/.san_hashes.json`, `.san/_cache/`
 
-After running it, restart Claude Code in the project (`/exit` then `claude`), then verify:
+After running it, restart Claude Code and/or Codex in the project, then verify:
 
 ```bash
 ~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py diagnose --project=/absolute/path/to/your/project
@@ -956,7 +1043,9 @@ Brain Stats:
 
 | Problem | Fix |
 |---------|-----|
-| brain tools not found | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
+| brain tools not found in Claude Code | Restart Claude Code. Check `claude mcp list` shows `agent-brain`. |
+| brain tools not found in Codex | Restart Codex. Run `/mcp` and confirm `agent-brain` is enabled. |
+| Codex hooks do not run | Run `/hooks`, review the Agent Brain hooks, and trust them. |
 | MCP connection error | Check venv: `~/.agent-brain/.venv/bin/python -c "import mcp, networkx"` |
 | No tools registered | Verify: `~/.agent-brain/.venv/bin/python ~/.agent-brain/server.py` shouldn't error |
 | `config.json` not found | Server works without it (empty brain). Create one if you want repo integration. |
@@ -977,15 +1066,16 @@ Runs a standalone health check from the shell — no Claude session required.
 2. `config.json` is valid JSON (or absent — empty brain is OK)
 3. `~/.agent-brain/` is writable (decision marker round-trip)
 4. `decisions.json` is readable if present
-5. `agent-brain` is registered as an MCP server in `~/.claude.json` and/or `~/.claude/settings.json` (layer 1)
-6. Every `~/.claude/agents/*.md` is **subagent-MCP-safe**: omits the `tools:` frontmatter field (preferred — inherits MCP) **or** lists `ToolSearch` in `tools:` (fallback bootstrap)
-7. Per-repo team resolution: which agents the brain considers in-team for each configured repo
+5. `agent-brain` is registered as an MCP server in Claude config and/or `~/.codex/config.toml`
+6. Codex hooks exist when configured (`~/.codex/hooks.json`)
+7. Every `~/.claude/agents/*.md` is **subagent-MCP-safe**: omits the `tools:` frontmatter field (preferred — inherits MCP) **or** lists `ToolSearch` in `tools:` (fallback bootstrap)
+8. Per-repo team resolution: which agents the brain considers in-team for each configured repo
 
 **With `--project=<path>`, also verifies:**
 
-8. `<project>/.mcp.json` exists and registers `agent-brain` (layer 3)
-9. `<project>/.claude/settings.local.json` enables project MCP and allowlists `agent-brain` (layer 4)
-10. `<project>/.gitignore` covers brain artifacts (informational)
+9. Claude project MCP files when present (`.mcp.json`, `.claude/settings.local.json`)
+10. Codex project guidance when present (`AGENTS.md`)
+11. `<project>/.gitignore` covers brain artifacts (informational)
 
 Exit code is `0` when all checks pass, `1` otherwise — safe to call from a CI pre-flight or a dotfiles bootstrap.
 

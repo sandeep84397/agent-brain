@@ -5,10 +5,16 @@ set -euo pipefail
 # Agent Brain — Setup Script
 #
 # Modes:
-#   ./setup.sh                          # full install (interactive wizard)
+#   ./setup.sh                          # install for every detected runtime
+#                                        # (Claude Code, Codex, or both)
+#   ./setup.sh --claude                 # Claude Code install only
+#   ./setup.sh --codex                  # Codex install (MCP + hooks)
+#   ./setup.sh --all                    # Claude Code + Codex install
 #   ./setup.sh --link-project=<path>    # link an existing project to brain
-#                                        (writes .mcp.json + project settings;
+#                                        (Claude project MCP + Codex AGENTS.md;
 #                                         install must already be done)
+#   ./setup.sh --link-codex-project=<path>
+#                                        # add AGENTS.md brain protocol guidance
 # ============================================================================
 
 BRAIN_DIR="${AGENT_BRAIN_DIR:-$HOME/.agent-brain}"
@@ -18,19 +24,60 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Argument parsing
 # ---------------------------------------------------------------------------
 LINK_PROJECT=""
+LINK_CODEX_PROJECT=""
+INSTALL_CLAUDE="auto"
+INSTALL_CODEX="auto"
 for arg in "$@"; do
     case "$arg" in
         --link-project=*) LINK_PROJECT="${arg#*=}" ;;
         --link-project)   echo "ERROR: --link-project requires a value (use --link-project=/path)"; exit 2 ;;
+        --link-codex-project=*) LINK_CODEX_PROJECT="${arg#*=}" ;;
+        --link-codex-project)   echo "ERROR: --link-codex-project requires a value (use --link-codex-project=/path)"; exit 2 ;;
+        --claude) INSTALL_CLAUDE=1; INSTALL_CODEX=0 ;;
+        --codex) INSTALL_CLAUDE=0; INSTALL_CODEX=1 ;;
+        --with-codex) INSTALL_CODEX=1 ;;
+        --all) INSTALL_CLAUDE=1; INSTALL_CODEX=1 ;;
         --help|-h)
             echo "Usage:"
-            echo "  ./setup.sh                          Full install + interactive wizard"
+            echo "  ./setup.sh                          Install for every detected runtime"
+            echo "  ./setup.sh --claude                 Install for Claude Code only"
+            echo "  ./setup.sh --codex                  Install for Codex only"
+            echo "  ./setup.sh --with-codex             Existing Claude install + Codex config"
+            echo "  ./setup.sh --all                    Install for Claude Code and Codex"
             echo "  ./setup.sh --link-project=<path>    Link an existing project to a"
-            echo "                                       previously-installed brain"
+            echo "                                       previously-installed brain for all runtimes"
+            echo "  ./setup.sh --link-codex-project=<path>"
+            echo "                                       Add Codex AGENTS.md guidance to a project"
             exit 0 ;;
         *) echo "Unknown flag: $arg"; echo "Try ./setup.sh --help"; exit 2 ;;
     esac
 done
+
+codex_detected() {
+    command -v codex &>/dev/null || [ -d "/Applications/Codex.app" ] || [ -n "${CODEX_HOME:-}" ]
+}
+
+if [ "$INSTALL_CLAUDE" = "auto" ]; then
+    if command -v claude &>/dev/null; then
+        INSTALL_CLAUDE=1
+    else
+        INSTALL_CLAUDE=0
+    fi
+fi
+
+if [ "$INSTALL_CODEX" = "auto" ]; then
+    if codex_detected; then
+        INSTALL_CODEX=1
+    else
+        INSTALL_CODEX=0
+    fi
+fi
+
+if [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ]; then
+    # Preserve the old fallback: still install the brain and print Claude's
+    # manual registration command when no supported runtime is detected.
+    INSTALL_CLAUDE=1
+fi
 
 # ---------------------------------------------------------------------------
 # --link-project mode: do NOT run the install wizard.
@@ -168,12 +215,44 @@ if not matching:
     print( "    so brain decisions can be filed under this repo's name.")
 PYEOF
 
+    "$PYBIN" "$SCRIPT_DIR/brain/codex_setup.py" \
+        link-project --project "$PROJECT_PATH"
+
     PROJECT_NAME="$(basename "$PROJECT_PATH")"
     echo ""
     echo "Next steps:"
     echo "  1. If '$PROJECT_NAME' is missing from $BRAIN_DIR/config.json, add it (see above)."
-    echo "  2. Restart Claude Code in the project: '/exit' then 'claude'."
-    echo "  3. Verify:  $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py diagnose --project=$PROJECT_PATH"
+    echo "  2. Restart Claude Code and/or Codex in the project so config and AGENTS.md reload."
+    echo "  3. In Codex, run /mcp and /hooks to confirm agent-brain is enabled and trusted."
+    echo "  4. Verify:  $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py diagnose --project=$PROJECT_PATH"
+    exit 0
+fi
+
+if [ -n "$LINK_CODEX_PROJECT" ]; then
+    PROJECT_PATH="$LINK_CODEX_PROJECT"
+    if [ ! -d "$PROJECT_PATH" ]; then
+        echo "ERROR: project path '$PROJECT_PATH' is not a directory."
+        exit 1
+    fi
+    if [ ! -f "$BRAIN_DIR/server.py" ] || [ ! -x "$BRAIN_DIR/.venv/bin/python" ]; then
+        echo "ERROR: agent-brain is not installed at $BRAIN_DIR."
+        echo "Run ./setup.sh --codex first, then re-run with --link-codex-project."
+        exit 1
+    fi
+
+    PROJECT_PATH="$(cd "$PROJECT_PATH" && pwd)"
+    echo "============================================"
+    echo "  Agent Brain — Link Codex Project"
+    echo "============================================"
+    echo "  Project:  $PROJECT_PATH"
+    echo ""
+    "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
+        link-project --project "$PROJECT_PATH"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Make sure '$PROJECT_PATH' is registered in $BRAIN_DIR/config.json."
+    echo "  2. Restart Codex in the project so AGENTS.md is reloaded."
+    echo "  3. In Codex, run /mcp and /hooks to confirm agent-brain is enabled and trusted."
     exit 0
 fi
 
@@ -206,7 +285,9 @@ echo "[2/6] Installing brain server..."
 
 mkdir -p "$BRAIN_DIR"
 cp "$SCRIPT_DIR/brain/server.py" "$BRAIN_DIR/server.py"
-echo "  Copied server.py to $BRAIN_DIR/"
+mkdir -p "$BRAIN_DIR/hooks"
+cp "$SCRIPT_DIR"/brain/hooks/*.py "$BRAIN_DIR/hooks/"
+echo "  Copied server.py and hooks to $BRAIN_DIR/"
 
 # ---------------------------------------------------------------------------
 # Step 3: Config
@@ -258,16 +339,31 @@ fi
 echo ""
 echo "[4/6] Registering MCP server..."
 
-if command -v claude &>/dev/null; then
+if [ "$INSTALL_CLAUDE" -eq 1 ] && command -v claude &>/dev/null; then
     # Remove existing registration if present (idempotent)
     claude mcp remove agent-brain 2>/dev/null || true
     claude mcp add --transport stdio --scope user agent-brain -- \
         "$BRAIN_DIR/.venv/bin/python" "$BRAIN_DIR/server.py"
-    echo "  Registered agent-brain MCP (global scope)."
-else
+    echo "  Registered agent-brain MCP with Claude Code (global scope)."
+elif [ "$INSTALL_CLAUDE" -eq 1 ]; then
     echo "  WARNING: 'claude' CLI not found. Register manually:"
     echo "  claude mcp add --transport stdio --scope user agent-brain -- \\"
     echo "      $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py"
+else
+    echo "  Skipping Claude Code MCP registration (Claude Code not selected or not detected)."
+fi
+
+if [ "$INSTALL_CODEX" -eq 1 ]; then
+    echo ""
+    echo "[4a] Installing Codex MCP + hooks..."
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+    "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
+        install-user \
+        --codex-home "$CODEX_HOME" \
+        --pybin "$BRAIN_DIR/.venv/bin/python" \
+        --server "$BRAIN_DIR/server.py" \
+        --hooks-dir "$BRAIN_DIR/hooks"
+    echo "  Restart Codex, then run /mcp and /hooks to review and trust hooks."
 fi
 
 # ---------------------------------------------------------------------------
@@ -277,9 +373,12 @@ echo ""
 echo "[4b] Installing brain hooks..."
 
 SETTINGS_FILE="$HOME/.claude/settings.json"
-HOOKS_DIR="$SCRIPT_DIR/brain/hooks"
+HOOKS_DIR="$BRAIN_DIR/hooks"
 PYBIN="$BRAIN_DIR/.venv/bin/python"
 
+if [ "$INSTALL_CLAUDE" -eq 0 ]; then
+    echo "  Skipping Claude Code hooks (Claude Code not selected or not detected)."
+else
 # Idempotent JSON merge — adds five hooks without clobbering existing ones:
 #   PreToolUse  Edit|Write  -> enforce_brain_protocol.py   (gate code edits)
 #   SessionStart startup|resume|compact -> inject_brain_context.py  (amnesia fix)
@@ -304,20 +403,31 @@ if settings_path.exists():
 
 hooks = settings.setdefault("hooks", {})
 
-def has_cmd(event, substr):
-    return any(substr in h.get("command", "")
-              for blk in hooks.get(event, []) for h in blk.get("hooks", []))
-
 def add(event, matcher, script, timeout):
     cmd = f"{pybin} {hooks_dir}/{script}"
-    if has_cmd(event, script):
+    existing_groups = hooks.get(event, [])
+    if any(h.get("command", "") == cmd
+           for blk in existing_groups for h in blk.get("hooks", [])):
         print(f"  = {event}/{script} already installed")
         return
+    kept = []
+    removed = False
+    for blk in existing_groups:
+        old_hooks = blk.get("hooks", [])
+        new_hooks = [h for h in old_hooks if script not in h.get("command", "")]
+        if len(new_hooks) != len(old_hooks):
+            removed = True
+        if new_hooks:
+            next_blk = dict(blk)
+            next_blk["hooks"] = new_hooks
+            kept.append(next_blk)
+    hooks[event] = kept
     hooks.setdefault(event, []).append({
         "matcher": matcher,
         "hooks": [{"type": "command", "command": cmd, "timeout": timeout}],
     })
-    print(f"  + {event}/{script}")
+    prefix = "~" if removed else "+"
+    print(f"  {prefix} {event}/{script}")
 
 add("PreToolUse", "Edit|Write", "enforce_brain_protocol.py", 5000)
 add("SessionStart", "startup|resume|compact", "inject_brain_context.py", 15000)
@@ -332,6 +442,7 @@ settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 print(f"  Wrote {settings_path} (backup at settings.json.bak)")
 PYEOF
 echo "  Set BRAIN_SKIP_ENFORCE=1 to bypass all gates for your own direct edits."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4c: Install the SAN tool-ladder directive into the global CLAUDE.md
@@ -342,6 +453,9 @@ echo "  Set BRAIN_SKIP_ENFORCE=1 to bypass all gates for your own direct edits."
 echo ""
 echo "[4c] Adding SAN tool-ladder to global CLAUDE.md..."
 
+if [ "$INSTALL_CLAUDE" -eq 0 ]; then
+    echo "  Skipping Claude Code CLAUDE.md update (Claude Code not selected or not detected)."
+else
 GLOBAL_CLAUDE="$HOME/.claude/CLAUDE.md"
 "$PYBIN" - "$GLOBAL_CLAUDE" <<'PYEOF'
 import sys
@@ -378,6 +492,7 @@ else:
     path.write_text(existing + sep + BLOCK)
     print(f"  ✓ Added SAN ladder to {path}")
 PYEOF
+fi
 
 # ---------------------------------------------------------------------------
 # Step 5: Install agent templates
@@ -385,6 +500,9 @@ PYEOF
 echo ""
 echo "[5/6] Installing agent templates..."
 
+if [ "$INSTALL_CLAUDE" -eq 0 ]; then
+    echo "  Skipping Claude Code agent templates (Claude Code not selected or not detected)."
+else
 AGENTS_DIR="$HOME/.claude/agents"
 mkdir -p "$AGENTS_DIR"
 
@@ -499,6 +617,7 @@ case "$AGENT_CHOICE" in
         echo "  Skipped. Existing agents preserved."
         ;;
 esac
+fi
 
 # ---------------------------------------------------------------------------
 # Step 6: Verify installation
@@ -546,11 +665,27 @@ else
 fi
 
 # Check MCP registration
-if command -v claude &>/dev/null; then
+if [ "$INSTALL_CLAUDE" -eq 1 ] && command -v claude &>/dev/null; then
     if claude mcp list 2>/dev/null | grep -q "agent-brain"; then
         echo "  ✓ MCP registered with Claude Code"
     else
         echo "  ⚠ MCP not found in claude mcp list (may need restart)"
+    fi
+fi
+
+if [ "$INSTALL_CODEX" -eq 1 ]; then
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+    if [ -f "$CODEX_HOME/config.toml" ] && grep -q "\[mcp_servers.agent-brain\]" "$CODEX_HOME/config.toml"; then
+        echo "  ✓ MCP configured for Codex"
+    else
+        echo "  ✗ Codex MCP config missing!"
+        ERRORS=$((ERRORS + 1))
+    fi
+    if [ -f "$CODEX_HOME/hooks.json" ] && grep -q "enforce_brain_protocol.py" "$CODEX_HOME/hooks.json"; then
+        echo "  ✓ Codex hooks configured"
+    else
+        echo "  ✗ Codex hooks missing!"
+        ERRORS=$((ERRORS + 1))
     fi
 fi
 
@@ -580,10 +715,22 @@ fi
 echo ""
 echo "Next steps:"
 echo "  1. Edit $BRAIN_DIR/config.json (add repos if not done above)"
-echo "  2. Customize agent names in $AGENTS_DIR/*.md (if skipped)"
-echo "  3. Restart Claude Code"
-echo "  4. Test: $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py stats"
-echo "  5. Re-run health check anytime:"
+if [ "$INSTALL_CLAUDE" -eq 1 ]; then
+    echo "  2. Customize agent names in $HOME/.claude/agents/*.md (if skipped)"
+    echo "  3. Restart Claude Code"
+elif [ "$INSTALL_CODEX" -eq 1 ]; then
+    echo "  2. Restart Codex"
+    echo "  3. Run /mcp and /hooks; trust the agent-brain hooks when prompted"
+fi
+if [ "$INSTALL_CLAUDE" -eq 1 ] && [ "$INSTALL_CODEX" -eq 1 ]; then
+    echo "  4. Optional per project: ./setup.sh --link-project=/absolute/path/to/project"
+elif [ "$INSTALL_CODEX" -eq 1 ]; then
+    echo "  4. Optional per project: ./setup.sh --link-codex-project=/absolute/path/to/project"
+else
+    echo "  4. Optional per project: ./setup.sh --link-project=/absolute/path/to/project"
+fi
+echo "  5. Test: $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py stats"
+echo "  6. Re-run health check anytime:"
 echo "       $BRAIN_DIR/.venv/bin/python $BRAIN_DIR/server.py diagnose"
 echo ""
 echo "Expected 'server.py stats' output:"
