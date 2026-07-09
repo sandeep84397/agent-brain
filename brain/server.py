@@ -20,6 +20,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 import re
@@ -1045,29 +1046,155 @@ def pre_check(agent: str, area: str, action_description: str,
     return out
 
 
+def _compact_string_list(values, limit: int = 20, chars: int = 200) -> list[str]:
+    """Normalize optional list fields without letting one item bloat the graph."""
+    if not values:
+        return []
+    if isinstance(values, (str, bytes)) or not isinstance(values, list):
+        values = [values]
+    out = []
+    for value in values[:limit]:
+        out.append(_cap_text(str(value), chars))
+    return out
+
+
+def _sanitize_validation(validation) -> list[dict]:
+    """Keep validation evidence structured, bounded, and JSON-friendly."""
+    if not validation:
+        return []
+    if isinstance(validation, dict):
+        validation = [validation]
+    if not isinstance(validation, list):
+        return []
+    out = []
+    for item in validation[:10]:
+        if not isinstance(item, dict):
+            continue
+        clean = {}
+        for key, value in item.items():
+            k = _cap_text(str(key), 80)
+            if isinstance(value, (int, float, bool)) or value is None:
+                clean[k] = value
+            elif isinstance(value, list):
+                clean[k] = _compact_string_list(value, limit=20, chars=160)
+            else:
+                clean[k] = _cap_text(str(value), 300)
+        if clean:
+            out.append(clean)
+    return out
+
+
+def _git_output(repo_path: Path, *args: str) -> Optional[str]:
+    """Run a local git metadata command. Never raises or contacts the network."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            text=True,
+            capture_output=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _collect_git_metadata(repo: str) -> dict:
+    """Best-effort repo snapshot for handoff records."""
+    repo_path = _resolve_repo_path(repo)
+    if not repo_path:
+        return {}
+    branch = _git_output(repo_path, "branch", "--show-current") or ""
+    commit = _git_output(repo_path, "rev-parse", "HEAD") or ""
+    origin_head = _git_output(repo_path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or ""
+    status = _git_output(repo_path, "status", "--short") or ""
+    uncommitted = []
+    for line in status.splitlines():
+        if len(line) >= 4:
+            uncommitted.append(line[3:])
+    meta = {
+        "branch": branch,
+        "base_branch": origin_head.replace("origin/", "", 1) if origin_head else "",
+        "commit_before": commit,
+        "working_tree_dirty": bool(status),
+        "uncommitted_files": uncommitted[:50],
+    }
+    return {k: v for k, v in meta.items() if v not in ("", [], None)}
+
+
+def _build_git_metadata(repo: str, branch: Optional[str], base_branch: Optional[str],
+                        commit_before: Optional[str], commit_after: Optional[str],
+                        commit_range: Optional[str], pr_number: Optional[str],
+                        working_tree_dirty: Optional[bool],
+                        uncommitted_files: Optional[list[str]]) -> dict:
+    """Merge explicit git metadata over best-effort auto-detected fields."""
+    git = _collect_git_metadata(repo)
+    explicit = {
+        "branch": branch,
+        "base_branch": base_branch,
+        "commit_before": commit_before,
+        "commit_after": commit_after,
+        "commit_range": commit_range,
+        "pr_number": pr_number,
+        "working_tree_dirty": working_tree_dirty,
+        "uncommitted_files": _compact_string_list(uncommitted_files, limit=50, chars=300),
+    }
+    for key, value in explicit.items():
+        if value not in (None, "", []):
+            git[key] = value
+    for key in ("branch", "base_branch", "commit_before", "commit_after", "commit_range", "pr_number"):
+        if key in git:
+            git[key] = _cap_text(str(git[key]), 200)
+    if "uncommitted_files" in git:
+        git["uncommitted_files"] = _compact_string_list(git["uncommitted_files"], limit=50, chars=300)
+    return {k: v for k, v in git.items() if v not in ("", [], None)}
+
+
+def _looks_complete_but_pending(action: str) -> bool:
+    return any(word in action.upper() for word in ("COMPLETE", "PUSHED", "MERGED", "REVIEWED"))
+
+
 @mcp.tool()
 def log_decision(
     agent: str, repo: str, area: str, action: str, reasoning: str,
     files_touched: Optional[list[str]] = None,
     code_symbols: Optional[list[str]] = None,
     plan_file: Optional[str] = None,
+    handoff_summary: Optional[str] = None,
+    branch: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    commit_before: Optional[str] = None,
+    commit_after: Optional[str] = None,
+    commit_range: Optional[str] = None,
+    pr_number: Optional[str] = None,
+    working_tree_dirty: Optional[bool] = None,
+    uncommitted_files: Optional[list[str]] = None,
+    validation: Optional[list[dict]] = None,
+    blockers: Optional[list[str]] = None,
+    deferred_work: Optional[list[str]] = None,
+    do_not_touch: Optional[list[str]] = None,
+    next_action: Optional[str] = None,
 ) -> str:
     """
     Log a decision. Call AFTER pre_check, BEFORE doing work — required before
-    code edits. area e.g. "auth"; optional files_touched paths and
-    code_symbols qualified_names link the decision to code. plan_file: path to
-    a written plan/spec — pre_check surfaces it to later agents in this area
-    so cheap executors reuse expensive planning instead of re-deriving it.
+    code edits. area e.g. "auth"; optional files_touched/code_symbols link
+    decisions to code; optional handoff/git/validation fields make future
+    get_resume_context calls compact and transcript-free.
     """
     # Cap stored text — unbounded fields produced 31KB decision nodes that
     # bloat the graph file and every query/pre_check response echoing them.
     action = _cap_text(action, 1000)
     reasoning = _cap_text(reasoning, 2000)
+    git = _build_git_metadata(repo, branch, base_branch, commit_before, commit_after,
+                              commit_range, pr_number, working_tree_dirty,
+                              uncommitted_files)
     with LOCK:
         G = _load_graph()
         node_id = f"dec_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         resolved_symbols = (code_symbols or [])[:50]
-        files = (files_touched or [])[:50]
+        files = (files_touched or git.get("uncommitted_files") or [])[:50]
         if files and not resolved_symbols:
             code_nodes = _resolve_files_to_code_nodes(repo, files)
             resolved_symbols = list(set(n["qualified_name"] for n in code_nodes))
@@ -1077,6 +1204,23 @@ def log_decision(
                           timestamp=datetime.now().isoformat(), outcome="pending")
         if plan_file:
             node_attrs["plan_file"] = _cap_text(plan_file, 500)
+        if handoff_summary:
+            node_attrs["handoff_summary"] = _cap_text(handoff_summary, 1200)
+        if git:
+            node_attrs["git"] = git
+        clean_validation = _sanitize_validation(validation)
+        if clean_validation:
+            node_attrs["validation"] = clean_validation
+        for key, values in (
+            ("blockers", blockers),
+            ("deferred_work", deferred_work),
+            ("do_not_touch", do_not_touch),
+        ):
+            clean = _compact_string_list(values)
+            if clean:
+                node_attrs[key] = clean
+        if next_action:
+            node_attrs["next_action"] = _cap_text(next_action, 500)
         G.add_node(node_id, **node_attrs)
         for sym in resolved_symbols:
             sym_node = f"code:{sym}"
@@ -1101,6 +1245,9 @@ def log_decision(
     result = f"Decision logged: {node_id}"
     if resolved_symbols:
         result += f"\nLinked to {len(resolved_symbols)} code symbol(s)"
+    if _looks_complete_but_pending(action):
+        result += ("\nNUDGE: action looks complete but outcome is still pending; "
+                   "call log_outcome when validation/review is done.")
     return result
 
 
@@ -1692,6 +1839,85 @@ def _format_roadmap_digest(rows: list[dict], limit: int = 15,
     return header + "\n" + "\n".join(lines)
 
 
+def _area_matches(data_area: str, area: str) -> bool:
+    """Exact-or-prefix area filter so area='x' includes x/roadmap."""
+    if not area:
+        return True
+    data_area = data_area or ""
+    return data_area == area or data_area.startswith(area.rstrip("/") + "/")
+
+
+def _decision_timestamp(data: dict) -> str:
+    return str(data.get("timestamp", ""))
+
+
+def _format_git_summary(git: dict) -> str:
+    if not isinstance(git, dict) or not git:
+        return ""
+    parts = []
+    for key, label in (
+        ("branch", "branch"),
+        ("base_branch", "base"),
+        ("commit_range", "range"),
+        ("pr_number", "PR"),
+    ):
+        if git.get(key) not in ("", None):
+            parts.append(f"{label}={git[key]}")
+    if "working_tree_dirty" in git:
+        parts.append(f"dirty={bool(git.get('working_tree_dirty'))}")
+    return ", ".join(parts)
+
+
+def _format_validation_entry(item: dict) -> str:
+    cmd = str(item.get("command", "?"))
+    status = str(item.get("status", "?"))
+    exit_code = item.get("exit_code")
+    suffix = f" (exit {exit_code})" if exit_code is not None else ""
+    counts = []
+    if item.get("passed") is not None:
+        counts.append(f"passed={item.get('passed')}")
+    if item.get("failed") is not None:
+        counts.append(f"failed={item.get('failed')}")
+    if counts:
+        suffix += " [" + ", ".join(counts) + "]"
+    return f"{cmd} -> {status}{suffix}"
+
+
+def _matching_decisions(G: nx.DiGraph, repo: str, area: str = "") -> list[tuple[str, dict]]:
+    rows = []
+    for node_id, data in G.nodes(data=True):
+        if data.get("type") != "decision":
+            continue
+        if repo and data.get("repo") != repo:
+            continue
+        if not _area_matches(str(data.get("area", "")), area):
+            continue
+        rows.append((node_id, dict(data)))
+    rows.sort(key=lambda row: _decision_timestamp(row[1]), reverse=True)
+    return rows
+
+
+def _pending_completion_nudges(rows: list[tuple[str, dict]], stale_days: int = 30) -> list[str]:
+    cutoff = datetime.now() - timedelta(days=stale_days)
+    nudges = []
+    for node_id, data in rows:
+        if data.get("outcome", "pending") != "pending":
+            continue
+        action = str(data.get("action", ""))
+        reasons = []
+        if _looks_complete_but_pending(action):
+            reasons.append("action looks complete")
+        try:
+            ts = datetime.fromisoformat(str(data.get("timestamp", "")))
+            if ts <= cutoff:
+                reasons.append(f"pending >{stale_days}d")
+        except (TypeError, ValueError):
+            pass
+        if reasons:
+            nudges.append(f"[{node_id}] {', '.join(reasons)}: consider log_outcome or resolve_stale_pending")
+    return nudges
+
+
 @mcp.tool()
 def get_roadmap(repo: str = "", limit: int = 15) -> str:
     """
@@ -1708,6 +1934,112 @@ def get_roadmap(repo: str = "", limit: int = 15) -> str:
     out = _format_roadmap_digest(rows, limit=limit)
     _record_query("get_roadmap", [r.get("id") for r in rows[:limit] if r.get("id")],
                   out, repo=repo, had_result=bool(rows))
+    return out
+
+
+@mcp.tool()
+def get_resume_context(repo: str, area: str = "", detail: str = "compact",
+                       limit: int = 5) -> str:
+    """
+    Return compact cross-session context for a repo/area: latest handoff,
+    open roadmap items, recent decisions, hygiene nudges, validation evidence,
+    SAN visibility, and the next recommended action.
+    """
+    _write_query_marker()
+    with LOCK:
+        G = _load_graph()
+
+    rows = _matching_decisions(G, repo, area)
+    if not rows:
+        out = f"RESUME CONTEXT: {repo}{(' | ' + area) if area else ''}\nNo matching decisions."
+        _record_query("get_resume_context", [], out, repo=repo, had_result=False)
+        return out
+
+    shown_ids = [node_id for node_id, _ in rows[:limit]]
+    lines = [f"RESUME CONTEXT: {repo}{(' | ' + area) if area else ''}", ""]
+
+    handoffs = [(node_id, data) for node_id, data in rows if data.get("handoff_summary")]
+    if handoffs:
+        lines.append("LATEST HANDOFF")
+        for node_id, data in handoffs[:max(1, min(limit, 3))]:
+            lines.append(f"[{node_id}] {data.get('timestamp', '?')[:19]} {data.get('agent', '?')} | {data.get('area', '?')}")
+            lines.append(f"  {data.get('handoff_summary')}")
+            git_line = _format_git_summary(data.get("git", {}))
+            if git_line:
+                lines.append(f"  git: {git_line}")
+            if data.get("next_action"):
+                lines.append(f"  next: {data.get('next_action')}")
+        lines.append("")
+
+    roadmap = [r for r in _roadmap_rows(G, repo) if _area_matches(str(r.get("area", "")), area)]
+    if roadmap:
+        lines.append("OPEN WORK")
+        for r in roadmap[:limit]:
+            tag = "ROADMAP " if r.get("is_roadmap") else ""
+            lines.append(f"[{r['id']}] {tag}{r['area']} | {r['action'][:150]} -> {r['outcome']}")
+        lines.append("")
+
+    blockers = []
+    do_not_touch = []
+    deferred = []
+    validation_lines = []
+    next_actions = []
+    for node_id, data in rows:
+        if data.get("outcome", "pending") in ("pending", "revised"):
+            for blocker in data.get("blockers", []) or []:
+                blockers.append(f"[{node_id}] {blocker}")
+        for item in data.get("do_not_touch", []) or []:
+            do_not_touch.append(f"[{node_id}] {item}")
+        for item in data.get("deferred_work", []) or []:
+            deferred.append(f"[{node_id}] {item}")
+        for item in data.get("validation", []) or []:
+            if isinstance(item, dict):
+                validation_lines.append(f"[{node_id}] {_format_validation_entry(item)}")
+        if data.get("next_action"):
+            next_actions.append(f"[{node_id}] {data.get('next_action')}")
+
+    if blockers:
+        lines.append("BLOCKERS")
+        lines.extend(f"- {x}" for x in blockers[:limit])
+        lines.append("")
+    if deferred and detail != "compact":
+        lines.append("DEFERRED")
+        lines.extend(f"- {x}" for x in deferred[:limit])
+        lines.append("")
+    if do_not_touch:
+        lines.append("DO NOT TOUCH")
+        lines.extend(f"- {x}" for x in do_not_touch[:limit])
+        lines.append("")
+    if validation_lines:
+        lines.append("VALIDATION")
+        lines.extend(f"- {x}" for x in validation_lines[:limit])
+        lines.append("")
+
+    nudges = _pending_completion_nudges(rows)
+    if nudges:
+        lines.append("HYGIENE NUDGES")
+        lines.extend(f"- {x}" for x in nudges[:limit])
+        lines.append("")
+
+    lines.append("RECENT DECISIONS")
+    for node_id, data in rows[:limit]:
+        lines.append(
+            f"[{node_id}] {data.get('timestamp', '?')[:10]} {data.get('agent', '?')} | "
+            f"{data.get('area', '?')} | {str(data.get('action', '?'))[:150]} "
+            f"-> {data.get('outcome', 'pending')}")
+    lines.append("")
+
+    san_line = _san_coverage_line(repo)
+    lines.append("SAN")
+    lines.append(san_line if san_line else f"No SAN coverage visible for repo '{repo}'.")
+    lines.append("")
+
+    if next_actions:
+        lines.append("NEXT")
+        lines.append(next_actions[0])
+
+    out = "\n".join(lines).rstrip()
+    _record_query("get_resume_context", shown_ids, out, repo=repo, had_result=True)
     return out
 
 
@@ -2253,7 +2585,10 @@ def _format_savings_report(session: dict, events: list[dict], today_str: str) ->
     return "\n".join(lines)
 
 
-_SAN_SKIP_DIRS = ("build", "bin", "out", "dist", ".gradle", "node_modules", "Pods")
+_SAN_SKIP_DIRS = (
+    "build", "bin", "out", "dist", ".gradle", "node_modules", "Pods",
+    ".output", ".wxt", "dist-unpacked", ".wrangler",
+)
 
 # One extension list for ALL SAN code paths (index build, freshness, orphan
 # cleanup). Divergent lists previously made non-JVM repos report wrong
@@ -2570,7 +2905,7 @@ def _rebuild_san_index(san_dir: Path, repo_path: Optional[Path] = None):
                         break
 
             # Extract qualified names from SAN content
-            for match in re.finditer(r'^([\w.]+)\s+@(\w+)\s*\{', content, re.MULTILINE):
+            for match in re.finditer(r'^(\S+)\s+@(\w+)\s*\{', content, re.MULTILINE):
                 qname = match.group(1)
                 kind = match.group(2)
                 index[qname] = {

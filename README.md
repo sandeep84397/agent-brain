@@ -202,7 +202,8 @@ For any non-trivial task, an agent follows this cycle (enforced by the hook — 
 ```
 1. pre_check(agent, area, action)     ← "has anyone tried this before? did it fail?"
 2. log_decision(agent, repo, area,    ← records the plan; unlocks code edits
-                action, reasoning)
+                action, reasoning,
+                handoff_summary?, validation?, git metadata?)
 3. … writes the code …
 4. log_outcome(decision_id, outcome,  ← records accepted / rejected / failed + why
                outcome_by, reason)
@@ -315,13 +316,13 @@ The brain is built to stay fast as the decision history grows into thousands of 
 
 > **Files in `~/.agent-brain/`:** `decisions.json` (snapshot) + `decisions.journal` (deltas) are the decision memory — both are needed; don't delete one without the other. `office-state.json` is live dashboard state (self-pruning), `san_savings.jsonl` is the token-savings log. All are per-machine and git-ignored.
 
-## MCP Tools (21)
+## MCP Tools (22)
 
 ### Core (every agent uses these)
 | Tool | Purpose |
 |------|---------|
 | `pre_check` | Past failures before starting work + plan pointers, escalation hints, model routing, SAN coverage (pass `repo=`) |
-| `log_decision` | Record what you decided and why; optional `plan_file` links a written plan |
+| `log_decision` | Record what you decided and why; optional `plan_file`, handoff summary, git metadata, validation, blockers, deferred work, and do-not-touch notes make future resume cheaper |
 | `log_outcome` | Record accepted/rejected/failed after review |
 | `log_feedback` | Reviewers log feedback on decisions |
 
@@ -331,6 +332,7 @@ The brain is built to stay fast as the decision history grows into thousands of 
 | `query_decisions` | Filter by area/agent/repo/outcome **and** rank by free-text relevance (`query="..."`) — finds decisions about a topic without knowing the exact area |
 | `get_decision` | Full detail + feedback for one decision |
 | `get_roadmap` | What's left to do — pending + roadmap/blocker-tagged work, ranked. One call to resume context after a fresh session or compaction |
+| `get_resume_context` | Compact repo/area digest: latest handoff, open work, validation, hygiene nudges, SAN visibility, and next action |
 
 ### Records & pruning (keep the brain lean)
 | Tool | Purpose |
