@@ -66,13 +66,26 @@ class SanCandidateValidationTests(unittest.TestCase):
             self.assertIn("empty_candidate", _codes(result))
 
     def test_rejects_invalid_header_and_text_outside_blocks(self):
-        # A comment-style / malformed header line that is not inside a block.
-        bad_header = "# pkg.Auth @svc {\n  src: 1-1\n}\n"
-        result = validate_san_candidate(bad_header, source_line_count=1)
+        # A line that is clearly meant to be a header (has the `@kind {`
+        # signature) but is malformed — comment-prefixed or indented — is
+        # invalid_header, not generic stray text.
+        comment_header = "# pkg.Auth @svc {\n  src: 1-1\n}\n"
+        result = validate_san_candidate(comment_header, source_line_count=1)
         self.assertFalse(result["valid"])
-        self.assertIn("text_outside_block", _codes(result))
+        self.assertIn("invalid_header", _codes(result))
 
-        # Free text between blocks.
+        indented_header = "  pkg.Auth @svc {\n  src: 1-1\n}\n"
+        result = validate_san_candidate(indented_header, source_line_count=1)
+        self.assertFalse(result["valid"])
+        self.assertIn("invalid_header", _codes(result))
+
+        # Trailing junk after the opening brace is also an invalid header.
+        trailing = "pkg.Auth @svc { extra\n  src: 1-1\n}\n"
+        result = validate_san_candidate(trailing, source_line_count=1)
+        self.assertFalse(result["valid"])
+        self.assertIn("invalid_header", _codes(result))
+
+        # Arbitrary prose with no header signature is stray text, not a header.
         stray = (
             "pkg.Auth @svc {\n  src: 1-1\n}\n"
             "not a header\n"
@@ -81,6 +94,7 @@ class SanCandidateValidationTests(unittest.TestCase):
         result = validate_san_candidate(stray, source_line_count=1)
         self.assertFalse(result["valid"])
         self.assertIn("text_outside_block", _codes(result))
+        self.assertNotIn("invalid_header", _codes(result))
 
     def test_requires_src_as_first_block_line(self):
         candidate = (
@@ -207,6 +221,32 @@ class SanAtomicPrimitiveTests(unittest.TestCase):
             # Destination unchanged; temp cleaned.
             self.assertEqual(target.read_bytes(), b"original")
             self.assertEqual(list(target.parent.glob(".*.tmp-*")), [])
+
+    def test_cleanup_failure_does_not_mask_primary_error(self):
+        # If os.replace fails AND the finally-block temp cleanup also fails, the
+        # ORIGINAL replace error must still propagate — the cleanup error must
+        # not shadow it (destination stays byte-exact regardless).
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "file.bin"
+            target.write_bytes(b"original")
+
+            real_unlink = Path.unlink
+
+            def failing_unlink(self, *a, **k):
+                # Fail only for the temp file, mimicking a read-only dir.
+                if ".tmp-" in self.name:
+                    raise PermissionError("unlink denied")
+                return real_unlink(self, *a, **k)
+
+            with mock.patch(
+                "brain.san_publish.os.replace",
+                side_effect=OSError("REAL-REPLACE-ERROR"),
+            ):
+                with mock.patch.object(Path, "unlink", failing_unlink):
+                    with self.assertRaises(OSError) as ctx:
+                        atomic_write_bytes(target, b"new-content")
+            self.assertIn("REAL-REPLACE-ERROR", str(ctx.exception))
+            self.assertEqual(target.read_bytes(), b"original")
 
     def test_temporary_names_are_process_unique(self):
         seen = []

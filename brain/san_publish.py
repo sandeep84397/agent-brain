@@ -20,6 +20,11 @@ from pathlib import Path
 
 # Column-zero header: `<qualified_name> @<kind> {`
 SAN_HEADER_RE = re.compile(r"^(\S+)\s+@(\w+)\s*\{$")
+# A line that carries the header signature (`@<kind> {`) but fails the strict
+# column-zero form above — e.g. comment-prefixed, indented, or with trailing
+# junk after the brace. Used to emit `invalid_header` rather than generic
+# `text_outside_block` for lines that were clearly meant to be headers.
+SAN_HEADER_LIKE_RE = re.compile(r"\S+\s+@\w+\s*\{")
 # First field of every block: `  src: <start>-<end>` (both >= 1).
 SAN_SRC_RE = re.compile(r"^  src: ([1-9]\d*)-([1-9]\d*)$")
 # Lenient prefix used only to distinguish "attempted src line" from "no src".
@@ -104,8 +109,13 @@ def validate_san_candidate(
             if line == "}":
                 add("stray_closing_brace", line_no)
                 continue
-            # Anything else outside a block (including comment-style or
-            # otherwise malformed header lines) is stray text.
+            # A line carrying the `@<kind> {` header signature but failing the
+            # strict column-zero form (comment-prefixed, indented, or with
+            # trailing junk) was clearly meant to be a header — invalid_header.
+            if SAN_HEADER_LIKE_RE.search(line):
+                add("invalid_header", line_no)
+                continue
+            # Anything else outside a block is stray text.
             add("text_outside_block", line_no)
             continue
 
@@ -209,9 +219,12 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
     finally:
+        # Best-effort cleanup: never let a cleanup failure mask the primary
+        # write/replace exception. On the success path the temp was already
+        # renamed away, so the unlink is a no-op FileNotFoundError.
         try:
             tmp.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
 
 
