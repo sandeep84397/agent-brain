@@ -7,6 +7,7 @@ license = "MIT"
 dependencies = [
     "mcp>=1.0.0",
     "networkx>=3.0",
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 readme = "README.md"
 keywords = ["claude", "mcp", "agents", "memory", "decision-tracking"]
