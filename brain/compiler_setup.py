@@ -98,29 +98,50 @@ def install_managed_artifact(
             changed=False,
         )
 
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            delete=False,
-            dir=artifact_path.parent,
-            prefix=f"{artifact_path.name}.tmp-",
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(rendered_content.encode("utf-8"))
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, artifact_path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    _atomic_write(artifact_path, rendered_content.encode("utf-8"))
 
     return InstallResult(
         path=artifact_path,
         previous_state=status.state,
         changed=True,
     )
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            dir=path.parent,
+            prefix=f"{path.name}.tmp-",
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _restore_artifact(
+    path: Path,
+    previous_bytes: bytes | None,
+    previous_stat: os.stat_result | None,
+) -> None:
+    if previous_bytes is None:
+        path.unlink(missing_ok=True)
+        return
+    _atomic_write(path, previous_bytes)
+    if previous_stat is not None:
+        os.chmod(path, previous_stat.st_mode)
+        os.utime(
+            path,
+            ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns),
+        )
 
 
 def _effective_config(config: SanCompilerConfig) -> SanCompilerConfig:
@@ -225,7 +246,21 @@ def install_codex_adapters(
         agent_template,
     )
     rendered_skill = render_codex_skill(contract_path, skill_template)
-    return (
-        install_managed_artifact(agent_path, rendered_agent),
-        install_managed_artifact(skill_path, rendered_skill),
+    statuses = (
+        inspect_managed_artifact(agent_path, rendered_agent),
+        inspect_managed_artifact(skill_path, rendered_skill),
     )
+    for status in statuses:
+        if status.state == "conflict":
+            raise ManagedArtifactConflict(status.path)
+
+    agent_bytes = agent_path.read_bytes() if agent_path.exists() else None
+    agent_stat = agent_path.stat() if agent_path.exists() else None
+    agent_result = install_managed_artifact(agent_path, rendered_agent)
+    try:
+        skill_result = install_managed_artifact(skill_path, rendered_skill)
+    except Exception:
+        if agent_result.changed:
+            _restore_artifact(agent_path, agent_bytes, agent_stat)
+        raise
+    return agent_result, skill_result

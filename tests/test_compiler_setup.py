@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -231,6 +232,99 @@ class ProviderInstallTests(unittest.TestCase):
                 )
 
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_codex_skill_conflict_preserves_stale_or_missing_agent(self):
+        for agent_exists in (True, False):
+            with self.subTest(agent_exists=agent_exists):
+                with tempfile.TemporaryDirectory() as tmp:
+                    codex_home = Path(tmp) / ".codex"
+                    agent = codex_home / "agents" / "brain-compiler.toml"
+                    skill = codex_home / "skills" / "brain-compiler" / "SKILL.md"
+                    if agent_exists:
+                        agent.parent.mkdir(parents=True)
+                        agent.write_bytes(managed_content("stale-agent").encode())
+                    skill.parent.mkdir(parents=True)
+                    skill_prior = b"user-owned skill\x00bytes\n"
+                    skill.write_bytes(skill_prior)
+                    agent_prior = (
+                        (agent.read_bytes(), agent.stat().st_mtime_ns)
+                        if agent_exists
+                        else None
+                    )
+
+                    with self.assertRaises(ManagedArtifactConflict) as raised:
+                        install_codex_adapters(
+                            codex_home=codex_home,
+                            config=self.config,
+                            assets_root=ASSETS_ROOT,
+                        )
+
+                    self.assertEqual(raised.exception.path, skill)
+                    self.assertEqual(skill.read_bytes(), skill_prior)
+                    if agent_prior is None:
+                        self.assertFalse(agent.exists())
+                    else:
+                        self.assertEqual(
+                            (agent.read_bytes(), agent.stat().st_mtime_ns),
+                            agent_prior,
+                        )
+                    self.assertEqual(list(codex_home.rglob("*.tmp-*")), [])
+
+    def test_codex_second_replace_failure_rolls_back_both_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / ".codex"
+            install_codex_adapters(
+                codex_home=codex_home,
+                config=self.config,
+                assets_root=ASSETS_ROOT,
+            )
+            agent = codex_home / "agents" / "brain-compiler.toml"
+            skill = codex_home / "skills" / "brain-compiler" / "SKILL.md"
+            skill.write_bytes(managed_content("stale-skill").encode())
+            before = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in (agent, skill)
+            }
+            changed = parse_san_compiler_config({
+                "san_compiler": {
+                    "codex": {
+                        "model": "gpt-custom",
+                        "reasoning_effort": "low",
+                    }
+                }
+            })
+            real_replace = os.replace
+            replace_calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls == 2:
+                    raise OSError("injected second replace failure")
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "brain.compiler_setup.os.replace",
+                side_effect=fail_second_replace,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "injected second replace failure",
+                ):
+                    install_codex_adapters(
+                        codex_home=codex_home,
+                        config=changed,
+                        assets_root=ASSETS_ROOT,
+                    )
+
+            self.assertEqual(
+                {
+                    path: (path.read_bytes(), path.stat().st_mtime_ns)
+                    for path in (agent, skill)
+                },
+                before,
+            )
+            self.assertEqual(list(codex_home.rglob("*.tmp-*")), [])
 
     def test_unrelated_agents_and_skills_are_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
