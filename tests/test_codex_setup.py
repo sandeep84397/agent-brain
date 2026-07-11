@@ -11,6 +11,7 @@ from brain.codex_setup import (
     ensure_project_agents_md,
     install_user,
 )
+from brain.compiler_config import CompilerConfigError
 from brain.compiler_setup import ManagedArtifactConflict
 
 
@@ -169,6 +170,51 @@ class CodexCompilerInstallTests(unittest.TestCase):
             self.assertIn('model_reasoning_effort = "medium"', agent_text)
             self.assertNotIn("{{", agent_text)
 
+    def test_install_user_threads_config_overrides_into_codex_agent(self):
+        # Exercises install_user's own load_san_compiler_config(brain_config)
+        # file-reading path with a NON-default config, proving the model/effort
+        # come from the file and not a hardcoded default. An impl that ignores
+        # the config would still emit gpt-5.4-mini/medium and fail here.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = self._write_config(
+                home,
+                {
+                    "san_compiler": {
+                        "codex": {"model": "gpt-custom", "reasoning_effort": "low"}
+                    }
+                },
+            )
+            self._install(home, config)
+
+            agent_text = self._agent_path(home).read_text()
+            self.assertIn('model = "gpt-custom"', agent_text)
+            self.assertIn('model_reasoning_effort = "low"', agent_text)
+            self.assertNotIn('model = "gpt-5.4-mini"', agent_text)
+
+    def test_install_user_validates_config_before_mutating_any_codex_surface(self):
+        # The Task 5 guarantee: an invalid SAN compiler config must be rejected
+        # BEFORE ensure_codex_config / ensure_codex_hooks / adapter install run,
+        # leaving every Codex surface untouched. Reordering validation after the
+        # ensure_* calls (the real regression this locks) mutates config.toml and
+        # hooks.json before raising — this test would then fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = self._write_config(
+                home,
+                {"san_compiler": {"codex": {"reasoning_effort": "BOGUS"}}},
+            )
+            codex = home / "codex"
+
+            with self.assertRaises(CompilerConfigError):
+                self._install(home, config)
+
+            # Nothing written: no config.toml, no hooks.json, no adapters, no dir.
+            self.assertFalse((codex / "config.toml").exists())
+            self.assertFalse((codex / "hooks.json").exists())
+            self.assertFalse(self._agent_path(home).exists())
+            self.assertFalse(self._skill_path(home).exists())
+
     def test_install_user_is_byte_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -205,6 +251,9 @@ class CodexCompilerInstallTests(unittest.TestCase):
             self.assertEqual(agent.read_bytes(), hand_written)
             self.assertEqual(agent.stat().st_mtime_ns, before_mtime)
             self.assertEqual(list((home / "codex").rglob("*.tmp-*")), [])
+            # The adapter conflict is detected before either managed artifact is
+            # written, so the managed skill must NOT have been created.
+            self.assertFalse(self._skill_path(home).exists())
 
     def test_install_user_preserves_unrelated_config_hooks_agents_and_skills(self):
         with tempfile.TemporaryDirectory() as tmp:
