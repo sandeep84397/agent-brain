@@ -176,6 +176,41 @@ class SanFreshnessScanTests(unittest.TestCase):
         self.assertEqual(plan["counts"]["stale"], 0)
         self.assertEqual(plan["malformed"][0]["source_path"], "src/Broken.py")
 
+    def test_non_utf8_source_and_san_do_not_crash_scan(self):
+        # A non-UTF8 source (binary-tainted) or a non-UTF8 existing SAN must
+        # NOT crash the read-only scan. read_text() raises UnicodeDecodeError
+        # (a ValueError, not OSError), so a naive `except OSError` would let it
+        # propagate out of the dry-run tool.
+        # Non-UTF8 SOURCE with a valid SAN + matching hash → classified fresh.
+        src_bytes = b"c = 1\n\xff\x80\n"
+        (self.repo / "src").mkdir(parents=True, exist_ok=True)
+        (self.repo / "src/Bin.py").write_bytes(src_bytes)
+        self._san_for("src/Bin.py", self._valid_san("Bin"))
+        # Non-UTF8 SAN whose corruption lands on the structural src line →
+        # fails the strict grammar (→ malformed), never a crash.
+        (self.repo / "src/BadSan.py").write_text("x = 2\n")
+        bad_san = self.san / "src/BadSan.py.san"
+        bad_san.parent.mkdir(parents=True, exist_ok=True)
+        bad_san.write_bytes(b"BadSan @module {\n  src: 1-\xff\x80\n}\n")
+        self._hashes({"src/Bin.py": _sha(src_bytes)})
+
+        # Must not raise.
+        plan = server.plan_san_refresh("demo")
+        report = server.check_san_freshness("demo")
+        dry = server.recompile_san("demo", dry_run=True)
+
+        self.assertEqual(plan["status"], "ok")
+        self.assertIsInstance(report, str)
+        self.assertIsInstance(dry, str)
+        # Non-UTF8 source with matching hash + valid SAN classifies fresh.
+        fresh_paths = {e["source_path"] for e in plan["fresh"]}
+        self.assertIn("src/Bin.py", fresh_paths)
+        # Non-UTF8 SAN is surfaced (malformed or, if replaced, still handled) —
+        # never a crash and never silently fresh.
+        malformed_paths = {e["source_path"] for e in plan["malformed"]}
+        self.assertNotIn("src/BadSan.py", fresh_paths)
+        self.assertIn("src/BadSan.py", malformed_paths)
+
     def test_invalid_repo_returns_structured_error(self):
         with mock.patch.object(server, "_resolve_repo_path", return_value=None):
             plan = server.plan_san_refresh("nope")

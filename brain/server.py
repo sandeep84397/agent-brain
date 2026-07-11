@@ -3081,10 +3081,16 @@ def _scan_san_freshness(repo: str) -> dict[str, object]:
                 missing.append({"source_path": rel, "source_sha256": digest})
                 continue
 
-            # Structural validity takes precedence over fresh/stale.
+            # Structural validity takes precedence over fresh/stale. Read with
+            # errors="replace" so a non-UTF8 SAN or a binary-tainted source
+            # never raises UnicodeDecodeError out of this read-only path — a
+            # non-UTF8 SAN then fails the strict grammar (→ malformed) and the
+            # source is classified from its already-hashed bytes.
             try:
-                san_text = san_path.read_text()
-                source_line_count = source_path.read_text().count("\n") + 1
+                san_text = san_path.read_text(errors="replace")
+                source_line_count = (
+                    source_path.read_text(errors="replace").count("\n") + 1
+                )
             except OSError:
                 malformed.append({
                     "source_path": rel,
