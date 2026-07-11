@@ -30,6 +30,17 @@
     "escalate": "fable"
   },
 
+  "san_compiler": {
+    "claude": {
+      "model": "claude-sonnet-4-6"
+    },
+    "codex": {
+      "model": "gpt-5.4-mini",
+      "reasoning_effort": "medium"
+    },
+    "allow_expensive_fallback": false
+  },
+
   "_comment_read_enforcement": "Optional, default 'soft'. Controls the Read->SAN hook. 'soft': nudge toward get_san on raw reads of SAN-covered code (never blocks). 'hard': BLOCK a 2nd+ raw read of the same fresh-SAN file (first read always allowed) so agents actually use SAN — set BRAIN_SKIP_READ_BLOCK=1 to bypass when you truly need exact bytes.",
   "read_enforcement": "soft"
 }
