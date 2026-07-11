@@ -32,6 +32,11 @@ from collections import defaultdict
 import uuid
 import threading
 
+try:
+    from .san_publish import atomic_write_bytes
+except ImportError:  # pragma: no cover - standalone execution
+    from san_publish import atomic_write_bytes  # type: ignore[no-redef]
+
 # ---------------------------------------------------------------------------
 # Configuration — no hardcoded paths
 # ---------------------------------------------------------------------------
@@ -2665,9 +2670,7 @@ def _load_san_hashes(san_dir: Path) -> dict:
 def _save_san_hashes(san_dir: Path, hashes: dict) -> None:
     """Persist source content hashes to .san_hashes.json (atomic write)."""
     hash_file = san_dir / ".san_hashes.json"
-    tmp = hash_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(hashes, indent=2))
-    tmp.rename(hash_file)
+    atomic_write_bytes(hash_file, json.dumps(hashes, indent=2).encode("utf-8"))
 
 
 def _hash_source(source_path: Path) -> str:
@@ -2883,44 +2886,83 @@ def _ensure_san_fresh(repo: str, force: bool = False) -> Optional[str]:
     return ", ".join(msg) if msg else None
 
 
-def _rebuild_san_index(san_dir: Path, repo_path: Optional[Path] = None):
-    """Rebuild _index.json from .san files. Pure Python, no MCP tool call."""
-    index = {}
+def _build_san_index(
+    san_dir: Path,
+    repo_path: Optional[Path] = None,
+    *,
+    strict: bool = False,
+) -> dict:
+    """Scan .san files and return the in-memory _index.json mapping.
+
+    Pure Python, no MCP tool call, and no filesystem writes. With
+    ``strict=False`` (default) an individual unreadable ``.san`` file is
+    skipped so one corrupt file cannot blank the whole index; with
+    ``strict=True`` any read/scan error propagates so a publication
+    transaction can detect it.
+    """
+    index: dict = {}
+    for san_file in san_dir.rglob("*.san"):
+        rel = str(san_file.relative_to(san_dir))
+        try:
+            content = san_file.read_text()
+        except OSError:
+            if strict:
+                raise
+            continue
+
+        # Canonical name form is <source>.san, so stripping .san usually
+        # leaves the real source path. Legacy replace-form names need the
+        # extension resolved from disk; never fabricate one.
+        source_rel = rel[:-4] if rel.endswith(".san") else rel
+        if not source_rel.endswith(SOURCE_EXTS) and repo_path:
+            for ext in SOURCE_EXTS:
+                if (repo_path / (source_rel + ext)).exists():
+                    source_rel = source_rel + ext
+                    break
+
+        # Extract qualified names from SAN content
+        for match in re.finditer(r'^(\S+)\s+@(\w+)\s*\{', content, re.MULTILINE):
+            qname = match.group(1)
+            kind = match.group(2)
+            index[qname] = {
+                "kind": kind,
+                "file": source_rel,
+                "tokens_san": len(content.split()),
+            }
+    return index
+
+
+def _rebuild_san_index(
+    san_dir: Path,
+    repo_path: Optional[Path] = None,
+    *,
+    strict: bool = False,
+):
+    """Rebuild _index.json from .san files.
+
+    ``strict=False`` (default) preserves the historical best-effort behavior:
+    scan and write failures are swallowed so callers on the hot path never
+    raise. ``strict=True`` propagates any read/scan/write failure so a
+    publication transaction can detect and roll back a corrupt index.
+    """
+    if strict:
+        index = _build_san_index(san_dir, repo_path, strict=True)
+        atomic_write_bytes(
+            san_dir / "_index.json",
+            json.dumps(index, indent=2).encode("utf-8"),
+        )
+        return
+
     try:
-        for san_file in san_dir.rglob("*.san"):
-            rel = str(san_file.relative_to(san_dir))
-            try:
-                content = san_file.read_text()
-            except OSError:
-                continue
-
-            # Canonical name form is <source>.san, so stripping .san usually
-            # leaves the real source path. Legacy replace-form names need the
-            # extension resolved from disk; never fabricate one.
-            source_rel = rel[:-4] if rel.endswith(".san") else rel
-            if not source_rel.endswith(SOURCE_EXTS) and repo_path:
-                for ext in SOURCE_EXTS:
-                    if (repo_path / (source_rel + ext)).exists():
-                        source_rel = source_rel + ext
-                        break
-
-            # Extract qualified names from SAN content
-            for match in re.finditer(r'^(\S+)\s+@(\w+)\s*\{', content, re.MULTILINE):
-                qname = match.group(1)
-                kind = match.group(2)
-                index[qname] = {
-                    "kind": kind,
-                    "file": source_rel,
-                    "tokens_san": len(content.split()),
-                }
+        index = _build_san_index(san_dir, repo_path)
     except Exception:
-        pass
+        index = {}
 
-    idx_file = san_dir / "_index.json"
     try:
-        tmp = idx_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(index, indent=2))
-        tmp.rename(idx_file)
+        atomic_write_bytes(
+            san_dir / "_index.json",
+            json.dumps(index, indent=2).encode("utf-8"),
+        )
     except OSError:
         pass
 
@@ -3481,10 +3523,8 @@ def update_san_index(repo: str) -> str:
 
     # Atomic write
     idx_file = san_dir / "_index.json"
-    tmp = idx_file.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(index, indent=2))
-        tmp.rename(idx_file)
+        atomic_write_bytes(idx_file, json.dumps(index, indent=2).encode("utf-8"))
     except OSError as e:
         return f"ERROR writing index: {e}"
 

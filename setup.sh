@@ -285,6 +285,7 @@ echo "[2/6] Installing brain server..."
 
 mkdir -p "$BRAIN_DIR"
 cp "$SCRIPT_DIR/brain/server.py" "$BRAIN_DIR/server.py"
+cp "$SCRIPT_DIR/brain/san_publish.py" "$BRAIN_DIR/san_publish.py"
 mkdir -p "$BRAIN_DIR/hooks"
 cp "$SCRIPT_DIR"/brain/hooks/*.py "$BRAIN_DIR/hooks/"
 echo "  Copied server.py and hooks to $BRAIN_DIR/"
