@@ -3284,12 +3284,28 @@ def _publish_failure(status: str, *, retryable: bool, **extra) -> dict:
 
 
 def _validate_publish_source_path(repo_path: Path, source_path: str):
-    """Return (rel, abs_path) or a failure dict for a publication source path."""
+    """Return (rel, abs_path) or a failure dict for a publication source path.
+
+    The returned rel is normalized (redundant `.`/separators collapsed) so the
+    same physical file cannot be tracked under two hash keys.
+    """
     if not source_path or source_path.startswith("/") or os.path.isabs(source_path):
         return _publish_failure("invalid_source_path", retryable=False)
-    parts = Path(source_path).parts
-    if ".." in parts:
+    if ".." in Path(source_path).parts:
         return _publish_failure("invalid_source_path", retryable=False)
+
+    # Normalize away redundant "." / duplicate-separator segments, then re-check
+    # that nothing escaped (defense in depth against backslash/normpath quirks).
+    normalized = os.path.normpath(source_path)
+    if (
+        normalized.startswith("/")
+        or os.path.isabs(normalized)
+        or normalized == ".."
+        or normalized.startswith(".." + os.sep)
+        or ".." in Path(normalized).parts
+    ):
+        return _publish_failure("invalid_source_path", retryable=False)
+    source_path = normalized
 
     candidate = repo_path / source_path
     # Symlink-escape guard: the realpath must remain inside the repo root.

@@ -667,7 +667,21 @@ class PublishSanTests(unittest.TestCase):
         self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
         # Newly created SAN dirs removed (best-effort): the SAN file is gone.
         self.assertFalse((self.san / "pkg/deep/A.py.san").exists())
+        # First-publication rollback must not leak the hash or index files
+        # that this transaction would have created.
+        self.assertFalse((self.san / ".san_hashes.json").exists())
+        self.assertFalse((self.san / "_index.json").exists())
         self.assertEqual(self._temp_leftovers(), [])
+
+    def test_normalized_source_path_records_single_hash_key(self):
+        # A redundant "." segment must normalize so the same physical file
+        # is not tracked under two hash keys.
+        self._src("src/A.py", "a = 1\n")
+        r = self._publish(source_path="src/./A.py", digest=_sha(b"a = 1\n"))
+        self.assertEqual(r["status"], "published")
+        self.assertEqual(r["source_path"], "src/A.py")
+        hashes = json.loads((self.san / ".san_hashes.json").read_text())
+        self.assertEqual(list(hashes.keys()), ["src/A.py"])
 
     def test_removes_process_unique_temp_files_after_failure(self):
         self._src("src/A.py", "a = 1\n")
