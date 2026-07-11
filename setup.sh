@@ -388,13 +388,19 @@ if [ "$INSTALL_CODEX" -eq 1 ]; then
     echo ""
     echo "[4a] Installing Codex MCP + hooks..."
     CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-    "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
+    if "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
         install-user \
         --codex-home "$CODEX_HOME" \
         --pybin "$BRAIN_DIR/.venv/bin/python" \
         --server "$BRAIN_DIR/server.py" \
-        --hooks-dir "$BRAIN_DIR/hooks"
-    echo "  Restart Codex, then run /mcp and /hooks to review and trust hooks."
+        --hooks-dir "$BRAIN_DIR/hooks" \
+        --brain-config "$BRAIN_DIR/config.json" \
+        --assets-root "$BRAIN_DIR/san"; then
+        echo "  Restart Codex, then run /mcp and /hooks to review and trust hooks."
+    else
+        echo "  WARNING: Codex install incomplete" \
+             "(config invalid or an unmanaged brain-compiler artifact exists)."
+    fi
 fi
 
 # ---------------------------------------------------------------------------

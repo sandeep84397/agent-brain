@@ -7,6 +7,13 @@ import json
 import re
 from pathlib import Path
 
+try:
+    from .compiler_config import load_san_compiler_config
+    from .compiler_setup import install_codex_adapters
+except ImportError:  # pragma: no cover - standalone execution
+    from compiler_config import load_san_compiler_config  # type: ignore[no-redef]
+    from compiler_setup import install_codex_adapters  # type: ignore[no-redef]
+
 
 MCP_BEGIN = "# BEGIN agent-brain MCP"
 MCP_END = "# END agent-brain MCP"
@@ -164,12 +171,36 @@ def ensure_project_agents_md(path: str | Path) -> bool:
     return True
 
 
-def install_user(codex_home: str | Path, pybin: str, server_py: str, hooks_dir: str) -> None:
+def install_user(
+    codex_home: str | Path,
+    pybin: str,
+    server_py: str,
+    hooks_dir: str,
+    brain_config: str | Path,
+    assets_root: str | Path,
+) -> None:
+    # Load and validate the SAN compiler config BEFORE mutating any Codex
+    # surface, so an invalid config leaves config.toml, hooks.json, and the
+    # managed adapters exactly as they were.
+    config = load_san_compiler_config(brain_config)
     home = Path(codex_home).expanduser()
     changed_config = ensure_codex_config(home / "config.toml", pybin, server_py)
     changed_hooks = ensure_codex_hooks(home / "hooks.json", pybin, hooks_dir)
+    agent_result, skill_result = install_codex_adapters(
+        codex_home=home,
+        config=config,
+        assets_root=assets_root,
+    )
     print(f"  {'✓ Updated' if changed_config else '✓ Already configured'} {home / 'config.toml'}")
     print(f"  {'✓ Updated' if changed_hooks else '✓ Already configured'} {home / 'hooks.json'}")
+    print(f"  {_adapter_status(agent_result)} {agent_result.path}")
+    print(f"  {_adapter_status(skill_result)} {skill_result.path}")
+
+
+def _adapter_status(result) -> str:
+    if not result.changed:
+        return "✓ Already configured"
+    return "✓ Created" if result.previous_state == "missing" else "✓ Updated"
 
 
 def link_project(project: str | Path) -> None:
@@ -192,13 +223,22 @@ def main() -> None:
     user.add_argument("--pybin", required=True)
     user.add_argument("--server", required=True)
     user.add_argument("--hooks-dir", required=True)
+    user.add_argument("--brain-config", required=True)
+    user.add_argument("--assets-root", required=True)
 
     project = sub.add_parser("link-project")
     project.add_argument("--project", required=True)
 
     args = parser.parse_args()
     if args.cmd == "install-user":
-        install_user(args.codex_home, args.pybin, args.server, args.hooks_dir)
+        install_user(
+            args.codex_home,
+            args.pybin,
+            args.server,
+            args.hooks_dir,
+            args.brain_config,
+            args.assets_root,
+        )
     elif args.cmd == "link-project":
         link_project(args.project)
 
