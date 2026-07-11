@@ -24,7 +24,11 @@ SAN_HEADER_RE = re.compile(r"^(\S+)\s+@(\w+)\s*\{$")
 # column-zero form above — e.g. comment-prefixed, indented, or with trailing
 # junk after the brace. Used to emit `invalid_header` rather than generic
 # `text_outside_block` for lines that were clearly meant to be headers.
-SAN_HEADER_LIKE_RE = re.compile(r"\S+\s+@\w+\s*\{")
+#
+# Anchored and driven by a negated class (`[^@\n]*`) so the prefix scan is
+# linear: the class and the required `@` are mutually exclusive, so there is no
+# per-position backtracking on a long stray line with no `@` (avoids ReDoS).
+SAN_HEADER_LIKE_RE = re.compile(r"^[^@\n]*@\w+[^\S\n]*\{")
 # First field of every block: `  src: <start>-<end>` (both >= 1).
 SAN_SRC_RE = re.compile(r"^  src: ([1-9]\d*)-([1-9]\d*)$")
 # Lenient prefix used only to distinguish "attempted src line" from "no src".

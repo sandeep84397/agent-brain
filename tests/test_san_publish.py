@@ -182,6 +182,38 @@ class SanCandidateValidationTests(unittest.TestCase):
             self.assertTrue(result["valid"], candidate)
             self.assertNotIn("placeholder_marker", _codes(result), candidate)
 
+    def test_long_stray_line_does_not_catastrophically_backtrack(self):
+        # A long single stray line (the exact malformed input the validator
+        # exists to reject) must classify in near-linear time. A greedy,
+        # unanchored header-like regex backtracks O(n^2) and hangs the MCP
+        # server on untrusted compiler output well under the byte cap.
+        import signal
+        import time
+
+        candidate = "x" * 200_000 + "\n"
+
+        class _Timeout(Exception):
+            pass
+
+        def _raise(signum, frame):
+            raise _Timeout()
+
+        prev = signal.signal(signal.SIGALRM, _raise)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 3)
+            start = time.perf_counter()
+            result = validate_san_candidate(candidate, source_line_count=1)
+            elapsed = time.perf_counter() - start
+        except _Timeout:
+            self.fail("validate_san_candidate hung on a long stray line (ReDoS)")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, prev)
+
+        self.assertFalse(result["valid"])
+        self.assertIn("text_outside_block", _codes(result))
+        self.assertLess(elapsed, 1.0)
+
     def test_enforces_byte_and_block_limits(self):
         big = "x" * (SAN_MAX_CANDIDATE_BYTES + 1)
         result = validate_san_candidate(big, source_line_count=1)
