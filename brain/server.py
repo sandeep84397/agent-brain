@@ -33,11 +33,26 @@ import uuid
 import threading
 
 try:
-    from .san_publish import atomic_write_bytes, validate_san_candidate
+    from .san_publish import (
+        atomic_write_bytes,
+        restore_file,
+        snapshot_file,
+        validate_san_candidate,
+    )
 except ImportError:  # pragma: no cover - standalone execution
     from san_publish import (  # type: ignore[no-redef]
         atomic_write_bytes,
+        restore_file,
+        snapshot_file,
         validate_san_candidate,
+    )
+
+try:
+    from .compiler_config import CompilerConfigError, parse_san_compiler_config
+except ImportError:  # pragma: no cover - standalone execution
+    from compiler_config import (  # type: ignore[no-redef]
+        CompilerConfigError,
+        parse_san_compiler_config,
     )
 
 # ---------------------------------------------------------------------------
@@ -225,13 +240,22 @@ def _write_query_marker() -> None:
 METRICS_FILE = BRAIN_DIR / "brain_metrics.jsonl"
 
 
+def _append_metric_strict(event: dict) -> None:
+    """Append one metric event as JSONL, PROPAGATING any failure.
+
+    Used by transactional callers (publish_san) that must roll back when the
+    metric cannot be persisted. The best-effort :func:`_log_metric` wraps this.
+    """
+    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    event = {"ts": datetime.now().isoformat(), "session": _SESSION_ID, **event}
+    with METRICS_FILE.open("a") as f:
+        f.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
 def _log_metric(event: dict) -> None:
     """Append one metric event as JSONL. Never raises, never blocks a tool."""
     try:
-        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
-        event = {"ts": datetime.now().isoformat(), "session": _SESSION_ID, **event}
-        with METRICS_FILE.open("a") as f:
-            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        _append_metric_strict(event)
     except Exception:
         pass
 
@@ -3244,6 +3268,267 @@ def check_san_freshness(repo: str) -> str:
     non-dry-run path.
     """
     return _format_san_freshness(_scan_san_freshness(repo))
+
+
+# One repo-wide lock: the hash file and index file are shared across all
+# sources in a repo, so concurrent publications must serialize their
+# shared-file writes. Source-digest compare-and-swap + process-unique temp
+# files remain the cross-process guard.
+SAN_PUBLISH_LOCK = threading.RLock()
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _publish_failure(status: str, *, retryable: bool, **extra) -> dict:
+    return {"status": status, "retryable": retryable, **extra}
+
+
+def _validate_publish_source_path(repo_path: Path, source_path: str):
+    """Return (rel, abs_path) or a failure dict for a publication source path."""
+    if not source_path or source_path.startswith("/") or os.path.isabs(source_path):
+        return _publish_failure("invalid_source_path", retryable=False)
+    parts = Path(source_path).parts
+    if ".." in parts:
+        return _publish_failure("invalid_source_path", retryable=False)
+
+    candidate = repo_path / source_path
+    # Symlink-escape guard: the realpath must remain inside the repo root.
+    try:
+        real = Path(os.path.realpath(candidate))
+        root_real = Path(os.path.realpath(repo_path))
+    except (OSError, ValueError):
+        return _publish_failure("invalid_source_path", retryable=False)
+    if real != root_real and root_real not in real.parents:
+        return _publish_failure("invalid_source_path", retryable=False)
+
+    return source_path, candidate
+
+
+def _publish_san(
+    repo: str,
+    source_path: str,
+    expected_source_sha256: str,
+    san_content: str,
+    provider: str,
+    model: str,
+    reasoning_effort,
+) -> dict:
+    # --- validation (no mutation) -------------------------------------------
+    repo_path = _resolve_repo_path(repo)
+    if not repo_path:
+        return _publish_failure("repo_not_found", retryable=False, repo=repo)
+    repo_path = Path(repo_path)
+
+    path_result = _validate_publish_source_path(repo_path, source_path)
+    if isinstance(path_result, dict):
+        return path_result
+    rel, abs_source = path_result
+
+    if _is_skipped_source(rel):
+        return _publish_failure("skipped_source", retryable=False,
+                                source_path=rel)
+    if not rel.endswith(SOURCE_EXTS):
+        return _publish_failure("unsupported_extension", retryable=False,
+                                source_path=rel)
+    if not abs_source.is_file():
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+
+    if not isinstance(expected_source_sha256, str) or not _SHA256_RE.match(
+        expected_source_sha256
+    ):
+        return _publish_failure("invalid_digest", retryable=False)
+
+    try:
+        config = parse_san_compiler_config(_load_config())
+    except CompilerConfigError as error:
+        return _publish_failure("compiler_config_invalid", retryable=False,
+                                detail=str(error))
+
+    if provider not in ("claude", "codex"):
+        return _publish_failure("provider_mismatch", retryable=False,
+                                provider=provider)
+    if provider == "claude":
+        expected_model = config.claude.model
+        if model != expected_model:
+            return _publish_failure("model_mismatch", retryable=False)
+        if reasoning_effort not in (None, ""):
+            return _publish_failure("reasoning_effort_mismatch", retryable=False)
+    else:  # codex
+        expected_model = config.codex.model
+        if model != expected_model:
+            return _publish_failure("model_mismatch", retryable=False)
+        if reasoning_effort != config.codex.reasoning_effort:
+            return _publish_failure("reasoning_effort_mismatch", retryable=False)
+
+    # Source digest compare (pre-validation read).
+    try:
+        current_digest = _hash_source(abs_source)
+    except OSError:
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+    if current_digest != expected_source_sha256:
+        return _publish_failure("source_changed", retryable=True,
+                                source_path=rel)
+
+    # Structural candidate validation.
+    try:
+        source_line_count = abs_source.read_text(errors="replace").count("\n") + 1
+    except OSError:
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+    validation = validate_san_candidate(san_content, source_line_count)
+    validation_summary = {
+        "valid": validation["valid"],
+        "block_count": validation["block_count"],
+        "bytes": validation["byte_count"],
+        "errors": validation["errors"],
+    }
+    if not validation["valid"]:
+        return _publish_failure("invalid_candidate", retryable=False,
+                                source_path=rel, validation=validation_summary)
+
+    # --- transaction (serialized; snapshot → replace → rollback on failure) --
+    with SAN_PUBLISH_LOCK:
+        san_dir = repo_path / ".san"
+        dest = san_dir / (rel + ".san")          # canonical append form only
+        hash_file = san_dir / ".san_hashes.json"
+        index_file = san_dir / "_index.json"
+
+        def _snap(path: Path):
+            data = snapshot_file(path)
+            mtime = path.stat().st_mtime_ns if data is not None else None
+            return data, mtime
+
+        def _restore(path: Path, snap) -> None:
+            data, mtime = snap
+            restore_file(path, data)
+            if data is not None and mtime is not None:
+                try:
+                    st = path.stat()
+                    os.utime(path, ns=(st.st_atime_ns, mtime))
+                except OSError:
+                    pass
+
+        dest_snap = _snap(dest)
+        hash_snap = _snap(hash_file)
+        index_snap = _snap(index_file)
+        metrics_snap = _snap(METRICS_FILE)
+
+        # Directories that do not yet exist and would be newly created — remove
+        # them on a first-publication rollback (deepest first).
+        created_dirs = []
+        probe = dest.parent
+        while not probe.exists():
+            created_dirs.append(probe)
+            probe = probe.parent
+
+        def _rollback() -> bool:
+            try:
+                _restore(dest, dest_snap)
+                _restore(hash_file, hash_snap)
+                _restore(index_file, index_snap)
+                _restore(METRICS_FILE, metrics_snap)
+                for directory in created_dirs:  # deepest → shallowest
+                    try:
+                        if directory.exists() and not any(directory.iterdir()):
+                            directory.rmdir()
+                    except OSError:
+                        pass
+                return True
+            except Exception:
+                return False
+
+        try:
+            # Re-hash immediately before replacement (compare-and-swap).
+            recheck = _hash_source(abs_source)
+            if recheck != expected_source_sha256:
+                return _publish_failure("source_changed", retryable=True,
+                                        source_path=rel)
+
+            # 1. Replace the SAN atomically.
+            atomic_write_bytes(dest, san_content.encode("utf-8"))
+
+            # 2. Persist copied hashes with the expected digest.
+            hashes = _load_san_hashes(san_dir)
+            hashes = dict(hashes)
+            hashes[rel] = expected_source_sha256
+            atomic_write_bytes(
+                hash_file, json.dumps(hashes, indent=2).encode("utf-8")
+            )
+
+            # 3. Rebuild index strictly (propagates any failure).
+            _rebuild_san_index(san_dir, repo_path=repo_path, strict=True)
+
+            # 4. Append the publication metric strictly.
+            source_tokens = _tokens_text(abs_source.read_text(errors="replace"))
+            san_tokens = _tokens_text(san_content)
+            _append_metric_strict({
+                "kind": "san_publish",
+                "repo": repo,
+                "file": rel,
+                "provider": provider,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "input_tokens": source_tokens,
+                "output_tokens": san_tokens,
+                "gen_cost": source_tokens + san_tokens,
+            })
+        except Exception:
+            if _rollback():
+                return _publish_failure("publication_failed", retryable=True,
+                                        source_path=rel,
+                                        validation=validation_summary)
+            return _publish_failure("rollback_failed", retryable=False,
+                                    source_path=rel)
+
+        # 5. Invalidate the freshness cache only after a committed publication.
+        _SAN_FRESH_CHECKED.pop(repo, None)
+
+        return {
+            "status": "published",
+            "repo": repo,
+            "source_path": rel,
+            "san_path": f".san/{rel}.san",
+            "source_sha256": expected_source_sha256,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "validation": validation_summary,
+        }
+
+
+@mcp.tool()
+def publish_san(
+    repo: str,
+    source_path: str,
+    expected_source_sha256: str,
+    san_content: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str | None = None,
+) -> dict[str, object]:
+    """Atomically publish one validated SAN file, bound to a source digest.
+
+    The brain-compiler (an LLM host) calls this after generating SAN content.
+    The Agent Brain server never selects or invokes a model — it validates the
+    DECLARED provider/model/effort against the configured compiler settings,
+    verifies the source has not changed since generation (SHA-256 compare-and-
+    swap), structurally validates the candidate, then atomically replaces the
+    SAN, updates the source-hash record and index, and appends a cost metric.
+    Any post-replacement failure rolls back SAN, hashes, index, and metrics to
+    their prior state. Results and metrics carry only validation summaries —
+    never source or SAN content.
+    """
+    return _publish_san(
+        repo,
+        source_path,
+        expected_source_sha256,
+        san_content,
+        provider,
+        model,
+        reasoning_effort,
+    )
 
 
 @mcp.tool()

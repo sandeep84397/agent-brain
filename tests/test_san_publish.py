@@ -395,5 +395,356 @@ class SanStrictIndexTests(unittest.TestCase):
                     server._rebuild_san_index(san_dir, strict=True)
 
 
+import hashlib
+import threading
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class PublishSanTests(unittest.TestCase):
+    CLAUDE_MODEL = "claude-sonnet-4-6"
+    CODEX_MODEL = "gpt-5.4-mini"
+    CODEX_EFFORT = "medium"
+
+    def setUp(self):
+        import brain.server as server
+        self.server = server
+        self._tmp = TemporaryDirectory()
+        self.repo = Path(self._tmp.name).resolve()
+        self.san = self.repo / ".san"
+        self._metrics_dir = TemporaryDirectory()
+        self.metrics = Path(self._metrics_dir.name) / "brain_metrics.jsonl"
+
+        self._patches = [
+            mock.patch.object(server, "_resolve_repo_path", return_value=self.repo),
+            mock.patch.object(server, "_get_repo_paths", return_value={"demo": self.repo}),
+            mock.patch.object(server, "METRICS_FILE", self.metrics),
+            mock.patch.object(server, "_load_config", return_value={}),
+            mock.patch.dict(server._SAN_FRESH_CHECKED, {}, clear=True),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+        self._metrics_dir.cleanup()
+
+    # helpers ---------------------------------------------------------------
+
+    def _src(self, rel: str, body: str) -> str:
+        p = self.repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+        return _sha(body.encode("utf-8"))
+
+    def _san_text(self, name: str) -> str:
+        return f"{name} @module {{\n  src: 1-1\n  purpose: x\n}}\n"
+
+    def _publish(self, **over):
+        args = dict(
+            repo="demo",
+            source_path="src/A.py",
+            expected_source_sha256=over.pop("digest", None),
+            san_content=over.pop("san", self._san_text("A")),
+            provider="claude",
+            model=self.CLAUDE_MODEL,
+            reasoning_effort=None,
+        )
+        args.update(over)
+        if args["expected_source_sha256"] is None:
+            args["expected_source_sha256"] = _sha(b"a = 1\n")
+        return self.server.publish_san(**args)
+
+    def _snapshot(self):
+        tree = {}
+        if self.san.exists():
+            for p in sorted(self.san.rglob("*")):
+                if p.is_file():
+                    st = p.stat()
+                    tree[str(p.relative_to(self.san))] = (p.read_bytes(), st.st_mtime_ns)
+        metrics = self.metrics.read_bytes() if self.metrics.exists() else None
+        return tree, metrics
+
+    def _temp_leftovers(self):
+        return [p for p in self.repo.rglob(".*.tmp-*")]
+
+    # validation / rejection ------------------------------------------------
+
+    def test_rejects_absolute_traversal_and_symlink_escape(self):
+        self._src("src/A.py", "a = 1\n")
+        # Absolute path.
+        r = self._publish(source_path="/etc/passwd")
+        self.assertEqual(r["status"], "invalid_source_path")
+        # Parent traversal.
+        r = self._publish(source_path="../outside.py")
+        self.assertEqual(r["status"], "invalid_source_path")
+        # Symlink escaping the repo.
+        outside_dir = Path(self._metrics_dir.name) / "outside"
+        outside_dir.mkdir(exist_ok=True)
+        (outside_dir / "secret.py").write_text("secret = 1\n")
+        link = self.repo / "src" / "link.py"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside_dir / "secret.py")
+        r = self._publish(source_path="src/link.py",
+                          digest=_sha(b"secret = 1\n"))
+        self.assertEqual(r["status"], "invalid_source_path")
+
+    def test_rejects_unsupported_and_skipped_source(self):
+        self._src("src/View.vue", "<template/>\n")
+        r = self._publish(source_path="src/View.vue",
+                          digest=_sha(b"<template/>\n"))
+        self.assertEqual(r["status"], "unsupported_extension")
+
+        self._src(".wxt/types/x.ts", "export const x = 1\n")
+        r = self._publish(source_path=".wxt/types/x.ts",
+                          digest=_sha(b"export const x = 1\n"))
+        self.assertEqual(r["status"], "skipped_source")
+
+    def test_source_not_found_is_reported(self):
+        r = self._publish(source_path="src/Nope.py", digest=_sha(b"x"))
+        self.assertEqual(r["status"], "source_not_found")
+
+    def test_rejects_invalid_or_mismatched_provider_model_effort(self):
+        self._src("src/A.py", "a = 1\n")
+        # Unknown provider.
+        r = self._publish(provider="kimi")
+        self.assertEqual(r["status"], "provider_mismatch")
+        # Wrong model.
+        r = self._publish(model="claude-3-opus")
+        self.assertEqual(r["status"], "model_mismatch")
+        # Claude with a non-empty reasoning effort.
+        r = self._publish(reasoning_effort="high")
+        self.assertEqual(r["status"], "reasoning_effort_mismatch")
+        # Codex with wrong effort.
+        r = self._publish(provider="codex", model=self.CODEX_MODEL,
+                          reasoning_effort="high")
+        self.assertEqual(r["status"], "reasoning_effort_mismatch")
+        # Codex with correct model + effort publishes.
+        r = self._publish(provider="codex", model=self.CODEX_MODEL,
+                          reasoning_effort=self.CODEX_EFFORT)
+        self.assertEqual(r["status"], "published")
+
+    def test_rejects_invalid_digest_format(self):
+        self._src("src/A.py", "a = 1\n")
+        r = self._publish(digest="NOTAHASH")
+        self.assertEqual(r["status"], "invalid_digest")
+        r = self._publish(digest=_sha(b"a = 1\n").upper())
+        self.assertEqual(r["status"], "invalid_digest")
+
+    def test_rejects_changed_source_digest_and_preserves_state(self):
+        self._src("src/A.py", "a = 1\n")
+        before = self._snapshot()
+        r = self._publish(digest=_sha(b"DIFFERENT\n"))
+        self.assertEqual(r["status"], "source_changed")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_rejects_invalid_candidate_and_preserves_state(self):
+        self._src("src/A.py", "a = 1\n")
+        before = self._snapshot()
+        r = self._publish(san="garbage without a header\n")
+        self.assertEqual(r["status"], "invalid_candidate")
+        self.assertIn("validation", r)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_rejects_compiler_config_invalid(self):
+        self._src("src/A.py", "a = 1\n")
+        with mock.patch.object(
+            self.server, "_load_config",
+            return_value={"san_compiler": {"allow_expensive_fallback": True}},
+        ):
+            r = self._publish()
+        self.assertEqual(r["status"], "compiler_config_invalid")
+
+    def test_rejects_repo_not_found(self):
+        with mock.patch.object(self.server, "_resolve_repo_path", return_value=None):
+            r = self._publish()
+        self.assertEqual(r["status"], "repo_not_found")
+
+    # success ---------------------------------------------------------------
+
+    def test_publishes_to_canonical_append_path(self):
+        self._src("src/A.py", "a = 1\n")
+        r = self._publish()
+        self.assertEqual(r["status"], "published")
+        self.assertEqual(r["san_path"], ".san/src/A.py.san")
+        # Canonical append form on disk (NOT legacy A.san).
+        self.assertTrue((self.san / "src/A.py.san").exists())
+        self.assertFalse((self.san / "src/A.san").exists())
+
+    def test_updates_hash_index_and_metric_after_replace(self):
+        digest = self._src("src/A.py", "a = 1\n")
+        r = self._publish(digest=digest)
+        self.assertEqual(r["status"], "published")
+        # Hash recorded.
+        hashes = json.loads((self.san / ".san_hashes.json").read_text())
+        self.assertEqual(hashes["src/A.py"], digest)
+        # Index rebuilt with the block.
+        index = json.loads((self.san / "_index.json").read_text())
+        self.assertIn("A", index)
+        # Metric appended with san_publish kind + token fields.
+        lines = [json.loads(x) for x in self.metrics.read_text().splitlines() if x.strip()]
+        pub = [m for m in lines if m.get("kind") == "san_publish"]
+        self.assertEqual(len(pub), 1)
+        self.assertEqual(pub[0]["provider"], "claude")
+        self.assertEqual(pub[0]["model"], self.CLAUDE_MODEL)
+        self.assertIn("input_tokens", pub[0])
+        self.assertIn("output_tokens", pub[0])
+        self.assertIn("gen_cost", pub[0])
+
+    # transactional rollback ------------------------------------------------
+
+    def test_write_failure_preserves_all_prior_state(self):
+        self._src("src/A.py", "a = 1\n")
+        # Prior published SAN state.
+        self._publish()
+        before = self._snapshot()
+        with mock.patch.object(
+            self.server, "atomic_write_bytes", side_effect=OSError("disk full"),
+        ):
+            r = self._publish()
+        self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_hash_failure_rolls_back_all_prior_state(self):
+        self._src("src/A.py", "a = 1\n")
+        self._publish()  # establish prior state
+        before = self._snapshot()
+
+        real = self.server.atomic_write_bytes
+        calls = {"n": 0}
+
+        def flaky(path, data):
+            calls["n"] += 1
+            # 1st write = SAN (allow); 2nd = hashes (fail).
+            if calls["n"] == 2:
+                raise OSError("hash write failed")
+            return real(path, data)
+
+        with mock.patch.object(self.server, "atomic_write_bytes", side_effect=flaky):
+            r = self._publish(san=self._san_text("A2"))
+        self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_index_failure_rolls_back_all_prior_state(self):
+        self._src("src/A.py", "a = 1\n")
+        self._publish()
+        before = self._snapshot()
+        with mock.patch.object(
+            self.server, "_rebuild_san_index", side_effect=OSError("index boom"),
+        ):
+            r = self._publish(san=self._san_text("A2"))
+        self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_metric_failure_rolls_back_all_prior_state(self):
+        self._src("src/A.py", "a = 1\n")
+        self._publish()
+        before = self._snapshot()
+        with mock.patch.object(
+            self.server, "_append_metric_strict", side_effect=OSError("metric boom"),
+        ):
+            r = self._publish(san=self._san_text("A2"))
+        self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_first_publication_failure_removes_created_empty_directories(self):
+        # No .san/ yet. A deep source path forces new nested dirs; a failure
+        # must remove the newly created empty directories.
+        self._src("pkg/deep/A.py", "a = 1\n")
+        self.assertFalse(self.san.exists())
+        with mock.patch.object(
+            self.server, "_rebuild_san_index", side_effect=OSError("boom"),
+        ):
+            r = self._publish(source_path="pkg/deep/A.py", digest=_sha(b"a = 1\n"))
+        self.assertIn(r["status"], ("publication_failed", "rollback_failed"))
+        # Newly created SAN dirs removed (best-effort): the SAN file is gone.
+        self.assertFalse((self.san / "pkg/deep/A.py.san").exists())
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_removes_process_unique_temp_files_after_failure(self):
+        self._src("src/A.py", "a = 1\n")
+        with mock.patch.object(
+            self.server, "_rebuild_san_index", side_effect=OSError("boom"),
+        ):
+            self._publish()
+        self.assertEqual(self._temp_leftovers(), [])
+
+    def test_rechecks_digest_immediately_before_replace(self):
+        # A source that changes AFTER validation but BEFORE the atomic replace
+        # must be caught by the pre-replace re-hash (compare-and-swap).
+        digest = self._src("src/A.py", "a = 1\n")
+        before = self._snapshot()
+
+        real_replace = self.server.atomic_write_bytes
+
+        def mutate_then_write(path, data):
+            # Simulate a concurrent source edit landing between validation and
+            # the SAN write.
+            (self.repo / "src/A.py").write_text("a = 999\n")
+            return real_replace(path, data)
+
+        # Only mutate on the first (SAN) write attempt.
+        with mock.patch.object(self.server, "_hash_source", wraps=self.server._hash_source):
+            (self.repo / "src/A.py").write_text("a = 1\n")
+            # Re-hash guard: change the file so the pre-replace hash differs.
+            def pre_replace_hash(p):
+                (self.repo / "src/A.py").write_text("a = 999\n")
+                return _sha(b"a = 999\n")
+            with mock.patch.object(self.server, "_hash_source", side_effect=pre_replace_hash):
+                r = self._publish(digest=digest)
+        self.assertEqual(r["status"], "source_changed")
+        self.assertEqual(self._snapshot(), before)
+
+    def test_serializes_concurrent_publications(self):
+        # Two concurrent publications of different sources must both succeed and
+        # leave a consistent hash+index (repo-wide lock serializes shared-file
+        # writes).
+        self._src("src/A.py", "a = 1\n")
+        self._src("src/B.py", "b = 2\n")
+        results = {}
+
+        def pub(name, digest):
+            results[name] = self.server.publish_san(
+                repo="demo", source_path=f"src/{name}.py",
+                expected_source_sha256=digest,
+                san_content=self._san_text(name),
+                provider="claude", model=self.CLAUDE_MODEL,
+            )
+
+        t1 = threading.Thread(target=pub, args=("A", _sha(b"a = 1\n")))
+        t2 = threading.Thread(target=pub, args=("B", _sha(b"b = 2\n")))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(results["A"]["status"], "published")
+        self.assertEqual(results["B"]["status"], "published")
+        hashes = json.loads((self.san / ".san_hashes.json").read_text())
+        self.assertEqual(hashes["src/A.py"], _sha(b"a = 1\n"))
+        self.assertEqual(hashes["src/B.py"], _sha(b"b = 2\n"))
+        index = json.loads((self.san / "_index.json").read_text())
+        self.assertIn("A", index)
+        self.assertIn("B", index)
+
+    def test_result_and_metric_never_contain_source_or_san_content(self):
+        self._src("src/A.py", "SECRET_SOURCE_TOKEN = 1\n")
+        digest = _sha(b"SECRET_SOURCE_TOKEN = 1\n")
+        san = "A @module {\n  src: 1-1\n  purpose: SECRET_SAN_TOKEN\n}\n"
+        r = self._publish(digest=digest, san=san)
+        self.assertEqual(r["status"], "published")
+        blob = json.dumps(r)
+        self.assertNotIn("SECRET_SOURCE_TOKEN", blob)
+        self.assertNotIn("SECRET_SAN_TOKEN", blob)
+        metrics_blob = self.metrics.read_text()
+        self.assertNotIn("SECRET_SOURCE_TOKEN", metrics_blob)
+        self.assertNotIn("SECRET_SAN_TOKEN", metrics_blob)
+
+
 if __name__ == "__main__":
     unittest.main()
