@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -17,6 +20,7 @@ from brain.compiler_setup import (
     install_claude_adapter,
     install_codex_adapters,
     install_managed_artifact,
+    main,
 )
 
 
@@ -347,6 +351,125 @@ class ProviderInstallTests(unittest.TestCase):
                 {path: path.read_bytes() for path in unrelated},
                 unrelated,
             )
+
+
+class MainCliTests(unittest.TestCase):
+    def _write_config(self, path: Path, obj: object) -> Path:
+        path.write_text(json.dumps(obj), encoding="utf-8")
+        return path
+
+    def _run(self, argv: list[str]):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(argv)
+        return code, buffer.getvalue()
+
+    def test_install_claude_creates_claude_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(root / "config.json", {})
+            claude_home = root / ".claude"
+
+            code, out = self._run([
+                "install-claude",
+                "--config", str(config),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+
+            agent = claude_home / "agents" / "brain-compiler.md"
+            self.assertEqual(code, 0)
+            self.assertTrue(agent.exists())
+            self.assertIn(MANAGED_MARKER, agent.read_text(encoding="utf-8"))
+            self.assertIn("created", out)
+
+    def test_install_claude_renders_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(
+                root / "config.json",
+                {"san_compiler": {"claude": {"model": "claude-custom-9"}}},
+            )
+            claude_home = root / ".claude"
+
+            code, _ = self._run([
+                "install-claude",
+                "--config", str(config),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+
+            agent = claude_home / "agents" / "brain-compiler.md"
+            self.assertEqual(code, 0)
+            self.assertIn("claude-custom-9", agent.read_text(encoding="utf-8"))
+
+    def test_install_claude_creates_no_codex_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(root / "config.json", {})
+            claude_home = root / ".claude"
+            codex_home = root / ".codex"
+
+            self._run([
+                "install-claude",
+                "--config", str(config),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+
+            self.assertFalse(codex_home.exists())
+
+    def test_invalid_config_exits_before_changing_last_valid_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_home = root / ".claude"
+            # First install a valid managed agent.
+            valid = self._write_config(root / "config.json", {})
+            self._run([
+                "install-claude",
+                "--config", str(valid),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+            agent = claude_home / "agents" / "brain-compiler.md"
+            before = (agent.read_bytes(), agent.stat().st_mtime_ns)
+
+            bad = root / "bad.json"
+            bad.write_text("{ not json", encoding="utf-8")
+            code, _ = self._run([
+                "install-claude",
+                "--config", str(bad),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+
+            self.assertNotEqual(code, 0)
+            self.assertEqual(
+                (agent.read_bytes(), agent.stat().st_mtime_ns), before
+            )
+            self.assertEqual(list(claude_home.rglob("*.tmp-*")), [])
+
+    def test_unmarked_claude_conflict_is_preserved_and_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(root / "config.json", {})
+            claude_home = root / ".claude"
+            agent = claude_home / "agents" / "brain-compiler.md"
+            agent.parent.mkdir(parents=True)
+            user_bytes = b"user-authored compiler, not managed\n"
+            agent.write_bytes(user_bytes)
+
+            code, out = self._run([
+                "install-claude",
+                "--config", str(config),
+                "--claude-home", str(claude_home),
+                "--assets-root", str(ASSETS_ROOT),
+            ])
+
+            self.assertNotEqual(code, 0)
+            self.assertEqual(agent.read_bytes(), user_bytes)
+            self.assertIn(str(agent), out)
+            self.assertEqual(list(claude_home.rglob("*.tmp-*")), [])
 
 
 if __name__ == "__main__":

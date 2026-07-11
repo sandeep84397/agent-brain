@@ -289,6 +289,21 @@ mkdir -p "$BRAIN_DIR/hooks"
 cp "$SCRIPT_DIR"/brain/hooks/*.py "$BRAIN_DIR/hooks/"
 echo "  Copied server.py and hooks to $BRAIN_DIR/"
 
+# Managed SAN compiler runtime + provider adapter assets
+cp "$SCRIPT_DIR/brain/compiler_config.py" "$BRAIN_DIR/compiler_config.py"
+cp "$SCRIPT_DIR/brain/compiler_setup.py" "$BRAIN_DIR/compiler_setup.py"
+mkdir -p "$BRAIN_DIR/san"
+cp "$SCRIPT_DIR/san/compiler-contract.md" "$BRAIN_DIR/san/compiler-contract.md"
+mkdir -p "$BRAIN_DIR/san/adapters/claude"
+mkdir -p "$BRAIN_DIR/san/adapters/codex/brain-compiler"
+cp "$SCRIPT_DIR/san/adapters/claude/brain-compiler.md" \
+  "$BRAIN_DIR/san/adapters/claude/brain-compiler.md"
+cp "$SCRIPT_DIR/san/adapters/codex/brain-compiler.toml" \
+  "$BRAIN_DIR/san/adapters/codex/brain-compiler.toml"
+cp "$SCRIPT_DIR/san/adapters/codex/brain-compiler/SKILL.md" \
+  "$BRAIN_DIR/san/adapters/codex/brain-compiler/SKILL.md"
+echo "  Copied SAN compiler runtime + adapter assets to $BRAIN_DIR/san/"
+
 # ---------------------------------------------------------------------------
 # Step 3: Config
 # ---------------------------------------------------------------------------
@@ -331,6 +346,22 @@ CONFIGEOF
     fi
 else
     echo "  config.json already exists. Skipping."
+fi
+
+# Managed Claude SAN compiler adapter (separate from the interactive
+# role-template prompt below; runs only when installing for Claude).
+if [ "$INSTALL_CLAUDE" -eq 1 ]; then
+    echo ""
+    echo "  Installing managed Claude SAN compiler adapter..."
+    if "$BRAIN_DIR/.venv/bin/python" "$BRAIN_DIR/compiler_setup.py" install-claude \
+        --config "$BRAIN_DIR/config.json" \
+        --claude-home "$HOME/.claude" \
+        --assets-root "$BRAIN_DIR/san"; then
+        :
+    else
+        echo "  WARNING: managed Claude SAN compiler adapter not installed" \
+             "(config invalid or an unmanaged brain-compiler.md exists)."
+    fi
 fi
 
 # ---------------------------------------------------------------------------

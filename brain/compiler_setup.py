@@ -1,18 +1,22 @@
+import argparse
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 try:
     from .compiler_config import (
+        CompilerConfigError,
         SanCompilerConfig,
         load_san_compiler_config,
         parse_san_compiler_config,
     )
 except ImportError:
     from compiler_config import (  # type: ignore[no-redef]
+        CompilerConfigError,
         SanCompilerConfig,
         load_san_compiler_config,
         parse_san_compiler_config,
@@ -264,3 +268,54 @@ def install_codex_adapters(
             _restore_artifact(agent_path, agent_bytes, agent_stat)
         raise
     return agent_result, skill_result
+
+
+def _install_status_line(result: InstallResult) -> str:
+    if not result.changed:
+        verb = "current"
+    elif result.previous_state == "missing":
+        verb = "created"
+    else:
+        verb = "updated"
+    return f"{verb} {result.path}"
+
+
+def _cmd_install_claude(args: argparse.Namespace) -> int:
+    # Load and validate config BEFORE rendering or writing anything.
+    config = load_san_compiler_config(args.config)
+    result = install_claude_adapter(
+        claude_home=args.claude_home,
+        config=config,
+        assets_root=args.assets_root,
+    )
+    print(_install_status_line(result))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="compiler_setup")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    claude = sub.add_parser(
+        "install-claude",
+        help="install the managed Claude SAN compiler adapter",
+    )
+    claude.add_argument("--config", required=True)
+    claude.add_argument("--claude-home", required=True)
+    claude.add_argument("--assets-root", required=True)
+    claude.set_defaults(func=_cmd_install_claude)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except ManagedArtifactConflict as conflict:
+        print(str(conflict), file=sys.stderr)
+        print(str(conflict.path))
+        return 3
+    except CompilerConfigError as error:
+        print(f"invalid config: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
