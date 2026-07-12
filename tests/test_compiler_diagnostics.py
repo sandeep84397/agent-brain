@@ -141,11 +141,14 @@ class ServerDiagnoseTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _run_diagnose(self, project="", config=None):
+    def _run_diagnose(self, project="", config=None, home=None):
         import unittest.mock as mock
+        from pathlib import Path as _Path
         patches = []
         if config is not None:
             patches.append(mock.patch.object(self.server, "_load_config", return_value=config))
+        if home is not None:
+            patches.append(mock.patch.object(_Path, "home", return_value=home))
         buf = self.io.StringIO()
         for p in patches:
             p.start()
@@ -158,14 +161,21 @@ class ServerDiagnoseTests(unittest.TestCase):
         return code, buf.getvalue()
 
     def test_invalid_compiler_config_fails_without_mutation(self):
-        before = sorted(self.base.rglob("*"))
+        # Point HOME at a real target the diagnose path would touch, then
+        # confirm the invalid config is reported as a FAIL, exits non-zero, and
+        # nothing was written.
+        fake_home = self.base / "home"
+        (fake_home / ".claude").mkdir(parents=True, exist_ok=True)
+        before = sorted(fake_home.rglob("*"))
         code, out = self._run_diagnose(
-            config={"san_compiler": {"allow_expensive_fallback": True}}
+            config={"san_compiler": {"allow_expensive_fallback": True}},
+            home=fake_home,
         )
-        self.assertIn("SAN compiler config", out)
+        self.assertIn("[FAIL] SAN compiler config", out)
         self.assertIn("invalid san_compiler config", out)
-        # Diagnosis is read-only: our temp base is untouched.
-        self.assertEqual(sorted(self.base.rglob("*")), before)
+        self.assertNotEqual(code, 0)
+        # Diagnosis is read-only: the home tree it would touch is unchanged.
+        self.assertEqual(sorted(fake_home.rglob("*")), before)
 
     def test_project_diagnose_reports_missing_dot_san_ignore(self):
         project = self.base / "proj"
