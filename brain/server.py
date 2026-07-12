@@ -3054,7 +3054,7 @@ def _san_coverage_line(repo: str) -> str:
 def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
     """
     Convert a source file relative path to its .san counterpart.
-    Canonical convention (per san/brain-compiler.md): APPEND .san —
+    Canonical convention (per san/compiler-contract.md): APPEND .san —
     src/.../Auth.kt → src/.../Auth.kt.san. Legacy files used
     extension-replacement (Auth.san); prefer whichever exists on disk,
     defaulting to the canonical append form for new files.
