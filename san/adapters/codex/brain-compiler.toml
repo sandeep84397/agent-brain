@@ -1,0 +1,13 @@
+# agent-brain-managed:san-compiler provider=codex artifact=agent version=1
+name = "brain-compiler"
+description = "Generate or refresh SAN through the current Codex host."
+model = "{{CODEX_MODEL}}"
+model_reasoning_effort = "{{CODEX_REASONING_EFFORT}}"
+developer_instructions = """
+Use the installed brain-compiler skill and canonical contract.
+Never invoke Claude, another provider, or codex exec.
+"""
+
+[[skills.config]]
+path = "{{CODEX_SKILL_PATH}}"
+enabled = true

@@ -13,6 +13,26 @@ A compression protocol for converting source code and documentation into a dense
 
 Measured with tiktoken (`o200k_base` + `cl100k_base`, agree within 0.1%) across 954 source/SAN pairs (Kotlin/Java/TS). Unicode operators (`→ ⇒ ×`) cost the same as ASCII equivalents on modern tokenizers — a typical SAN line is 19 tokens in either form. Caveat: standalone `⇒` is 3 tokens on the older cl100k; targeting older models, prefer ASCII (`->`, `=>`, `xN`).
 
+## Compiler contract and host adapters
+
+[`compiler-contract.md`](compiler-contract.md) is the normative,
+provider-neutral SAN compiler contract. It owns source scope, SAN v2 semantics,
+semantic parity checks, planning/publication rules, failure classification, and
+privacy requirements.
+
+Host adapters are intentionally thin:
+
+- [`adapters/claude/brain-compiler.md`](adapters/claude/brain-compiler.md)
+  configures the current Claude Code host.
+- [`adapters/codex/brain-compiler.toml`](adapters/codex/brain-compiler.toml)
+  configures the current Codex host.
+- [`adapters/codex/brain-compiler/SKILL.md`](adapters/codex/brain-compiler/SKILL.md)
+  loads the canonical contract and Agent Brain publication workflow for that
+  host.
+
+Adapters select host behavior only. They must not fork or redefine canonical
+SAN semantics.
+
 ## Format Contract (machine-parsed — STRICT)
 
 Every entity block MUST start at column 0 with:

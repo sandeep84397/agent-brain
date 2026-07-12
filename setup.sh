@@ -172,17 +172,22 @@ else:
     print(f"  ✓ {settings_path} already up to date")
 
 # 3. .gitignore (append-if-missing for the brain artifacts)
+# Ignore the whole .san/ tree — SAN files are generated, not source of truth.
 gitignore_path = project / ".gitignore"
 required_lines = [
     ".mcp.json",
-    ".san/.san_hashes.json",
-    ".san/_cache/",
+    ".san/",
 ]
+# An existing anchored form (/.san/) is treated as already covering .san/.
+_equivalents = {".san/": {".san/", "/.san/"}}
 existing_lines: list[str] = []
 if gitignore_path.exists():
     existing_lines = gitignore_path.read_text().splitlines()
 existing_set = {ln.strip() for ln in existing_lines}
-to_append = [ln for ln in required_lines if ln not in existing_set]
+to_append = [
+    ln for ln in required_lines
+    if not (existing_set & _equivalents.get(ln, {ln}))
+]
 if to_append:
     block = ["", "# agent-brain"] + to_append + [""]
     with gitignore_path.open("a") as f:
@@ -285,9 +290,25 @@ echo "[2/6] Installing brain server..."
 
 mkdir -p "$BRAIN_DIR"
 cp "$SCRIPT_DIR/brain/server.py" "$BRAIN_DIR/server.py"
+cp "$SCRIPT_DIR/brain/san_publish.py" "$BRAIN_DIR/san_publish.py"
 mkdir -p "$BRAIN_DIR/hooks"
 cp "$SCRIPT_DIR"/brain/hooks/*.py "$BRAIN_DIR/hooks/"
 echo "  Copied server.py and hooks to $BRAIN_DIR/"
+
+# Managed SAN compiler runtime + provider adapter assets
+cp "$SCRIPT_DIR/brain/compiler_config.py" "$BRAIN_DIR/compiler_config.py"
+cp "$SCRIPT_DIR/brain/compiler_setup.py" "$BRAIN_DIR/compiler_setup.py"
+mkdir -p "$BRAIN_DIR/san"
+cp "$SCRIPT_DIR/san/compiler-contract.md" "$BRAIN_DIR/san/compiler-contract.md"
+mkdir -p "$BRAIN_DIR/san/adapters/claude"
+mkdir -p "$BRAIN_DIR/san/adapters/codex/brain-compiler"
+cp "$SCRIPT_DIR/san/adapters/claude/brain-compiler.md" \
+  "$BRAIN_DIR/san/adapters/claude/brain-compiler.md"
+cp "$SCRIPT_DIR/san/adapters/codex/brain-compiler.toml" \
+  "$BRAIN_DIR/san/adapters/codex/brain-compiler.toml"
+cp "$SCRIPT_DIR/san/adapters/codex/brain-compiler/SKILL.md" \
+  "$BRAIN_DIR/san/adapters/codex/brain-compiler/SKILL.md"
+echo "  Copied SAN compiler runtime + adapter assets to $BRAIN_DIR/san/"
 
 # ---------------------------------------------------------------------------
 # Step 3: Config
@@ -333,6 +354,22 @@ else
     echo "  config.json already exists. Skipping."
 fi
 
+# Managed Claude SAN compiler adapter (separate from the interactive
+# role-template prompt below; runs only when installing for Claude).
+if [ "$INSTALL_CLAUDE" -eq 1 ]; then
+    echo ""
+    echo "  Installing managed Claude SAN compiler adapter..."
+    if "$BRAIN_DIR/.venv/bin/python" "$BRAIN_DIR/compiler_setup.py" install-claude \
+        --config "$BRAIN_DIR/config.json" \
+        --claude-home "$HOME/.claude" \
+        --assets-root "$BRAIN_DIR/san"; then
+        :
+    else
+        echo "  WARNING: managed Claude SAN compiler adapter not installed" \
+             "(config invalid or an unmanaged brain-compiler.md exists)."
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Step 4: Register MCP server with Claude Code
 # ---------------------------------------------------------------------------
@@ -357,13 +394,19 @@ if [ "$INSTALL_CODEX" -eq 1 ]; then
     echo ""
     echo "[4a] Installing Codex MCP + hooks..."
     CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-    "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
+    if "$BRAIN_DIR/.venv/bin/python" "$SCRIPT_DIR/brain/codex_setup.py" \
         install-user \
         --codex-home "$CODEX_HOME" \
         --pybin "$BRAIN_DIR/.venv/bin/python" \
         --server "$BRAIN_DIR/server.py" \
-        --hooks-dir "$BRAIN_DIR/hooks"
-    echo "  Restart Codex, then run /mcp and /hooks to review and trust hooks."
+        --hooks-dir "$BRAIN_DIR/hooks" \
+        --brain-config "$BRAIN_DIR/config.json" \
+        --assets-root "$BRAIN_DIR/san"; then
+        echo "  Restart Codex, then run /mcp and /hooks to review and trust hooks."
+    else
+        echo "  WARNING: Codex install incomplete" \
+             "(config invalid or an unmanaged brain-compiler artifact exists)."
+    fi
 fi
 
 # ---------------------------------------------------------------------------

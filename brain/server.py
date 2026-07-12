@@ -32,6 +32,37 @@ from collections import defaultdict
 import uuid
 import threading
 
+try:
+    from .san_publish import (
+        atomic_write_bytes,
+        restore_file,
+        snapshot_file,
+        validate_san_candidate,
+    )
+except ImportError:  # pragma: no cover - standalone execution
+    from san_publish import (  # type: ignore[no-redef]
+        atomic_write_bytes,
+        restore_file,
+        snapshot_file,
+        validate_san_candidate,
+    )
+
+try:
+    from .compiler_config import CompilerConfigError, parse_san_compiler_config
+except ImportError:  # pragma: no cover - standalone execution
+    from compiler_config import (  # type: ignore[no-redef]
+        CompilerConfigError,
+        parse_san_compiler_config,
+    )
+
+try:
+    from .compiler_setup import diagnose_compiler_artifacts
+except ImportError:  # pragma: no cover - standalone execution
+    try:
+        from compiler_setup import diagnose_compiler_artifacts  # type: ignore[no-redef]
+    except ImportError:  # compiler_setup not installed alongside server
+        diagnose_compiler_artifacts = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Configuration — no hardcoded paths
 # ---------------------------------------------------------------------------
@@ -217,13 +248,22 @@ def _write_query_marker() -> None:
 METRICS_FILE = BRAIN_DIR / "brain_metrics.jsonl"
 
 
+def _append_metric_strict(event: dict) -> None:
+    """Append one metric event as JSONL, PROPAGATING any failure.
+
+    Used by transactional callers (publish_san) that must roll back when the
+    metric cannot be persisted. The best-effort :func:`_log_metric` wraps this.
+    """
+    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    event = {"ts": datetime.now().isoformat(), "session": _SESSION_ID, **event}
+    with METRICS_FILE.open("a") as f:
+        f.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
 def _log_metric(event: dict) -> None:
     """Append one metric event as JSONL. Never raises, never blocks a tool."""
     try:
-        BRAIN_DIR.mkdir(parents=True, exist_ok=True)
-        event = {"ts": datetime.now().isoformat(), "session": _SESSION_ID, **event}
-        with METRICS_FILE.open("a") as f:
-            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        _append_metric_strict(event)
     except Exception:
         pass
 
@@ -2665,9 +2705,7 @@ def _load_san_hashes(san_dir: Path) -> dict:
 def _save_san_hashes(san_dir: Path, hashes: dict) -> None:
     """Persist source content hashes to .san_hashes.json (atomic write)."""
     hash_file = san_dir / ".san_hashes.json"
-    tmp = hash_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(hashes, indent=2))
-    tmp.rename(hash_file)
+    atomic_write_bytes(hash_file, json.dumps(hashes, indent=2).encode("utf-8"))
 
 
 def _hash_source(source_path: Path) -> str:
@@ -2883,44 +2921,83 @@ def _ensure_san_fresh(repo: str, force: bool = False) -> Optional[str]:
     return ", ".join(msg) if msg else None
 
 
-def _rebuild_san_index(san_dir: Path, repo_path: Optional[Path] = None):
-    """Rebuild _index.json from .san files. Pure Python, no MCP tool call."""
-    index = {}
+def _build_san_index(
+    san_dir: Path,
+    repo_path: Optional[Path] = None,
+    *,
+    strict: bool = False,
+) -> dict:
+    """Scan .san files and return the in-memory _index.json mapping.
+
+    Pure Python, no MCP tool call, and no filesystem writes. With
+    ``strict=False`` (default) an individual unreadable ``.san`` file is
+    skipped so one corrupt file cannot blank the whole index; with
+    ``strict=True`` any read/scan error propagates so a publication
+    transaction can detect it.
+    """
+    index: dict = {}
+    for san_file in san_dir.rglob("*.san"):
+        rel = str(san_file.relative_to(san_dir))
+        try:
+            content = san_file.read_text()
+        except OSError:
+            if strict:
+                raise
+            continue
+
+        # Canonical name form is <source>.san, so stripping .san usually
+        # leaves the real source path. Legacy replace-form names need the
+        # extension resolved from disk; never fabricate one.
+        source_rel = rel[:-4] if rel.endswith(".san") else rel
+        if not source_rel.endswith(SOURCE_EXTS) and repo_path:
+            for ext in SOURCE_EXTS:
+                if (repo_path / (source_rel + ext)).exists():
+                    source_rel = source_rel + ext
+                    break
+
+        # Extract qualified names from SAN content
+        for match in re.finditer(r'^(\S+)\s+@(\w+)\s*\{', content, re.MULTILINE):
+            qname = match.group(1)
+            kind = match.group(2)
+            index[qname] = {
+                "kind": kind,
+                "file": source_rel,
+                "tokens_san": len(content.split()),
+            }
+    return index
+
+
+def _rebuild_san_index(
+    san_dir: Path,
+    repo_path: Optional[Path] = None,
+    *,
+    strict: bool = False,
+):
+    """Rebuild _index.json from .san files.
+
+    ``strict=False`` (default) preserves the historical best-effort behavior:
+    scan and write failures are swallowed so callers on the hot path never
+    raise. ``strict=True`` propagates any read/scan/write failure so a
+    publication transaction can detect and roll back a corrupt index.
+    """
+    if strict:
+        index = _build_san_index(san_dir, repo_path, strict=True)
+        atomic_write_bytes(
+            san_dir / "_index.json",
+            json.dumps(index, indent=2).encode("utf-8"),
+        )
+        return
+
     try:
-        for san_file in san_dir.rglob("*.san"):
-            rel = str(san_file.relative_to(san_dir))
-            try:
-                content = san_file.read_text()
-            except OSError:
-                continue
-
-            # Canonical name form is <source>.san, so stripping .san usually
-            # leaves the real source path. Legacy replace-form names need the
-            # extension resolved from disk; never fabricate one.
-            source_rel = rel[:-4] if rel.endswith(".san") else rel
-            if not source_rel.endswith(SOURCE_EXTS) and repo_path:
-                for ext in SOURCE_EXTS:
-                    if (repo_path / (source_rel + ext)).exists():
-                        source_rel = source_rel + ext
-                        break
-
-            # Extract qualified names from SAN content
-            for match in re.finditer(r'^(\S+)\s+@(\w+)\s*\{', content, re.MULTILINE):
-                qname = match.group(1)
-                kind = match.group(2)
-                index[qname] = {
-                    "kind": kind,
-                    "file": source_rel,
-                    "tokens_san": len(content.split()),
-                }
+        index = _build_san_index(san_dir, repo_path)
     except Exception:
-        pass
+        index = {}
 
-    idx_file = san_dir / "_index.json"
     try:
-        tmp = idx_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(index, indent=2))
-        tmp.rename(idx_file)
+        atomic_write_bytes(
+            san_dir / "_index.json",
+            json.dumps(index, indent=2).encode("utf-8"),
+        )
     except OSError:
         pass
 
@@ -2977,7 +3054,7 @@ def _san_coverage_line(repo: str) -> str:
 def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
     """
     Convert a source file relative path to its .san counterpart.
-    Canonical convention (per san/brain-compiler.md): APPEND .san —
+    Canonical convention (per san/compiler-contract.md): APPEND .san —
     src/.../Auth.kt → src/.../Auth.kt.san. Legacy files used
     extension-replacement (Auth.san); prefer whichever exists on disk,
     defaulting to the canonical append form for new files.
@@ -2991,54 +3068,491 @@ def _source_to_san_path(san_dir: Path, source_rel: str) -> Path:
     return appended
 
 
-def check_san_freshness(repo: str) -> str:
-    """
-    Check SAN freshness: detect stale/missing SANs, clean up orphans.
-    Internal helper — exposed via recompile_san(dry_run=True).
+def _scan_san_freshness(repo: str) -> dict[str, object]:
+    """Classify SAN freshness for a repo using filesystem READS ONLY.
+
+    Never mkdir/write/touch/unlink/log and never calls any mutating helper
+    (_ensure_san_fresh, _refresh_san, _save_san_hashes, _record_san_gen,
+    _rebuild_san_index). Returns the stable freshness schema.
     """
     repo_path = _resolve_repo_path(repo)
     if not repo_path:
-        return f"ERROR: repo '{repo}' not found in config"
+        return {"status": "repo_not_found", "repo": repo}
 
-    # Clean up orphans and detect staleness
-    result = _ensure_san_fresh(repo, force=True)
-
-    # Now report current state
     san_dir = repo_path / ".san"
-    if not san_dir.exists():
-        return f"No .san/ directory in '{repo}'."
 
-    index = _load_san_index(san_dir)
-    fresh = 0
-    remaining_stale = []
-    seen_files = set()
+    missing: list[dict] = []
+    stale: list[dict] = []
+    fresh: list[dict] = []
+    orphaned: list[dict] = []
+    unsupported: list[dict] = []
+    malformed: list[dict] = []
 
-    for qualified_name, meta in index.items():
-        source_rel = meta.get("file", "")
-        if not source_rel or source_rel in seen_files:
-            continue
-        seen_files.add(source_rel)
-        source_path = repo_path / source_rel
-        san_path = _source_to_san_path(san_dir, source_rel)
-        if san_path.exists() and source_path.exists():
-            if source_path.stat().st_mtime > san_path.stat().st_mtime:
-                remaining_stale.append(source_rel)
+    hashes = _load_san_hashes(san_dir) if san_dir.exists() else {}
+    seen_sources: set[str] = set()
+
+    # 1. Walk supported source files.
+    for ext in ("**/*" + e for e in SOURCE_EXTS):
+        for source_path in repo_path.glob(ext):
+            if not source_path.is_file():
+                continue
+            rel = str(source_path.relative_to(repo_path))
+            if rel.startswith(".san" + os.sep) or _is_skipped_source(rel):
+                continue
+            if rel in seen_sources:
+                continue
+            seen_sources.add(rel)
+
+            try:
+                digest = _hash_source(source_path)
+            except OSError:
+                continue
+            san_path = _source_to_san_path(san_dir, rel) if san_dir.exists() else None
+
+            if san_path is None or not san_path.exists():
+                missing.append({"source_path": rel, "source_sha256": digest})
+                continue
+
+            # Structural validity takes precedence over fresh/stale. Read with
+            # errors="replace" so a non-UTF8 SAN or a binary-tainted source
+            # never raises UnicodeDecodeError out of this read-only path — a
+            # non-UTF8 SAN then fails the strict grammar (→ malformed) and the
+            # source is classified from its already-hashed bytes.
+            try:
+                san_text = san_path.read_text(errors="replace")
+                source_line_count = (
+                    source_path.read_text(errors="replace").count("\n") + 1
+                )
+            except OSError:
+                malformed.append({
+                    "source_path": rel,
+                    "san_path": _rel_san_path(repo_path, san_path),
+                    "errors": [],
+                })
+                continue
+            validation = validate_san_candidate(san_text, source_line_count)
+            if not validation["valid"]:
+                malformed.append({
+                    "source_path": rel,
+                    "san_path": _rel_san_path(repo_path, san_path),
+                    "errors": validation["errors"],
+                })
+                continue
+
+            stored = hashes.get(rel)
+            if stored is not None:
+                if stored == digest:
+                    fresh.append({"source_path": rel, "source_sha256": digest})
+                else:
+                    stale.append({"source_path": rel, "source_sha256": digest})
             else:
-                fresh += 1
+                # Compatibility path: no stored digest → mtime comparison only,
+                # with NO backfill/touch.
+                try:
+                    src_newer = source_path.stat().st_mtime > san_path.stat().st_mtime
+                except OSError:
+                    src_newer = True
+                if src_newer:
+                    stale.append({"source_path": rel, "source_sha256": digest})
+                else:
+                    fresh.append({"source_path": rel, "source_sha256": digest})
 
-    lines = [f"SAN freshness for '{repo}':",
-             f"  Entries: {len(index)}",
-             f"  Fresh: {fresh}",
-             f"  Remaining stale: {len(remaining_stale)}"]
-    if result:
-        lines.insert(1, f"  Auto-fix: {result}")
-    if remaining_stale:
-        lines.append("\nStale — run brain-compiler to regenerate:")
-        for s in remaining_stale[:10]:
-            lines.append(f"  - {s}")
-        if len(remaining_stale) > 10:
-            lines.append(f"  ... and {len(remaining_stale) - 10} more")
+    # 2. Orphaned SAN files: a .san whose source no longer exists.
+    if san_dir.exists():
+        for san_file in sorted(san_dir.rglob("*.san")):
+            rel = str(san_file.relative_to(san_dir))
+            source_rel_append = rel[:-4] if rel.endswith(".san") else rel
+            source_rel_legacy = str(Path(rel).with_suffix(""))
+            has_source = False
+            for source_rel in {source_rel_append, source_rel_legacy}:
+                if (repo_path / source_rel).exists():
+                    has_source = True
+                    break
+                if not source_rel.endswith(SOURCE_EXTS):
+                    for e in SOURCE_EXTS:
+                        if (repo_path / (source_rel + e)).exists():
+                            has_source = True
+                            break
+                if has_source:
+                    break
+            if not has_source:
+                orphaned.append({"san_path": _rel_san_path(repo_path, san_file)})
+
+    # 3. Hash-tracked sources whose extension is unsupported by SOURCE_EXTS.
+    #    Only files explicitly tracked in hash metadata are surfaced — never a
+    #    blanket sweep of every non-code repository file.
+    for tracked_rel in sorted(hashes.keys()):
+        if tracked_rel in seen_sources:
+            continue
+        if tracked_rel.endswith(SOURCE_EXTS):
+            continue
+        if (repo_path / tracked_rel).exists():
+            unsupported.append({
+                "source_path": tracked_rel,
+                "reason": "unsupported_extension",
+            })
+
+    counts = {
+        "missing": len(missing),
+        "stale": len(stale),
+        "fresh": len(fresh),
+        "orphaned": len(orphaned),
+        "unsupported": len(unsupported),
+        "malformed": len(malformed),
+    }
+    return {
+        "status": "ok",
+        "repo": repo,
+        "counts": counts,
+        "missing": missing,
+        "stale": stale,
+        "fresh": fresh,
+        "orphaned": orphaned,
+        "unsupported": unsupported,
+        "malformed": malformed,
+    }
+
+
+def _rel_san_path(repo_path: Path, san_file: Path) -> str:
+    """Return a `.san/...`-relative display path for a SAN file."""
+    try:
+        return str(san_file.relative_to(repo_path))
+    except ValueError:
+        return str(san_file)
+
+
+@mcp.tool()
+def plan_san_refresh(repo: str) -> dict[str, object]:
+    """Report SAN freshness WITHOUT mutating anything (filesystem reads only).
+
+    Returns a structured plan: which sources are missing/stale/fresh, which
+    SAN files are orphaned, which tracked sources are unsupported, and which
+    existing SAN files are structurally malformed. Performs zero filesystem or
+    metrics mutation — never creates `.san/`, deletes orphans, or writes
+    hashes. Use before invoking the brain-compiler to see what needs work.
+    """
+    return _scan_san_freshness(repo)
+
+
+def _format_san_freshness(plan: dict[str, object]) -> str:
+    """Render a freshness plan dict as a human-readable report."""
+    if plan.get("status") == "repo_not_found":
+        return f"ERROR: repo '{plan.get('repo')}' not found in config"
+
+    repo = plan.get("repo")
+    counts = plan.get("counts", {})
+    lines = [
+        f"SAN freshness for '{repo}':",
+        f"  Fresh: {counts.get('fresh', 0)}",
+        f"  Stale: {counts.get('stale', 0)}",
+        f"  Missing: {counts.get('missing', 0)}",
+        f"  Orphaned: {counts.get('orphaned', 0)}",
+        f"  Unsupported: {counts.get('unsupported', 0)}",
+        f"  Malformed: {counts.get('malformed', 0)}",
+    ]
+
+    def _emit(title: str, items: list, key: str) -> None:
+        if not items:
+            return
+        lines.append(f"\n{title}:")
+        for item in items[:10]:
+            lines.append(f"  - {item.get(key)}")
+        if len(items) > 10:
+            lines.append(f"  ... and {len(items) - 10} more")
+
+    _emit("Stale — run brain-compiler to regenerate", plan.get("stale", []), "source_path")
+    _emit("Missing — run brain-compiler to generate", plan.get("missing", []), "source_path")
+    _emit("Malformed — regenerate", plan.get("malformed", []), "source_path")
+    _emit("Orphaned SAN (source gone)", plan.get("orphaned", []), "san_path")
     return "\n".join(lines)
+
+
+def check_san_freshness(repo: str) -> str:
+    """
+    Report SAN freshness (read-only). Exposed via recompile_san(dry_run=True).
+
+    This performs NO mutation — it never cleans orphans, creates `.san/`, or
+    updates hashes. The mutating housekeeping lives in recompile_san's
+    non-dry-run path.
+    """
+    return _format_san_freshness(_scan_san_freshness(repo))
+
+
+# One repo-wide lock: the hash file and index file are shared across all
+# sources in a repo, so concurrent publications must serialize their
+# shared-file writes. Source-digest compare-and-swap + process-unique temp
+# files remain the cross-process guard.
+SAN_PUBLISH_LOCK = threading.RLock()
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _publish_failure(status: str, *, retryable: bool, **extra) -> dict:
+    return {"status": status, "retryable": retryable, **extra}
+
+
+def _validate_publish_source_path(repo_path: Path, source_path: str):
+    """Return (rel, abs_path) or a failure dict for a publication source path.
+
+    The returned rel is normalized (redundant `.`/separators collapsed) so the
+    same physical file cannot be tracked under two hash keys.
+    """
+    if not source_path or source_path.startswith("/") or os.path.isabs(source_path):
+        return _publish_failure("invalid_source_path", retryable=False)
+    if ".." in Path(source_path).parts:
+        return _publish_failure("invalid_source_path", retryable=False)
+
+    # Normalize away redundant "." / duplicate-separator segments, then re-check
+    # that nothing escaped (defense in depth against backslash/normpath quirks).
+    normalized = os.path.normpath(source_path)
+    if (
+        normalized.startswith("/")
+        or os.path.isabs(normalized)
+        or normalized == ".."
+        or normalized.startswith(".." + os.sep)
+        or ".." in Path(normalized).parts
+    ):
+        return _publish_failure("invalid_source_path", retryable=False)
+    source_path = normalized
+
+    candidate = repo_path / source_path
+    # Symlink-escape guard: the realpath must remain inside the repo root.
+    try:
+        real = Path(os.path.realpath(candidate))
+        root_real = Path(os.path.realpath(repo_path))
+    except (OSError, ValueError):
+        return _publish_failure("invalid_source_path", retryable=False)
+    if real != root_real and root_real not in real.parents:
+        return _publish_failure("invalid_source_path", retryable=False)
+
+    return source_path, candidate
+
+
+def _publish_san(
+    repo: str,
+    source_path: str,
+    expected_source_sha256: str,
+    san_content: str,
+    provider: str,
+    model: str,
+    reasoning_effort,
+) -> dict:
+    # --- validation (no mutation) -------------------------------------------
+    repo_path = _resolve_repo_path(repo)
+    if not repo_path:
+        return _publish_failure("repo_not_found", retryable=False, repo=repo)
+    repo_path = Path(repo_path)
+
+    path_result = _validate_publish_source_path(repo_path, source_path)
+    if isinstance(path_result, dict):
+        return path_result
+    rel, abs_source = path_result
+
+    if _is_skipped_source(rel):
+        return _publish_failure("skipped_source", retryable=False,
+                                source_path=rel)
+    if not rel.endswith(SOURCE_EXTS):
+        return _publish_failure("unsupported_extension", retryable=False,
+                                source_path=rel)
+    if not abs_source.is_file():
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+
+    if not isinstance(expected_source_sha256, str) or not _SHA256_RE.match(
+        expected_source_sha256
+    ):
+        return _publish_failure("invalid_digest", retryable=False)
+
+    try:
+        config = parse_san_compiler_config(_load_config())
+    except CompilerConfigError as error:
+        return _publish_failure("compiler_config_invalid", retryable=False,
+                                detail=str(error))
+
+    if provider not in ("claude", "codex"):
+        return _publish_failure("provider_mismatch", retryable=False,
+                                provider=provider)
+    if provider == "claude":
+        expected_model = config.claude.model
+        if model != expected_model:
+            return _publish_failure("model_mismatch", retryable=False)
+        if reasoning_effort not in (None, ""):
+            return _publish_failure("reasoning_effort_mismatch", retryable=False)
+    else:  # codex
+        expected_model = config.codex.model
+        if model != expected_model:
+            return _publish_failure("model_mismatch", retryable=False)
+        if reasoning_effort != config.codex.reasoning_effort:
+            return _publish_failure("reasoning_effort_mismatch", retryable=False)
+
+    # Source digest compare (pre-validation read).
+    try:
+        current_digest = _hash_source(abs_source)
+    except OSError:
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+    if current_digest != expected_source_sha256:
+        return _publish_failure("source_changed", retryable=True,
+                                source_path=rel)
+
+    # Structural candidate validation.
+    try:
+        source_line_count = abs_source.read_text(errors="replace").count("\n") + 1
+    except OSError:
+        return _publish_failure("source_not_found", retryable=True,
+                                source_path=rel)
+    validation = validate_san_candidate(san_content, source_line_count)
+    validation_summary = {
+        "valid": validation["valid"],
+        "block_count": validation["block_count"],
+        "bytes": validation["byte_count"],
+        "errors": validation["errors"],
+    }
+    if not validation["valid"]:
+        return _publish_failure("invalid_candidate", retryable=False,
+                                source_path=rel, validation=validation_summary)
+
+    # --- transaction (serialized; snapshot → replace → rollback on failure) --
+    with SAN_PUBLISH_LOCK:
+        san_dir = repo_path / ".san"
+        dest = san_dir / (rel + ".san")          # canonical append form only
+        hash_file = san_dir / ".san_hashes.json"
+        index_file = san_dir / "_index.json"
+
+        def _snap(path: Path):
+            data = snapshot_file(path)
+            mtime = path.stat().st_mtime_ns if data is not None else None
+            return data, mtime
+
+        def _restore(path: Path, snap) -> None:
+            data, mtime = snap
+            restore_file(path, data)
+            if data is not None and mtime is not None:
+                try:
+                    st = path.stat()
+                    os.utime(path, ns=(st.st_atime_ns, mtime))
+                except OSError:
+                    pass
+
+        dest_snap = _snap(dest)
+        hash_snap = _snap(hash_file)
+        index_snap = _snap(index_file)
+        metrics_snap = _snap(METRICS_FILE)
+
+        # Directories that do not yet exist and would be newly created — remove
+        # them on a first-publication rollback (deepest first).
+        created_dirs = []
+        probe = dest.parent
+        while not probe.exists():
+            created_dirs.append(probe)
+            probe = probe.parent
+
+        def _rollback() -> bool:
+            try:
+                _restore(dest, dest_snap)
+                _restore(hash_file, hash_snap)
+                _restore(index_file, index_snap)
+                _restore(METRICS_FILE, metrics_snap)
+                for directory in created_dirs:  # deepest → shallowest
+                    try:
+                        if directory.exists() and not any(directory.iterdir()):
+                            directory.rmdir()
+                    except OSError:
+                        pass
+                return True
+            except Exception:
+                return False
+
+        try:
+            # Re-hash immediately before replacement (compare-and-swap).
+            recheck = _hash_source(abs_source)
+            if recheck != expected_source_sha256:
+                return _publish_failure("source_changed", retryable=True,
+                                        source_path=rel)
+
+            # 1. Replace the SAN atomically.
+            atomic_write_bytes(dest, san_content.encode("utf-8"))
+
+            # 2. Persist copied hashes with the expected digest.
+            hashes = _load_san_hashes(san_dir)
+            hashes = dict(hashes)
+            hashes[rel] = expected_source_sha256
+            atomic_write_bytes(
+                hash_file, json.dumps(hashes, indent=2).encode("utf-8")
+            )
+
+            # 3. Rebuild index strictly (propagates any failure).
+            _rebuild_san_index(san_dir, repo_path=repo_path, strict=True)
+
+            # 4. Append the publication metric strictly.
+            source_tokens = _tokens_text(abs_source.read_text(errors="replace"))
+            san_tokens = _tokens_text(san_content)
+            _append_metric_strict({
+                "kind": "san_publish",
+                "repo": repo,
+                "file": rel,
+                "provider": provider,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "input_tokens": source_tokens,
+                "output_tokens": san_tokens,
+                "gen_cost": source_tokens + san_tokens,
+            })
+        except Exception:
+            if _rollback():
+                return _publish_failure("publication_failed", retryable=True,
+                                        source_path=rel,
+                                        validation=validation_summary)
+            return _publish_failure("rollback_failed", retryable=False,
+                                    source_path=rel)
+
+        # 5. Invalidate the freshness cache only after a committed publication.
+        _SAN_FRESH_CHECKED.pop(repo, None)
+
+        return {
+            "status": "published",
+            "repo": repo,
+            "source_path": rel,
+            "san_path": f".san/{rel}.san",
+            "source_sha256": expected_source_sha256,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "validation": validation_summary,
+        }
+
+
+@mcp.tool()
+def publish_san(
+    repo: str,
+    source_path: str,
+    expected_source_sha256: str,
+    san_content: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str | None = None,
+) -> dict[str, object]:
+    """Atomically publish one validated SAN file, bound to a source digest.
+
+    The brain-compiler (an LLM host) calls this after generating SAN content.
+    The Agent Brain server never selects or invokes a model — it validates the
+    DECLARED provider/model/effort against the configured compiler settings,
+    verifies the source has not changed since generation (SHA-256 compare-and-
+    swap), structurally validates the candidate, then atomically replaces the
+    SAN, updates the source-hash record and index, and appends a cost metric.
+    Any post-replacement failure rolls back SAN, hashes, index, and metrics to
+    their prior state. Results and metrics carry only validation summaries —
+    never source or SAN content.
+    """
+    return _publish_san(
+        repo,
+        source_path,
+        expected_source_sha256,
+        san_content,
+        provider,
+        model,
+        reasoning_effort,
+    )
 
 
 @mcp.tool()
@@ -3481,10 +3995,8 @@ def update_san_index(repo: str) -> str:
 
     # Atomic write
     idx_file = san_dir / "_index.json"
-    tmp = idx_file.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(index, indent=2))
-        tmp.rename(idx_file)
+        atomic_write_bytes(idx_file, json.dumps(index, indent=2).encode("utf-8"))
     except OSError as e:
         return f"ERROR writing index: {e}"
 
@@ -4526,6 +5038,47 @@ def _diagnose(project: str = "") -> int:
     checks.append(("MCP registered (main session)", found_anywhere,
                    " | ".join(location_report)))
 
+    # 5b. Managed SAN compiler adapters (detection only; never invokes a
+    #     provider CLI or a model). Reports current/stale/missing/conflict per
+    #     detected provider.
+    if diagnose_compiler_artifacts is None:
+        checks.append(("SAN compiler adapters", True,
+                       "compiler_setup not installed — skipping"))
+    else:
+        try:
+            compiler_config = parse_san_compiler_config(_load_config())
+        except CompilerConfigError as e:
+            checks.append(("SAN compiler config", False,
+                           f"invalid san_compiler config: {e}"))
+        else:
+            claude_detected = (home / ".claude").exists() or (
+                shutil.which("claude") is not None
+            )
+            codex_detected = codex_home.exists() or (
+                shutil.which("codex") is not None
+            )
+            assets_root = BRAIN_DIR / "san"
+            try:
+                diagnostics = diagnose_compiler_artifacts(
+                    home=home / ".claude",
+                    codex_home=codex_home,
+                    config=compiler_config,
+                    assets_root=assets_root,
+                    claude_detected=claude_detected,
+                    codex_detected=codex_detected,
+                )
+            except Exception as e:
+                checks.append(("SAN compiler adapters", False,
+                               f"diagnosis error: {e}"))
+                diagnostics = ()
+            if not diagnostics:
+                checks.append(("SAN compiler adapters", True,
+                               "no provider host detected — skipping"))
+            for d in diagnostics:
+                ok = d.state in ("current", "stale", "missing")
+                label = f"SAN compiler {d.provider} {d.artifact}"
+                checks.append((label, ok, d.detail))
+
     # 6. agent .md frontmatter is subagent-MCP-safe.
     #    Two valid configurations:
     #      (a) NO `tools:` field → subagent inherits everything including MCP (preferred)
@@ -4660,15 +5213,19 @@ def _diagnose(project: str = "") -> int:
                     checks.append(("Project Codex AGENTS.md", False,
                                    f"read error: {e}"))
 
-            # 10. .gitignore (informational)
+            # 10. .gitignore (informational). Advise ignoring the whole .san/
+            # tree (SAN files are generated). An anchored /.san/ is equivalent.
             gi = proj / ".gitignore"
-            wanted = {".mcp.json", ".san/.san_hashes.json", ".san/_cache/"}
             if not gi.exists():
                 checks.append(("Project .gitignore", True,
                                "no .gitignore — skipping"))
             else:
                 lines = {ln.strip() for ln in gi.read_text().splitlines()}
-                missing_gi = sorted(wanted - lines)
+                missing_gi = []
+                if not ({".mcp.json"} & lines):
+                    missing_gi.append(".mcp.json")
+                if not ({".san/", "/.san/"} & lines):
+                    missing_gi.append(".san/")
                 if missing_gi:
                     # Informational — not all repos want .mcp.json gitignored
                     checks.append(("Project .gitignore", True,

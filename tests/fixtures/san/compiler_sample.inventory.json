@@ -1,0 +1,36 @@
+{
+  "block_inventory": [
+    "compiler_sample @module",
+    "compiler_sample.JsonEnvelope @model",
+    "compiler_sample.JsonEnvelope.__init__ @fn",
+    "compiler_sample.JsonEnvelope.render @fn"
+  ],
+  "names": [
+    "compiler_sample",
+    "compiler_sample.JsonEnvelope",
+    "compiler_sample.JsonEnvelope.__init__",
+    "compiler_sample.JsonEnvelope.render",
+    "self.prefix",
+    "payload",
+    "json.dumps"
+  ],
+  "signatures": [
+    "fn:__init__(self, prefix: str) -> None",
+    "fn:render(self, payload: dict[str, object]) -> str"
+  ],
+  "dependency_facts": [
+    "deps: json",
+    "deps: json.dumps(sort_keys=True)"
+  ],
+  "public_surfaces": [
+    "compiler_sample.JsonEnvelope @model",
+    "fn:__init__(self, prefix: str) -> None",
+    "fn:render(self, payload: dict[str, object]) -> str"
+  ],
+  "state_facts": [
+    "@state: self.prefix: str = prefix"
+  ],
+  "error_facts": [
+    "@errors: ValueError(\"payload must not be empty\") when payload is empty"
+  ]
+}
