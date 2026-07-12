@@ -55,6 +55,14 @@ except ImportError:  # pragma: no cover - standalone execution
         parse_san_compiler_config,
     )
 
+try:
+    from .compiler_setup import diagnose_compiler_artifacts
+except ImportError:  # pragma: no cover - standalone execution
+    try:
+        from compiler_setup import diagnose_compiler_artifacts  # type: ignore[no-redef]
+    except ImportError:  # compiler_setup not installed alongside server
+        diagnose_compiler_artifacts = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Configuration — no hardcoded paths
 # ---------------------------------------------------------------------------
@@ -5030,6 +5038,47 @@ def _diagnose(project: str = "") -> int:
     checks.append(("MCP registered (main session)", found_anywhere,
                    " | ".join(location_report)))
 
+    # 5b. Managed SAN compiler adapters (detection only; never invokes a
+    #     provider CLI or a model). Reports current/stale/missing/conflict per
+    #     detected provider.
+    if diagnose_compiler_artifacts is None:
+        checks.append(("SAN compiler adapters", True,
+                       "compiler_setup not installed — skipping"))
+    else:
+        try:
+            compiler_config = parse_san_compiler_config(_load_config())
+        except CompilerConfigError as e:
+            checks.append(("SAN compiler config", False,
+                           f"invalid san_compiler config: {e}"))
+        else:
+            claude_detected = (home / ".claude").exists() or (
+                shutil.which("claude") is not None
+            )
+            codex_detected = codex_home.exists() or (
+                shutil.which("codex") is not None
+            )
+            assets_root = BRAIN_DIR / "san"
+            try:
+                diagnostics = diagnose_compiler_artifacts(
+                    home=home / ".claude",
+                    codex_home=codex_home,
+                    config=compiler_config,
+                    assets_root=assets_root,
+                    claude_detected=claude_detected,
+                    codex_detected=codex_detected,
+                )
+            except Exception as e:
+                checks.append(("SAN compiler adapters", False,
+                               f"diagnosis error: {e}"))
+                diagnostics = ()
+            if not diagnostics:
+                checks.append(("SAN compiler adapters", True,
+                               "no provider host detected — skipping"))
+            for d in diagnostics:
+                ok = d.state in ("current", "stale", "missing")
+                label = f"SAN compiler {d.provider} {d.artifact}"
+                checks.append((label, ok, d.detail))
+
     # 6. agent .md frontmatter is subagent-MCP-safe.
     #    Two valid configurations:
     #      (a) NO `tools:` field → subagent inherits everything including MCP (preferred)
@@ -5164,15 +5213,19 @@ def _diagnose(project: str = "") -> int:
                     checks.append(("Project Codex AGENTS.md", False,
                                    f"read error: {e}"))
 
-            # 10. .gitignore (informational)
+            # 10. .gitignore (informational). Advise ignoring the whole .san/
+            # tree (SAN files are generated). An anchored /.san/ is equivalent.
             gi = proj / ".gitignore"
-            wanted = {".mcp.json", ".san/.san_hashes.json", ".san/_cache/"}
             if not gi.exists():
                 checks.append(("Project .gitignore", True,
                                "no .gitignore — skipping"))
             else:
                 lines = {ln.strip() for ln in gi.read_text().splitlines()}
-                missing_gi = sorted(wanted - lines)
+                missing_gi = []
+                if not ({".mcp.json"} & lines):
+                    missing_gi.append(".mcp.json")
+                if not ({".san/", "/.san/"} & lines):
+                    missing_gi.append(".san/")
                 if missing_gi:
                     # Informational — not all repos want .mcp.json gitignored
                     checks.append(("Project .gitignore", True,

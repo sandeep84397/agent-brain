@@ -9,6 +9,7 @@ from typing import Literal, Sequence
 
 try:
     from .compiler_config import (
+        CodexReasoningEffort,
         CompilerConfigError,
         SanCompilerConfig,
         load_san_compiler_config,
@@ -16,6 +17,7 @@ try:
     )
 except ImportError:
     from compiler_config import (  # type: ignore[no-redef]
+        CodexReasoningEffort,
         CompilerConfigError,
         SanCompilerConfig,
         load_san_compiler_config,
@@ -42,6 +44,18 @@ class InstallResult:
     path: Path
     previous_state: ManagedState
     changed: bool
+
+
+@dataclass(frozen=True)
+class CompilerArtifactDiagnostic:
+    provider: Provider
+    artifact: Literal["agent", "skill"]
+    path: Path
+    state: ManagedState
+    model: str
+    reasoning_effort: "CodexReasoningEffort | None"
+    expected_version: int
+    detail: str
 
 
 class ManagedArtifactConflict(RuntimeError):
@@ -268,6 +282,145 @@ def install_codex_adapters(
             _restore_artifact(agent_path, agent_bytes, agent_stat)
         raise
     return agent_result, skill_result
+
+
+def _artifact_detail(
+    provider: Provider,
+    state: ManagedState,
+    path: Path,
+    model: str,
+    reasoning_effort,
+) -> str:
+    if state == "current":
+        base = f"current; version={ADAPTER_VERSION}; model={model}"
+        if provider == "codex" and reasoning_effort is not None:
+            base += f"; reasoning_effort={reasoning_effort}"
+        return base
+    if state == "missing":
+        flag = "--claude" if provider == "claude" else "--codex"
+        return f"missing; run ./setup.sh {flag}"
+    if state == "conflict":
+        return f"conflict: unmanaged file preserved at {path}"
+    if state == "stale":
+        return "stale managed artifact; rerun the provider setup"
+    return state
+
+
+def diagnose_compiler_artifacts(
+    *,
+    home: str | Path,
+    codex_home: str | Path,
+    config: SanCompilerConfig,
+    assets_root: str | Path,
+    claude_detected: bool,
+    codex_detected: bool,
+) -> tuple[CompilerArtifactDiagnostic, ...]:
+    """Report managed-adapter state per detected provider WITHOUT writing.
+
+    Renders expected bytes with the same functions installation uses and
+    compares them against on-disk artifacts via inspect_managed_artifact.
+    Providers whose host was not detected are skipped. Never invokes a
+    provider CLI or a model.
+    """
+    root = Path(assets_root)
+    effective = _effective_config(config)
+    contract_path = root / "compiler-contract.md"
+    diagnostics: list[CompilerArtifactDiagnostic] = []
+
+    def _contract_missing(
+        provider: Provider,
+        artifact: Literal["agent", "skill"],
+        path: Path,
+        model: str,
+        reasoning_effort,
+    ) -> CompilerArtifactDiagnostic:
+        return CompilerArtifactDiagnostic(
+            provider=provider,
+            artifact=artifact,
+            path=path,
+            state="missing",
+            model=model,
+            reasoning_effort=reasoning_effort,
+            expected_version=ADAPTER_VERSION,
+            detail=f"canonical compiler contract missing at {contract_path}",
+        )
+
+    if claude_detected:
+        agent_path = Path(home) / "agents" / "brain-compiler.md"
+        template_path = root / "adapters" / "claude" / "brain-compiler.md"
+        model = effective.claude.model
+        if not contract_path.exists() or not template_path.exists():
+            diagnostics.append(
+                _contract_missing("claude", "agent", agent_path, model, None)
+            )
+        else:
+            rendered = render_claude_adapter(
+                config, contract_path, template_path.read_text(encoding="utf-8")
+            )
+            status = inspect_managed_artifact(agent_path, rendered)
+            diagnostics.append(CompilerArtifactDiagnostic(
+                provider="claude",
+                artifact="agent",
+                path=agent_path,
+                state=status.state,
+                model=model,
+                reasoning_effort=None,
+                expected_version=ADAPTER_VERSION,
+                detail=_artifact_detail("claude", status.state, agent_path, model, None),
+            ))
+
+    if codex_detected:
+        home_c = Path(codex_home)
+        agent_path = home_c / "agents" / "brain-compiler.toml"
+        skill_path = home_c / "skills" / "brain-compiler" / "SKILL.md"
+        agent_template = root / "adapters" / "codex" / "brain-compiler.toml"
+        skill_template = root / "adapters" / "codex" / "brain-compiler" / "SKILL.md"
+        model = effective.codex.model
+        effort = effective.codex.reasoning_effort
+
+        if (
+            not contract_path.exists()
+            or not agent_template.exists()
+            or not skill_template.exists()
+        ):
+            diagnostics.append(
+                _contract_missing("codex", "agent", agent_path, model, effort)
+            )
+            diagnostics.append(
+                _contract_missing("codex", "skill", skill_path, model, effort)
+            )
+        else:
+            rendered_agent = render_codex_agent(
+                config, skill_path, contract_path,
+                agent_template.read_text(encoding="utf-8"),
+            )
+            rendered_skill = render_codex_skill(
+                contract_path, skill_template.read_text(encoding="utf-8")
+            )
+            agent_status = inspect_managed_artifact(agent_path, rendered_agent)
+            skill_status = inspect_managed_artifact(skill_path, rendered_skill)
+            diagnostics.append(CompilerArtifactDiagnostic(
+                provider="codex",
+                artifact="agent",
+                path=agent_path,
+                state=agent_status.state,
+                model=model,
+                reasoning_effort=effort,
+                expected_version=ADAPTER_VERSION,
+                detail=_artifact_detail("codex", agent_status.state, agent_path, model, effort),
+            ))
+            diagnostics.append(CompilerArtifactDiagnostic(
+                provider="codex",
+                artifact="skill",
+                path=skill_path,
+                state=skill_status.state,
+                model=model,
+                reasoning_effort=effort,
+                expected_version=ADAPTER_VERSION,
+                detail=_artifact_detail("codex", skill_status.state, skill_path, model, effort),
+            ))
+
+    return tuple(diagnostics)
 
 
 def _install_status_line(result: InstallResult) -> str:

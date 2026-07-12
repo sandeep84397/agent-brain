@@ -172,17 +172,22 @@ else:
     print(f"  ✓ {settings_path} already up to date")
 
 # 3. .gitignore (append-if-missing for the brain artifacts)
+# Ignore the whole .san/ tree — SAN files are generated, not source of truth.
 gitignore_path = project / ".gitignore"
 required_lines = [
     ".mcp.json",
-    ".san/.san_hashes.json",
-    ".san/_cache/",
+    ".san/",
 ]
+# An existing anchored form (/.san/) is treated as already covering .san/.
+_equivalents = {".san/": {".san/", "/.san/"}}
 existing_lines: list[str] = []
 if gitignore_path.exists():
     existing_lines = gitignore_path.read_text().splitlines()
 existing_set = {ln.strip() for ln in existing_lines}
-to_append = [ln for ln in required_lines if ln not in existing_set]
+to_append = [
+    ln for ln in required_lines
+    if not (existing_set & _equivalents.get(ln, {ln}))
+]
 if to_append:
     block = ["", "# agent-brain"] + to_append + [""]
     with gitignore_path.open("a") as f:
