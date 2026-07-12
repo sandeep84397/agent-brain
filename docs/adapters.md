@@ -15,7 +15,7 @@ What differs between runtimes is only the **install surface** and hook trust UX:
 
 The knowledge (decisions, outcomes, SAN) is identical everywhere. Hooks make the
 protocol mechanical where the host supports them; MCP `instructions` remain the
-portable fallback.
+portable baseline.
 
 ## Claude Code (fully enforced)
 
